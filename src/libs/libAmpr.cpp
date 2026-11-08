@@ -10,6 +10,7 @@
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
+#include <sys/mman.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -1112,6 +1113,15 @@ static bool AppendCommandRecord(uint64_t command_buffer, CommandBufferState::Com
 	return CommitCommandBufferRecord(command_buffer, &state, record_size);
 }
 
+// mincore() fails with ENOMEM as soon as one page of the range is not mapped.
+static bool HostRangeMapped(uint64_t address, uint64_t size) {
+	constexpr uint64_t page = 4096;
+	const auto         begin = address & ~(page - 1);
+	const auto         pages = (address + size - begin + page - 1) / page;
+	std::vector<unsigned char> residency(pages);
+	return mincore(reinterpret_cast<void*>(begin), pages * page, residency.data()) == 0;
+}
+
 static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t file_offset,
                                uint64_t destination, uint64_t size, uint64_t* bytes_read);
 
@@ -1357,8 +1367,15 @@ static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t 
 		void* end   = nullptr;
 		int   prot  = 0;
 		if (LibKernel::Memory::KernelQueryMemoryProtection(reinterpret_cast<void*>(at), &start, &end,
-		                                                   &prot) != OK ||
-		    prot == 0 || reinterpret_cast<uint64_t>(end) <= at) {
+		                                                   &prot) != OK) {
+			// GameFlex: not one of the game's mappings. Its malloc can come from Kyty's own heap
+			// (Kingdom Hearts III, the buffer of its first video): what counts is that it is mapped.
+			if (HostRangeMapped(at, destination + size - at)) {
+				break;
+			}
+			prot = 0;
+		}
+		if (prot == 0 || reinterpret_cast<uint64_t>(end) <= at) {
 			static std::atomic<uint32_t> s_logged {0};
 			if (s_logged.fetch_add(1, std::memory_order_relaxed) < 32) {
 				LOGF("\tAPR read into unmapped memory: %s offset=0x%016" PRIx64 " destination=0x%016" PRIx64
