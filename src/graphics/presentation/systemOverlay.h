@@ -31,6 +31,8 @@ SystemOverlayVisualState GetSystemOverlayVisualState() noexcept;
 // A shader or pipeline has just been compiled: shows the compilation toast for a moment. From any
 // thread. KYTY_SHADER_TOAST=0 turns the toast off.
 void                     NotifyShaderCompiled() noexcept;
+// The first draw this GPU cannot do has been dropped: says for a moment that objects are missing.
+void                     NotifyMeshDrawsDropped() noexcept;
 void                     NotifyTrophyUnlocked(std::string_view name, int32_t grade,
                                               std::span<const std::byte> icon_png);
 

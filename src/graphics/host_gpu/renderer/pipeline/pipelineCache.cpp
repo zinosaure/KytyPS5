@@ -718,6 +718,11 @@ void PipelineCache::Save() {
 
 void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state) {
 	m_defer_translation = m_compile_aside && state.deferrable;
+	// Every way out ends the deferral: a dropped draw must not defer the next compute shader.
+	struct DeferralEnd {
+		bool& deferring;
+		~DeferralEnd() { deferring = false; }
+	} deferral_end {m_defer_translation};
 	const auto& context           = command.GetRegisters();
 	const auto& user_config       = command.GetUserConfig();
 	const auto& sh                = context.GetShaderRegisters();
@@ -786,7 +791,22 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		                         .buffer_format != Prospero::BufferFormat::k32UInt);
 	}
 	if (mesh_active) {
-		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);
+		// GameFlex: a GPU without mesh shaders (Turnip) drops these draws rather than stop the
+		// game. Objects go missing from the picture, and the overlay says so.
+		if (!m_graphics.mesh_shader_enabled) {
+			static std::atomic_uint64_t dropped = 0;
+			const auto                  count   = dropped.fetch_add(1, std::memory_order_relaxed);
+			if (count == 0) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "Warning: this GPU has no mesh shaders, their draws are dropped and objects "
+				    "go missing (first: shader 0x{:016x}).\n",
+				    vertex_params[0].hash));
+				NotifyMeshDrawsDropped();
+			} else if ((count + 1) % 100000 == 0) {
+				Log::WriteToConsoleAndLog(fmt::format("Mesh draws dropped: {}\n", count + 1));
+			}
+			return;
+		}
 		auto& mesh              = vertex_info[0].mesh;
 		mesh.host_subgroup_size = m_graphics.subgroup_size;
 		const auto& limits      = m_graphics.mesh_shader_properties;

@@ -251,6 +251,9 @@ std::atomic<bool>              g_trophy_notification_active {false};
 constexpr auto                       COMPILE_TOAST_LINGER = std::chrono::milliseconds {1500};
 std::atomic<uint32_t>                g_compile_count {0};
 std::atomic<Clock::duration::rep>    g_compile_last {0};
+// The notice of a GPU without mesh shaders: when the first of their draws was dropped.
+constexpr auto                       MESH_NOTICE_LINGER = std::chrono::seconds {20};
+std::atomic<Clock::duration::rep>    g_mesh_dropped_at {0};
 std::array<std::filesystem::path, 2> g_splash_paths;
 std::atomic<bool>                    g_splash_active {false};
 std::atomic<Clock::duration::rep>    g_splash_hidden_at {0};
@@ -716,6 +719,11 @@ static bool CompileToastActive() noexcept {
 	return Clock::now().time_since_epoch() - last < COMPILE_TOAST_LINGER;
 }
 
+static bool MeshNoticeActive() noexcept {
+	const Clock::duration dropped {g_mesh_dropped_at.load(std::memory_order_relaxed)};
+	return dropped.count() != 0 && Clock::now().time_since_epoch() - dropped < MESH_NOTICE_LINGER;
+}
+
 SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const auto core   = CoreIme::GetVisualState();
 	const auto dialog = DialogIme::GetVisualState();
@@ -724,10 +732,11 @@ SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const bool splash        = g_splash_active.load(std::memory_order_acquire);
 	const auto cursor        = GetHostInputTouchPadVisualState();
 	const bool compiling     = CompileToastActive();
+	const bool mesh_notice   = MeshNoticeActive();
 	return {core.active || dialog.active || system.active || trophy_active || splash ||
-	            cursor.enabled || compiling,
+	            cursor.enabled || compiling || mesh_notice,
 	        core.revision + dialog.revision + system.revision + (trophy_active ? 1u : 0u) +
-	            (splash ? 2u : 0u) + (compiling ? 4u : 0u) +
+	            (splash ? 2u : 0u) + (compiling ? 4u : 0u) + (mesh_notice ? 8u : 0u) +
 	            static_cast<decltype(core.revision)>(g_compile_count.load(std::memory_order_relaxed)) +
 	            static_cast<decltype(core.revision)>(cursor.revision) + PerformanceOverlayRevision()};
 }
@@ -869,6 +878,10 @@ void NotifyShaderCompiled() noexcept {
 		g_compile_last.store(Clock::now().time_since_epoch().count(), std::memory_order_relaxed);
 		g_compile_count.fetch_add(1, std::memory_order_relaxed);
 	}
+}
+
+void NotifyMeshDrawsDropped() noexcept {
+	g_mesh_dropped_at.store(Clock::now().time_since_epoch().count(), std::memory_order_relaxed);
 }
 
 void NotifyTrophyUnlocked(std::string_view name, int32_t grade,
@@ -1693,33 +1706,46 @@ struct SystemOverlay::Impl {
 		}
 	}
 
-	// While shaders compile, in the bottom-left corner: the game may stutter, or miss an effect
-	// for a moment, for a reason worth saying.
-	void DrawCompileToast(vk::Extent2D frame_extent) {
-		if (!CompileToastActive()) {
-			g_compile_count.store(0, std::memory_order_relaxed);
-			return;
-		}
+	// One line in the bottom-left corner, `row` lines up from the bottom.
+	void DrawCornerNotice(const std::string& text, vk::Extent2D frame_extent, int row) {
 		const float scale = std::clamp(std::min(static_cast<float>(frame_extent.width) / 1920.0f,
 		                                        static_cast<float>(frame_extent.height) / 1080.0f),
 		                               0.65f, 1.25f);
-		// Console language 2 is French; the emulator's other strings have no entry for this one.
-		const auto  count = g_compile_count.load(std::memory_order_relaxed);
-		const auto  text  = Config::GetConsoleLanguage() == 2
-		                        ? fmt::format("Compilation des shaders : {}", count)
-		                        : fmt::format("Compiling shaders: {}", count);
 		const float size = 22.0f * scale;
 		const float pad  = 12.0f * scale;
 		const auto  extent =
 		    ImGui::GetFont()->CalcTextSizeA(size, std::numeric_limits<float>::max(), 0.0f,
 		                                    text.c_str());
-		const ImVec2 bottom_left {24.0f * scale, static_cast<float>(frame_extent.height) - 24.0f * scale};
+		const float  bottom = static_cast<float>(frame_extent.height) - 24.0f * scale -
+		                      static_cast<float>(row) * (extent.y + 2.0f * pad + 8.0f * scale);
+		const ImVec2 bottom_left {24.0f * scale, bottom};
 		const ImVec2 top_left {bottom_left.x, bottom_left.y - extent.y - 2.0f * pad};
 		const ImVec2 bottom_right {bottom_left.x + extent.x + 2.0f * pad, bottom_left.y};
 		auto*        draw = ImGui::GetForegroundDrawList();
 		draw->AddRectFilled(top_left, bottom_right, IM_COL32(24, 26, 32, 215), 10.0f * scale);
 		draw->AddText(nullptr, size, {top_left.x + pad, top_left.y + pad},
 		              IM_COL32(255, 255, 255, 255), text.c_str());
+	}
+
+	// What the player would otherwise take for a bug: the first moments of a GPU without mesh
+	// shaders, and while shaders compile (the game may stutter, or miss an effect for a moment).
+	// Console language 2 is French; the emulator's other strings have no entry for these.
+	void DrawCornerNotices(vk::Extent2D frame_extent) {
+		const bool french = Config::GetConsoleLanguage() == 2;
+		int        row    = 0;
+		if (MeshNoticeActive()) {
+			DrawCornerNotice(french ? "Pas de mesh shaders sur ce GPU : des objets manquent à l'image"
+			                        : "No mesh shaders on this GPU: objects are missing",
+			                 frame_extent, row++);
+		}
+		if (!CompileToastActive()) {
+			g_compile_count.store(0, std::memory_order_relaxed);
+			return;
+		}
+		const auto count = g_compile_count.load(std::memory_order_relaxed);
+		DrawCornerNotice(french ? fmt::format("Compilation des shaders : {}", count)
+		                        : fmt::format("Compiling shaders: {}", count),
+		                 frame_extent, row);
 	}
 
 	void DrawTrophyNotification(vk::Extent2D frame_extent, Clock::time_point now, float min_top) {
@@ -1859,7 +1885,7 @@ struct SystemOverlay::Impl {
 		if (!has_overlay && !g_trophy_notification_active.load(std::memory_order_acquire) &&
 		    !g_splash_active.load(std::memory_order_acquire) &&
 		    !GetHostInputTouchPadVisualState().enabled && !PerformanceOverlayEnabled() &&
-		    !CompileToastActive()) {
+		    !CompileToastActive() && !MeshNoticeActive()) {
 			return false;
 		}
 		const auto prepared_session = snapshot.session;
@@ -1900,7 +1926,7 @@ struct SystemOverlay::Impl {
 			}
 		}
 		DrawTrophyNotification(frame_extent, now, performance_bottom);
-		DrawCompileToast(frame_extent);
+		DrawCornerNotices(frame_extent);
 		DrawTouchPadCursor(GetHostInputTouchPadVisualState());
 		ImGui::Render();
 		extent = frame_extent;

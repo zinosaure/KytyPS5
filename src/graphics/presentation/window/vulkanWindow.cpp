@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <memory>
@@ -473,7 +474,9 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		    workgroup_layout.workgroupMemoryExplicitLayout != VK_FALSE));
 	}
 	// Indirect mesh draws launch their records' groups from a task shader.
-	graphics.mesh_shader_enabled = mesh.meshShader && mesh.taskShader;
+	// KYTY_NO_MESH_SHADER: a GPU that has them takes the path of one that does not (the bench).
+	graphics.mesh_shader_enabled = mesh.meshShader && mesh.taskShader &&
+	                               std::getenv("KYTY_NO_MESH_SHADER") == nullptr;
 
 	vk::StructureChain<
 	    vk::PhysicalDeviceProperties2, vk::PhysicalDeviceFloatControlsProperties,
