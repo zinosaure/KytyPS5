@@ -1648,7 +1648,9 @@ static void KYTY_SYSV_ABI KernelDebugRaiseException(int /*c1*/, int /*c2*/) {
 static void KYTY_SYSV_ABI exit(int code) {
 	PRINT_NAME();
 
-	::exit(code);
+	// Same as libc exit(): guest threads still run, so no static destructors.
+	std::fflush(nullptr);
+	std::quick_exit(code);
 }
 
 static KYTY_SYSV_ABI MallocReplace* KernelGetSanitizerMallocReplaceExternal() {

@@ -71,7 +71,12 @@ const char** GetArgv() {
 static KYTY_SYSV_ABI void exit(int code) {
 	PRINT_NAME();
 
-	::exit(code);
+	// Guest threads and the window loop are still running: ::exit() would destroy the
+	// statics they read (Config::GetVblankFrequency() on a reset g_config) and turn the
+	// game exit into a crash. Leave the way a closed window does (Emulator::Execute).
+	// quick_exit flushes nothing: the console lines that say why the game left go first.
+	std::fflush(nullptr);
+	std::quick_exit(code);
 }
 
 static void PrintAbortStringCandidate(const char* name, uint64_t addr) {
