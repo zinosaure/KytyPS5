@@ -211,7 +211,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	}
 	auto& desc = r.desc;
 	desc.type              = TextureCache::BindingType::RenderTarget;
-	desc.info.data            = {rt.base.addr, 0};
+	desc.info.data            = {LibKernel::Memory::CompactFoldedAddress(rt.base.addr), 0};
 	desc.info.pixel_format = target_format.format;
 	desc.info.guest_format = target_format.guest_format;
 	desc.info.type         = image_type;

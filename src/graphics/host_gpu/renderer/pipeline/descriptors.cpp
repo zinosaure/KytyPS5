@@ -588,7 +588,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	    storage ? StorageViewFormat(resource, format, pixel_format) : pixel_format;
 	const auto              block_bytes = Prospero::BlockCompressedBytesPerBlock(format);
 	TextureCache::ImageDesc desc {};
-	desc.info.data         = {address, 0};
+	desc.info.data         = {LibKernel::Memory::CompactFoldedAddress(address), 0};
 	desc.info.pixel_format = pixel_format;
 	desc.info.guest_format = format;
 	desc.info.type         = TextureBaseType(type);

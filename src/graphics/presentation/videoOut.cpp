@@ -1,4 +1,5 @@
 #include "graphics/presentation/videoOut.h"
+#include "kernel/memory.h"
 
 #include "common/abi.h"
 #include "common/assert.h"
@@ -1435,7 +1436,8 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
 			LOGF("\t buffers[%d]: ignoring reserved fields {%p, %p}\n", i, buffers[i].reserved[0],
 			     buffers[i].reserved[1]);
 		}
-		const auto data_address     = reinterpret_cast<uint64_t>(buffers[i].data);
+		const auto data_address     =
+		    LibKernel::Memory::CompactFoldedAddress(reinterpret_cast<uint64_t>(buffers[i].data));
 		const auto metadata_address = reinterpret_cast<uint64_t>(buffers[i].metadata);
 		registrations.push_back({
 		    .group_index      = set_index,

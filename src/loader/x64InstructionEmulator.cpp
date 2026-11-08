@@ -1,6 +1,7 @@
 #include "loader/x64InstructionEmulator.h"
 
 #include "common/common.h"
+#include "kernel/memory.h"
 
 #include <Zydis/Zydis.h>
 #include <bit>
@@ -820,6 +821,20 @@ bool TryEmulate(void* native_context) {
 	       TryEmulateShaNi(context) ||
 #endif
 	       TryEmulateCpuExtensions(context);
+}
+
+bool FoldCompactAddresses(void* native_context) {
+	Context context {static_cast<decltype(Context::native)>(native_context)};
+	bool    folded = false;
+	for (int index = 0; index < 16; index++) {
+		const auto value  = static_cast<uint64_t>(context.Gpr(index));
+		const auto target = Libs::LibKernel::Memory::CompactFoldedAddress(value);
+		if (target != value) {
+			context.Gpr(index) = static_cast<decltype(context.Gpr(index) + 0)>(target);
+			folded             = true;
+		}
+	}
+	return folded;
 }
 
 void SkipLoad(void* native_context, size_t length) {

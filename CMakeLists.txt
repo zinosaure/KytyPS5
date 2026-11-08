@@ -54,6 +54,12 @@ include("${KYTY_SOURCE_DIR}/utils.cmake")
 include(CTest)
 
 option(KYTY_ENABLE_CLANG_TIDY "Run clang-tidy checks during builds" OFF)
+# Guest address space below 512 GiB, for hosts with a 39-bit user address space
+# (Android GKI). See src/kernel/memory.h.
+option(KYTY_COMPACT_ADDRESS_SPACE "Keep the guest address space below 512 GiB" OFF)
+if(KYTY_COMPACT_ADDRESS_SPACE)
+	add_compile_definitions(KYTY_COMPACT_ADDRESS_SPACE)
+endif()
 
 set(KYTY_BUILD_ORIGIN "Source" CACHE STRING "Build provenance shown in diagnostics")
 set_property(CACHE KYTY_BUILD_ORIGIN PROPERTY STRINGS Source Official Fork)

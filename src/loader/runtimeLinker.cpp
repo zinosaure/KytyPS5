@@ -666,6 +666,13 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
 		}
+#if defined(KYTY_COMPACT_ADDRESS_SPACE)
+		if (Libs::LibKernel::Memory::CompactFoldedAddress(info->access_violation_vaddr) !=
+		        info->access_violation_vaddr &&
+		    Loader::X64InstructionEmulator::FoldCompactAddresses(info->native_context)) {
+			return true;
+		}
+#endif
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
 			return true;

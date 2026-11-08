@@ -11,8 +11,15 @@ namespace Libs::Graphics {
 
 constexpr uint64_t TRACKER_PAGE_SIZE    = 4ull * 1024ull;
 constexpr uint64_t TRACKER_REGION_SIZE  = 4ull * 1024ull * 1024ull;
+#if defined(KYTY_COMPACT_ADDRESS_SPACE)
+// Everything below 512 GiB; the fold point equals kExtendedMemoryBase, so the
+// packed page index space is contiguous (see memory.h).
+constexpr uint64_t TRACKER_ADDRESS_SIZE = 1ull << 39u;
+constexpr uint64_t LOWER_ADDRESS_SIZE   = 1ull << 38u;
+#else
 constexpr uint64_t TRACKER_ADDRESS_SIZE = 1ull << 44u;
 constexpr uint64_t LOWER_ADDRESS_SIZE   = 1ull << 40u;
+#endif
 constexpr size_t   TRACKER_REGION_PAGES = TRACKER_REGION_SIZE / TRACKER_PAGE_SIZE;
 
 struct GuestRange {

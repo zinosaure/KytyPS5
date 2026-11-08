@@ -183,6 +183,11 @@ static std::atomic<uint64_t> g_test_free_range_visits {0};
 // place (chantier 41 of GameFlex).
 static bool UnifiedMemoryRequested() {
 	static const bool requested = [] {
+#if defined(KYTY_COMPACT_ADDRESS_SPACE)
+		// A phone cannot hold the guest's whole memory in physical pages (the system heap
+		// allocates them at once): 12 GiB there would have Android kill the application.
+		return false;
+#endif
 		const char* value = std::getenv("KYTY_UNIFIED_MEMORY");
 		return value != nullptr && value[0] == '1';
 	}();
@@ -2473,7 +2478,8 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 		return KERNEL_ERROR_ENOMEM;
 	}
 
-	auto     in_addr         = reinterpret_cast<uint64_t>(*addr);
+	// The top of a capped reservation (KernelReserveVirtualRange).
+	auto     in_addr         = CompactFoldedAddress(reinterpret_cast<uint64_t>(*addr));
 	uint64_t out_addr        = 0;
 	bool     shared_backing  = false;
 	bool     reserved_target = false;
@@ -2941,6 +2947,18 @@ int KYTY_SYSV_ABI KernelReserveVirtualRange(void** addr, size_t len, int flags, 
 	    (alignment & (PAGE_SIZE - 1)) != 0) {
 		return KERNEL_ERROR_EINVAL;
 	}
+
+#if defined(KYTY_COMPACT_ADDRESS_SPACE)
+	// Unreal's PS5 layer reserves 512 GiB in one piece, the whole of a phone's address space, and
+	// uses its bottom and a few mappings at its top (MapDirectMemory). The game is told it has them.
+	constexpr size_t COMPACT_RESERVATION_CAP = 176ull * 1024 * 1024 * 1024;
+	if (len > COMPACT_RESERVATION_CAP) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Compact address space: reservation of {:#x} capped to {:#x}\n", len,
+		    COMPACT_RESERVATION_CAP));
+		len = COMPACT_RESERVATION_CAP;
+	}
+#endif
 
 	uint64_t out_addr            = 0;
 	bool     range_already_added = false;

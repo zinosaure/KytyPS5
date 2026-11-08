@@ -220,7 +220,7 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 	}
 	TextureCache::ImageDesc desc {};
 	desc.type                 = TextureCache::BindingType::DepthTarget;
-	desc.info.data            = {depth_address, depth_backing_size};
+	desc.info.data = {LibKernel::Memory::CompactFoldedAddress(depth_address), depth_backing_size};
 	desc.info.stencil =
 	    has_stencil ? GuestRange {stencil_address, stencil_backing_size} : GuestRange {};
 	desc.info.pixel_format    = format;

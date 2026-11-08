@@ -45,8 +45,32 @@ struct Lifecycle {
 using callback_func_t = void (*)(uintptr_t addr, size_t size);
 
 constexpr uint32_t KERNEL_MAXIMUM_NAME_LENGTH = 32;
+#if defined(KYTY_COMPACT_ADDRESS_SPACE)
+// A 39-bit user address space (Android GKI: 512 GiB) cannot hold the default
+// layout, whose extended region sits at 8 TiB. Everything moves below 512 GiB:
+// the user range ends at 256 GiB (HOST_USER_MAX), the extended region follows
+// it, and the GPU-side fold point (LOWER_ADDRESS_SIZE) equals its base.
+constexpr uint64_t kExtendedMemoryBase       = 0x4000000000ull;
+constexpr uint64_t kExtendedMemorySize       = 128ull * 1024 * 1024 * 1024;
+#else
 constexpr uint64_t kExtendedMemoryBase       = 0x080000000000ull;
 constexpr uint64_t kExtendedMemorySize       = 512ull * 1024 * 1024 * 1024;
+#endif
+
+// The top of a capped reservation goes under the 39 bits of a phone: 0x8fc0000000, where Unreal
+// maps its display buffers, becomes 0x3fc0000000, the end of the game's space. The game goes on
+// naming them by the first. The GPU reads them here; the processor zeroes them at most, and
+// that fault is caught (RuntimeLinker, X64InstructionEmulator::FoldCompactAddresses).
+constexpr uint64_t CompactFoldedAddress(uint64_t address) {
+#if defined(KYTY_COMPACT_ADDRESS_SPACE)
+	constexpr uint64_t FOLD_FROM = 1ull << 39u;
+	constexpr uint64_t FOLD_END  = 1ull << 40u;
+	constexpr uint64_t FOLD_BY   = 0x5000000000ull;
+	return address >= FOLD_FROM && address < FOLD_END ? address - FOLD_BY : address;
+#else
+	return address;
+#endif
+}
 
 struct VirtualQueryInfo {
 	uintptr_t start;
