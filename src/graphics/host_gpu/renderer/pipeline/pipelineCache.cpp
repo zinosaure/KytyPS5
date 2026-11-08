@@ -655,7 +655,10 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		if (slot >= RENDER_COLOR_ATTACHMENTS_MAX) {
 			break;
 		}
-		if (sh.target_output_mode[index] != 0 && render_target_mask_slot(write_mask, slot) != 0) {
+		// A target whose format is COLOR_INVALID is off: the color block drops what the pixel
+		// shader exports to it (Final Fantasy VII Rebirth binds such slots with an address).
+		if (sh.target_output_mode[index] != 0 && render_target_mask_slot(write_mask, slot) != 0 &&
+		    context.GetRenderTarget(slot).info.format != Prospero::ChannelLayout::kInvalid) {
 			color_output_mask |= 1u << slot;
 		}
 	}
