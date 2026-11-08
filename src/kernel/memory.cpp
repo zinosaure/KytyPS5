@@ -2066,6 +2066,10 @@ static bool IsAmmMemoryRange(uint64_t vaddr, size_t size) {
 	       size <= kExtendedMemoryBase + kExtendedMemorySize - vaddr;
 }
 
+bool IsAmmAddress(uint64_t vaddr) {
+	return vaddr >= kExtendedMemoryBase && vaddr < kExtendedMemoryBase + kExtendedMemorySize;
+}
+
 int UnmapAmmMemory(uint64_t vaddr, size_t size) {
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 	if (!IsAmmMemoryRange(vaddr, size)) return KERNEL_ERROR_EINVAL;

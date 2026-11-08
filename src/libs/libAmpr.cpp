@@ -1370,7 +1370,8 @@ static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t 
 		                                                   &prot) != OK) {
 			// GameFlex: not one of the game's mappings. Its malloc can come from Kyty's own heap
 			// (Kingdom Hearts III, the buffer of its first video): what counts is that it is mapped.
-			if (HostRangeMapped(at, destination + size - at)) {
+			// A hole in the guest's own space is a reservation: mincore counts it, a copy would crash.
+			if (!LibKernel::Memory::IsAmmAddress(at) && HostRangeMapped(at, destination + size - at)) {
 				break;
 			}
 			prot = 0;
@@ -2143,14 +2144,22 @@ static int KYTY_SYSV_ABI AprCommandBufferResetGatherScatterState(void* command_b
 }
 
 static int KYTY_SYSV_ABI AprCommandBufferMapBegin(void* command_buffer, uint64_t va, uint64_t size,
-                                                  int32_t, int32_t) {
+                                                  int32_t type, int32_t prot) {
 	PRINT_NAME();
 
 	if (command_buffer == nullptr || !ValidateAmmMapArgs(va, size)) {
 		return LibKernel::KERNEL_ERROR_EINVAL;
 	}
 
-	if (AppendNoOpCommand(command_buffer, APR_MAP_BEGIN_RECORD_SIZE) != OK) {
+	// GameFlex: the read that follows lands there, and the game then uses the memory (FF XVI).
+	CommandBufferState::AmmMapCommand command {};
+	command.kind = AmmCommandKind::MapAuto;
+	command.va   = va;
+	command.size = size;
+	command.type = type;
+	command.prot = prot;
+	if (!AppendCommandRecord(reinterpret_cast<uint64_t>(command_buffer), command,
+	                         APR_MAP_BEGIN_RECORD_SIZE)) {
 		return LibKernel::KERNEL_ERROR_EFAULT;
 	}
 
@@ -2161,7 +2170,7 @@ static int KYTY_SYSV_ABI AprCommandBufferMapBegin(void* command_buffer, uint64_t
 
 static int KYTY_SYSV_ABI AprCommandBufferMapDirectBegin(void* command_buffer, uint64_t va,
                                                         uint64_t dmem_offset, uint64_t size,
-                                                        int32_t, int32_t) {
+                                                        int32_t type, int32_t prot) {
 	PRINT_NAME();
 
 	if (command_buffer == nullptr || !ValidateAmmMapArgs(va, size) ||
@@ -2169,7 +2178,15 @@ static int KYTY_SYSV_ABI AprCommandBufferMapDirectBegin(void* command_buffer, ui
 		return LibKernel::KERNEL_ERROR_EINVAL;
 	}
 
-	if (AppendNoOpCommand(command_buffer, APR_MAP_DIRECT_BEGIN_SIZE) != OK) {
+	CommandBufferState::AmmMapCommand command {};
+	command.kind        = AmmCommandKind::MapDirect;
+	command.va          = va;
+	command.dmem_offset = dmem_offset;
+	command.size        = size;
+	command.type        = type;
+	command.prot        = prot;
+	if (!AppendCommandRecord(reinterpret_cast<uint64_t>(command_buffer), command,
+	                         APR_MAP_DIRECT_BEGIN_SIZE)) {
 		return LibKernel::KERNEL_ERROR_EFAULT;
 	}
 
