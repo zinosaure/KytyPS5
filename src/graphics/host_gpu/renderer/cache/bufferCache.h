@@ -13,6 +13,8 @@
 
 #include <array>
 #include <map>
+#include <tuple>
+#include <unordered_map>
 #include <mutex>
 #include <span>
 #include <utility>
@@ -74,11 +76,38 @@ public:
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
+	// Unified memory: the guest's memory is imported, and buffers over it are views of it,
+	// with nothing to upload, protect or download.
+	[[nodiscard]] bool IsUnified() const noexcept { return m_unified_memory != nullptr; }
+	// Writes guest memory in command order (a label, WRITE_DATA): false outside unified memory,
+	// where the caller writes it itself.
+	bool WriteGuestMemory(uint64_t vaddr, const void* data, uint64_t size);
+	// The value of a label WriteGuestMemory recorded at exactly [vaddr, vaddr + size), that the
+	// GPU has not written yet: work recorded after it sees it, in command order.
+	[[nodiscard]] bool PendingGuestWrite(uint64_t vaddr, uint64_t size, uint64_t* value);
+	// Unified memory: Kyty's own reads at record time (indirect arguments, shader constants)
+	// wait for GPU work recorded before them that may write [vaddr, vaddr + size). The guest's
+	// threads never do: they wait on the GPU's labels, as on the console.
+	void FinishPendingGpuWrites(uint64_t vaddr, uint64_t size);
+	// Unified memory: whether GPU work recorded and not done yet may write [vaddr, vaddr + size).
+	[[nodiscard]] bool HasPendingGpuWrites(uint64_t vaddr, uint64_t size);
+	// As FinishPendingGpuWrites, for the 4-byte reads of the SRT walker; true when it waited.
+	bool FinishPendingGpuWritesUnder(std::span<const uint64_t> addresses);
+	// Unified memory: whether the GPU wrote [vaddr, vaddr + size) since the last call for it. GPU
+	// writes leave no fault: a reader that keeps its own copy (the image heap) asks.
+	[[nodiscard]] bool TakeUnifiedGpuWrites(uint64_t vaddr, uint64_t size);
+	// Unified memory: whether the GPU ever wrote [vaddr, vaddr + size), as the old path's
+	// GPU-modified state says until a download.
+	[[nodiscard]] bool IsUnifiedGpuWritten(uint64_t vaddr, uint64_t size) const;
+	// The guest unmapped or remapped [vaddr, vaddr + size): views of it must go.
+	void ForgetUnifiedRange(uint64_t vaddr, uint64_t size);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// How many of these bytes the GPU wrote and the guest memory does not hold yet, at most size.
+	[[nodiscard]] uint64_t GpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	// Color metadata the GPU found free of the clear keys in `keys` (bits of code >> 5) stays so
@@ -113,6 +142,17 @@ private:
 	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
 	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
 	[[nodiscard]] BufferId CreateBuffer(uint64_t vaddr, uint64_t size);
+	void ImportUnifiedMemory();
+	// The window over [vaddr, vaddr + size) with the guest's views bound in it, or nothing when
+	// the range is not wholly guest memory (modules) or spans more than a window.
+	[[nodiscard]] BufferId UnifiedWindow(uint64_t vaddr, uint64_t size);
+	// Binds the guest's current views over [vaddr, vaddr + size) in the windows that cover it,
+	// and points the BDA table at them. True when every page of the range is guest memory.
+	bool BindUnified(uint64_t vaddr, uint64_t size);
+	// GPU work recorded now writes [vaddr, vaddr + size) of the guest memory.
+	void RecordUnifiedGpuWrite(uint64_t vaddr, uint64_t size);
+	void BindUnifiedPieces(uint64_t begin, uint64_t end,
+	                       const std::vector<std::tuple<uint64_t, uint64_t, uint64_t>>& pieces);
 	void                   Register(BufferId id);
 	void Unregister(BufferId id);
 	template <bool insert>
@@ -152,6 +192,30 @@ private:
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+	vk::DeviceMemory                                  m_unified_memory {};
+	uint8_t*                                          m_unified_base = nullptr;
+	// Labels the GPU writes, by address.
+	struct PendingGuestWriteEntry {
+		uint64_t size  = 0;
+		uint64_t tick  = 0;
+		uint64_t value = 0;
+	};
+	std::map<uint64_t, PendingGuestWriteEntry> m_pending_guest_writes;
+	// A window of guest addresses starts at every GiB and covers two: any range up to 1 GiB fits
+	// one (the device's buffers stay under 4 GiB).
+	static constexpr uint32_t UnifiedWindowBits = 30;
+	static constexpr uint64_t UnifiedWindowSize = uint64_t {2} << UnifiedWindowBits;
+	std::unordered_map<uint64_t, BufferId>            m_unified_windows;
+	// The guest views bound in the windows: address -> (size, offset in the dma-buf).
+	std::map<uint64_t, std::pair<uint64_t, uint64_t>> m_unified_views;
+	vk::Fence                                         m_unified_bind_fence {};
+	// Ranges bound for writing, by start: (end, tick of the command buffer that may write them).
+	std::map<uint64_t, std::pair<uint64_t, uint64_t>> m_pending_gpu_writes;
+	// The longest of them: no range starting further before an address can reach it.
+	uint64_t                                          m_pending_gpu_writes_span = 0;
+	// Ranges bound for writing that no TakeUnifiedGpuWrites has taken yet, and all of them.
+	RangeSet                                          m_unified_gpu_writes;
+	RangeSet                                          m_unified_gpu_written;
 };
 
 } // namespace Libs::Graphics

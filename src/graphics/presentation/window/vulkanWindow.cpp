@@ -444,6 +444,13 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	if (!add(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME)) {
 		supported.unlink<vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR>();
 	}
+	if (Libs::LibKernel::Memory::UnifiedMemoryFd() >= 0 &&
+	    HasExtension(available_extensions, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME) &&
+	    HasExtension(available_extensions, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME)) {
+		device_extensions.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+		device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+		graphics.unified_memory_import = true;
+	}
 	Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
 	physical_device.getFeatures2(&supported2);
 	const bool barycentric_supported = barycentric.fragmentShaderBarycentric == VK_TRUE;
@@ -454,8 +461,10 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	}
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
 
-	auto features12                     = WindowContext::RequiredVulkan12Features();
-	features12.shaderSharedInt64Atomics = supported12.shaderSharedInt64Atomics;
+	auto features12                      = WindowContext::RequiredVulkan12Features();
+	features12.shaderSharedInt64Atomics  = supported12.shaderSharedInt64Atomics;
+	features12.drawIndirectCount         = supported12.drawIndirectCount;
+	graphics.draw_indirect_count_enabled = supported12.drawIndirectCount != VK_FALSE;
 	if (!features12.shaderSharedInt64Atomics || !workgroup_layout.workgroupMemoryExplicitLayout) {
 		Log::WriteToConsoleAndLog(fmt::format(
 		    "WARNING: Native 64-bit LDS atomics are unavailable: shaderSharedInt64Atomics={}, "
@@ -571,6 +580,13 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	     graphics.occlusion_queries_enabled ? "true" : "false",
 	     graphics.occlusion_query_precise_enabled ? "true" : "false");
 	device_features.shaderInt64 = VK_TRUE;
+	// Unified memory keeps the guest's page table on sparse buffers over the imported memory.
+	if (graphics.unified_memory_import) {
+		graphics.unified_memory_import = supported2.features.sparseBinding &&
+		                                 supported2.features.sparseResidencyBuffer;
+		device_features.sparseBinding         = graphics.unified_memory_import;
+		device_features.sparseResidencyBuffer = graphics.unified_memory_import;
+	}
 	device_features.shaderFloat64 =
 	    supported2.features.shaderFloat64 && float_controls.shaderSignedZeroInfNanPreserveFloat64;
 

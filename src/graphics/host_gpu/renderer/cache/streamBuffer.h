@@ -36,10 +36,22 @@ inline constexpr vk::BufferUsageFlags ReadFlags =
 inline constexpr vk::BufferUsageFlags AllFlags =
     ReadFlags | vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eStorageBuffer;
 
+// A buffer whose pages are bound one by one to the imported guest memory (unified memory).
+struct SparseWindow {};
+
 class Buffer {
 public:
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
 	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size);
+	// A buffer over the imported guest memory (unified memory): no allocation of its own, and
+	// its mapping is the guest's own bytes.
+	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address,
+	       vk::BufferUsageFlags flags, uint64_t size, vk::DeviceMemory memory,
+	       uint64_t memory_offset, uint8_t* mapped);
+	// A window of guest addresses over the imported guest memory: its pages are bound to it as
+	// the guest maps them (vkQueueBindSparse), so that the GPU sees the guest's own page table.
+	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address,
+	       vk::BufferUsageFlags flags, uint64_t size, SparseWindow);
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
 
@@ -48,6 +60,8 @@ public:
 	[[nodiscard]] std::span<uint8_t> Mapped() const noexcept { return m_mapped; }
 	[[nodiscard]] bool               IsCoherent() const noexcept { return m_coherent; }
 	[[nodiscard]] MemoryUsage        Usage() const noexcept { return m_usage; }
+	[[nodiscard]] bool               IsExternal() const noexcept { return m_external; }
+	[[nodiscard]] uint64_t           MemoryOffset() const noexcept { return m_memory_offset; }
 	[[nodiscard]] uint64_t           CpuAddress() const noexcept { return m_cpu_address; }
 	[[nodiscard]] vk::DeviceAddress  BufferDeviceAddress() const noexcept {
 		EXIT_IF(m_device_address == 0);
@@ -91,6 +105,8 @@ private:
 	VmaAllocation                 m_allocation = nullptr;
 	uint64_t                      m_size;
 	bool                          m_coherent = false;
+	bool                          m_external = false;
+	uint64_t                      m_memory_offset = 0;
 	std::span<uint8_t>            m_mapped;
 };
 

@@ -9,6 +9,9 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, std::span<uint32_t> values);
+// Unified memory: true when it had to wait for GPU work, recorded before, that may write one of the
+// addresses the walker read. The walk then reads them again.
+using SrtReadsSettler = bool (*)(std::span<const uint64_t> addresses);
 
 // Image descriptors at base + first + k * step, k < count, within size bytes that a sampled
 // root selects by GPU-computed byte offset. The host keeps them resident instead of
@@ -45,6 +48,7 @@ struct SrtRuntime {
 	std::span<const uint32_t> workgroup_counts;
 	uint64_t                  indirect_args_address = 0;
 	ImageHeapSource*          image_heap            = nullptr;
+	SrtReadsSettler           settle_reads          = nullptr;
 };
 
 class SrtReadCapture {

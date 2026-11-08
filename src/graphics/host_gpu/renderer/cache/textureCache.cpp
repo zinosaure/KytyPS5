@@ -116,6 +116,15 @@ constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
 	return true;
 }
 
+constexpr uint64_t LargeImage = 1u << 20u;
+
+uint64_t SliceBytes(const ImageInfo& info) {
+	const auto shift = info.IsBlock() ? 2u : 0u;
+	const auto round = (1u << shift) - 1u;
+	return static_cast<uint64_t>((info.extent.width + round) >> shift) *
+	       ((info.extent.height + round) >> shift) * info.bytes_per_block;
+}
+
 } // namespace
 
 TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler,
@@ -1045,7 +1054,10 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	const GuestRange viewed {range.address + slice_size * first + mip.offset,
 	                         slice_size * (count - 1) + mip.size};
 	const auto run = [&](uint32_t slice) { return viewed.address + slice_size * slice; };
-	if (m_buffer_cache.IsRegionGpuModified(viewed.address, viewed.size)) {
+	// Unified memory has no GPU-modified pages: a range the GPU wrote takes the same GPU check, in
+	// command order. Read by the CPU now, its codes could predate the fill that writes them.
+	if (m_buffer_cache.IsRegionGpuModified(viewed.address, viewed.size) ||
+	    m_buffer_cache.IsUnifiedGpuWritten(viewed.address, viewed.size)) {
 		std::array<vk::ClearAttachment, TileManager::ColorClearSlots> clears {};
 		uint32_t keys = 0;
 		for (uint32_t key = 0; key < clears.size(); key++) {
@@ -1321,6 +1333,21 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
 			                                    inserted.info.data.size)) {
 				inserted.MarkBufferModified();
+			}
+			// Unreal hands the memory of its transient targets from one image to the next, several times
+			// a frame. A large target, depth or storage image created there holds nothing the game reads
+			// before writing it: on the console, it holds what the previous image left, and the guest
+			// memory does not even have that. Reloading it would cost a full retile for undefined
+			// contents. It reloads when buffer writes cover a slice of it, as a clear through a buffer.
+			const auto& info = inserted.info;
+			if (desc.type != BindingType::Texture && desc.type != BindingType::VideoOut &&
+			    info.IsTiled() && info.data.size >= LargeImage && info.samples == 1 &&
+			    info.metadata.compression == VideoOutCompression::Uncompressed &&
+			    m_buffer_cache.GpuDirtyBytes(info.data.address, info.data.size) < SliceBytes(info)) {
+				inserted.ClearBufferModified();
+				if (inserted.IsCpuDirty()) {
+					inserted.RefreshComplete();
+				}
 			}
 		}
 		auto& image = m_slot_images[result];
@@ -1785,6 +1812,10 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	}
 	ForgetColorMetadataChecks(image.info.data.address, copy_size);
 	m_texture_cache.DownloadImage(image, buffer, buf_offset, copy_size, levels);
+	if (buffer.IsExternal()) {
+		// Unified memory: the image lands in the guest memory, on the GPU.
+		RecordUnifiedGpuWrite(image.info.data.address, copy_size);
+	}
 	return true;
 }
 
@@ -1831,6 +1862,25 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	return true;
 }
 
+// Unreal places counters, indirect arguments and lists in the memory of its large render targets
+// between their uses, and its culling passes write a few bytes of pools that start at one. A shader
+// buffer smaller than one slice of a large GPU-produced image, or ending past the image and its
+// stencil plane, is such a resource, not the image's contents: reloading the image from guest memory
+// would cost a full detile. Small images reload, as one written in part through a buffer can hold
+// what is read from it.
+static bool IsAliasedBufferWrite(const Image& image, uint64_t size) {
+	const auto& info = image.info;
+	if (!info.IsTiled() || info.data.size < LargeImage ||
+	    !(image.usage.render_target || image.usage.storage || info.IsDepth())) {
+		return false;
+	}
+	const uint64_t slice = SliceBytes(info);
+	const uint64_t end   = info.stencil.size != 0 && info.stencil.address > info.data.address
+	                           ? std::max(info.data.End(), info.stencil.End())
+	                           : info.data.End();
+	return size < slice || size > end - info.data.address;
+}
+
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
 	for (const auto id: FindImagesInRegion(address, size)) {
@@ -1839,6 +1889,9 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 			continue;
 		}
 		image.ClearGpuModified();
+		if (IsAliasedBufferWrite(image, size)) {
+			continue;
+		}
 		image.MarkBufferModified();
 	}
 }

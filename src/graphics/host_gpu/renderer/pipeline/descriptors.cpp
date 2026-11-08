@@ -676,6 +676,7 @@ void RenderExecutor::BindImage(ImageId id, bool storage) {
 	}
 	image.binding.is_bound = true;
 	image.binding.shader_write |= storage;
+	image.usage.storage |= storage;
 	m_bound_images.push_back(id);
 }
 

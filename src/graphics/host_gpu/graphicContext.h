@@ -28,6 +28,10 @@ struct GraphicContext {
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
+	// The guest's memory is a dma-buf the device imports (KYTY_UNIFIED_MEMORY).
+	bool                               unified_memory_import                 = false;
+	// Its size once imported: the game's memory, counted in the heaps but not the caches' use.
+	uint64_t                           unified_memory_bytes                  = 0;
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
 	bool                               attachment_feedback_loop_enabled      = false;
@@ -41,6 +45,8 @@ struct GraphicContext {
 	bool                               occlusion_query_precise_enabled       = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
+	// vkCmdDraw*IndirectCount: a guest multi-draw's count read by the GPU (chantier 41, P4).
+	bool                                      draw_indirect_count_enabled           = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;
 	uint32_t                           min_subgroup_size                     = 0;

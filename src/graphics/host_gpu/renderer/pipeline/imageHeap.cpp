@@ -201,7 +201,9 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 
 bool ImageHeap::Refresh(Memory& memory) {
 	// GPU writes leave no fault; reading the table downloads them.
-	const bool gpu_dirty = m_context.GetBufferCache().HasGpuDirtyBytes(memory.base, memory.size);
+	auto&      buffers   = m_context.GetBufferCache();
+	const bool unified   = buffers.TakeUnifiedGpuWrites(memory.base, memory.size);
+	const bool gpu_dirty = unified || buffers.HasGpuDirtyBytes(memory.base, memory.size);
 	const auto pages     = memory.dirty_pages.size();
 	m_runs.clear();
 	{

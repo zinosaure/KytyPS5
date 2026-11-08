@@ -103,6 +103,9 @@ public:
 	void WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t wait_op);
 	void MemSemaphore(uint64_t* counter, bool signal, bool write);
 	void WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num, uint32_t write_control);
+	// A value the CP reads: a label the GPU still has to write (unified memory) is read as the
+	// value it will hold, which work recorded after it sees in command order.
+	[[nodiscard]] uint64_t ReadGuestValue(const void* address, uint64_t size);
 	void WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes);
 	void DmaData(uint8_t dst_sel, uint64_t dst_address_or_offset, uint8_t src_sel,
 	             uint64_t src_address_or_offset_or_immediate, uint32_t num_bytes);
@@ -137,6 +140,10 @@ private:
 	// read only when a later draw inherits it.
 	uint32_t m_num_instances      = 1;
 	uint64_t m_num_instances_addr = 0;
+	// With a count the GPU reads: where it is, the record stride, and the records at most.
+	uint64_t m_num_instances_count_addr = 0;
+	uint32_t m_num_instances_stride     = 0;
+	uint32_t m_num_instances_max        = 0;
 
 	const int m_interrupt_event_id;
 	uint64_t  m_synthetic_occlusion_counter = 0;

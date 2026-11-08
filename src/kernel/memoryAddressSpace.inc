@@ -104,12 +104,35 @@ public:
 			}
 		}
 #else
-		m_fd = static_cast<int>(syscall(SYS_memfd_create, "KytyDirectMemory", 0));
+		if (UnifiedMemoryRequested()) {
+			// A dma-buf of the system heap, not a memfd: the GPU imports it whole
+			// (VK_EXT_external_memory_dma_buf) and reads and writes the guest's bytes in place.
+			// RADV refuses to import a shared memfd mapping as a host pointer.
+			const int heap = open("/dev/dma_heap/system", O_RDWR | O_CLOEXEC);
+			dma_heap_allocation_data allocation {};
+			allocation.len      = m_size;
+			allocation.fd_flags = O_RDWR | O_CLOEXEC;
+			if (heap >= 0 && ioctl(heap, DMA_HEAP_IOCTL_ALLOC, &allocation) == 0) {
+				m_fd      = static_cast<int>(allocation.fd);
+				m_unified = true;
+			} else {
+				LOGF_COLOR(Log::Color::Red,
+				           "\t direct-memory backing: dma-buf heap unavailable (%d), unified "
+				           "memory off\n",
+				           errno);
+			}
+			if (heap >= 0) {
+				close(heap);
+			}
+		}
+		if (m_fd < 0) {
+			m_fd = static_cast<int>(syscall(SYS_memfd_create, "KytyDirectMemory", 0));
+		}
 #endif
 		if (m_fd < 0) {
 			EXIT("direct-memory backing: shared fd creation failed: %d\n", errno);
 		}
-		if (ftruncate(m_fd, static_cast<off_t>(m_size)) != 0) {
+		if (!m_unified && ftruncate(m_fd, static_cast<off_t>(m_size)) != 0) {
 			EXIT("direct-memory backing: ftruncate to %" PRIu64 " MB failed: %d\n",
 			     m_size / (1024U * 1024U), errno);
 		}
@@ -156,6 +179,90 @@ public:
 	}
 
 	[[nodiscard]] uint64_t GetBackingSize() const { return m_size; }
+
+	// The dma-buf behind the guest's memory, or -1 when it is a memfd.
+	[[nodiscard]] int GetUnifiedFd() const { return m_unified ? m_fd : -1; }
+
+	// The longest run of views around [vaddr, vaddr + size) that is contiguous both in guest
+	// addresses and in the backing, so that one GPU buffer can cover it.
+	bool FindBackingRun(uint64_t vaddr, uint64_t size, uint64_t* run_vaddr, uint64_t* run_size,
+	                    uint64_t* run_backing_offset) {
+		if (size == 0 || UINT64_MAX - vaddr < size) {
+			return false;
+		}
+		std::shared_lock lock(m_mutex);
+		auto             found = m_maps.upper_bound(vaddr);
+		if (found == m_maps.begin()) {
+			return false;
+		}
+		--found;
+		if (vaddr >= found->second.vaddr + found->second.size) {
+			return false;
+		}
+		auto first = found;
+		while (first != m_maps.begin()) {
+			const auto previous = std::prev(first);
+			if (previous->second.vaddr + previous->second.size != first->second.vaddr ||
+			    previous->second.backing_offset + previous->second.size !=
+			        first->second.backing_offset) {
+				break;
+			}
+			first = previous;
+		}
+		auto last = found;
+		for (auto next = std::next(last); next != m_maps.end(); ++next) {
+			if (last->second.vaddr + last->second.size != next->second.vaddr ||
+			    last->second.backing_offset + last->second.size != next->second.backing_offset) {
+				break;
+			}
+			last = next;
+		}
+		const auto begin = first->second.vaddr;
+		const auto end   = last->second.vaddr + last->second.size;
+		if (vaddr + size > end) {
+			return false;
+		}
+		*run_vaddr          = begin;
+		*run_size           = end - begin;
+		*run_backing_offset = first->second.backing_offset;
+		return true;
+	}
+
+	// The views over [vaddr, vaddr + size), clipped to it, in address order; gaps are not reported.
+	template <typename Func>
+	void ForEachView(uint64_t vaddr, uint64_t size, Func&& func) {
+		std::shared_lock lock(m_mutex);
+		const auto       end = vaddr + size;
+		auto             it  = m_maps.upper_bound(vaddr);
+		if (it != m_maps.begin()) {
+			--it;
+		}
+		for (; it != m_maps.end() && it->second.vaddr < end; ++it) {
+			const auto& entry = it->second;
+			const auto  begin = std::max(vaddr, entry.vaddr);
+			const auto  stop  = std::min(end, entry.vaddr + entry.size);
+			if (begin < stop) {
+				func(begin, stop - begin, entry.backing_offset + (begin - entry.vaddr));
+			}
+		}
+	}
+
+	// GAMEFLEX-DIAG: the views over [vaddr, vaddr + size), as "vaddr+size@offset".
+	std::string DescribeViews(uint64_t vaddr, uint64_t size) {
+		std::shared_lock lock(m_mutex);
+		std::string      out;
+		auto             it = m_maps.upper_bound(vaddr);
+		if (it != m_maps.begin()) {
+			--it;
+		}
+		for (int n = 0; it != m_maps.end() && it->first < vaddr + size && n < 24; ++it, ++n) {
+			char line[96];
+			snprintf(line, sizeof line, " 0x%llx+0x%llx@0x%llx", (unsigned long long)it->second.vaddr,
+			         (unsigned long long)it->second.size, (unsigned long long)it->second.backing_offset);
+			out += line;
+		}
+		return out;
+	}
 
 	void ZeroRange(uint64_t backing_offset, uint64_t size) {
 		std::lock_guard lock(m_mutex);
@@ -540,6 +647,7 @@ private:
 	uint64_t                     m_size         = 0;
 	std::shared_mutex            m_mutex;
 	std::map<uint64_t, MapEntry> m_maps;
+	bool                         m_unified = false;
 };
 
 class GuestAddressSpace {
@@ -589,6 +697,16 @@ public:
 
 	[[nodiscard]] uint64_t GetGranularity() const { return m_granularity; }
 	[[nodiscard]] uint64_t GetBackingBase() const { return m_backing->GetBackingBase(); }
+	[[nodiscard]] int      GetUnifiedFd() const { return m_backing->GetUnifiedFd(); }
+	std::string DescribeViews(uint64_t vaddr, uint64_t size) { return m_backing->DescribeViews(vaddr, size); }
+	template <typename Func>
+	void ForEachView(uint64_t vaddr, uint64_t size, Func&& func) {
+		m_backing->ForEachView(vaddr, size, std::forward<Func>(func));
+	}
+	bool FindBackingRun(uint64_t vaddr, uint64_t size, uint64_t* run_vaddr, uint64_t* run_size,
+	                    uint64_t* run_backing_offset) {
+		return m_backing->FindBackingRun(vaddr, size, run_vaddr, run_size, run_backing_offset);
+	}
 	[[nodiscard]] uint64_t GetBackingSize() const { return m_backing->GetBackingSize(); }
 
 	void ZeroBacking(uint64_t backing_offset, uint64_t size) {

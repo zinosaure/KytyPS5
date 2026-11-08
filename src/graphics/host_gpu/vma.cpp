@@ -94,7 +94,7 @@ uint64_t GraphicContext::GetDeviceMemoryUsage() const {
 			usage += budgets[heap].usage;
 		}
 	}
-	return usage;
+	return usage - std::min(usage, unified_memory_bytes);
 }
 
 uint32_t GraphicContext::GetHeapUsage(std::span<HeapUsage, VK_MAX_MEMORY_HEAPS> heaps) const {
@@ -141,6 +141,7 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 	if (discrete) {
 		return budget - std::min<uint64_t>(budget / 8, 1024ull * 1024 * 1024);
 	}
+	usage -= std::min(usage, unified_memory_bytes);
 	constexpr uint64_t system_reserve = 8ull * 1024 * 1024 * 1024;
 	const auto         available      = budget > usage ? budget - usage : uint64_t {0};
 	return std::max(local, available > system_reserve ? available - system_reserve : uint64_t {0});

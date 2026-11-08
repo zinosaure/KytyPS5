@@ -246,6 +246,15 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	}
 
 	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
+		// Unified memory: a label the GPU writes in work recorded before. Its barriers already
+		// hold everything recorded after it until the work before it is done, which is what the
+		// wait asks: go on recording. A wait on another value, the CPU or another queue suspends.
+		uint64_t pending = 0;
+		if (m_renderer.GetBufferCache().PendingGuestWrite(reinterpret_cast<uint64_t>(addr),
+		                                                  sizeof(T), &pending) &&
+		    TestWaitRegMemValue(static_cast<T>(pending), ref, mask, func)) {
+			return;
+		}
 		SuspendPm4();
 	}
 }
@@ -282,12 +291,28 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		return;
 	}
 
-	// Completion labels can be reused immediately; memcpy may write a destination twice.
+	// The CP writes when it reads the packet, before the GPU runs the work recorded ahead of it:
+	// readers on the CP's side (the SRT walker, indirect registers) must see the value, unified
+	// memory or not. Completion labels can be reused immediately; memcpy may write a destination
+	// twice.
 	auto* output = static_cast<volatile uint32_t*>(dst);
 	for (uint32_t i = 0; i < dw_num; i++) {
 		*output = src[i];
 		output += !write_one_address;
 	}
+}
+
+uint64_t CommandProcessor::ReadGuestValue(const void* address, uint64_t size) {
+	uint64_t   value   = 0;
+	auto&      buffers = m_renderer.GetBufferCache();
+	const auto vaddr   = reinterpret_cast<uint64_t>(address);
+	if (!buffers.PendingGuestWrite(vaddr, size, &value)) {
+		// The CP reads it now: GPU work recorded before that writes it must be done (a culling
+		// shader that decides which draws run).
+		buffers.FinishPendingGpuWrites(vaddr, size);
+		std::memcpy(&value, address, size);
+	}
+	return value;
 }
 
 void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes) {
@@ -635,8 +660,22 @@ void CommandProcessor::SetNumInstances(uint32_t num_instances) {
 
 uint32_t CommandProcessor::NumInstances() {
 	if (m_num_instances_addr != 0) {
-		m_num_instances      = *reinterpret_cast<const uint32_t*>(m_num_instances_addr);
-		m_num_instances_addr = 0;
+		auto address = m_num_instances_addr;
+		if (m_num_instances_count_addr != 0) {
+			// The record count the GPU read: the last record's address follows it.
+			const auto last  = (address - offsetof(vk::DrawIndirectCommand, instanceCount));
+			const auto count = static_cast<uint32_t>(
+			    ReadGuestValue(reinterpret_cast<const void*>(m_num_instances_count_addr), sizeof(uint32_t)));
+			const auto first = last - (uint64_t {m_num_instances_max} - 1u) * m_num_instances_stride;
+			address = count == 0 ? 0
+			          : first + uint64_t {std::min(count, m_num_instances_max) - 1u} * m_num_instances_stride +
+			                offsetof(vk::DrawIndirectCommand, instanceCount);
+		}
+		if (address != 0) {
+			m_num_instances = static_cast<uint32_t>(ReadGuestValue(reinterpret_cast<const void*>(address), sizeof(uint32_t)));
+		}
+		m_num_instances_addr       = 0;
+		m_num_instances_count_addr = 0;
 	}
 	return m_num_instances;
 }
@@ -672,7 +711,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 		case 0x03:
 			// The wait selector applies only to Z-pass query readiness.
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
-			value = *reinterpret_cast<const volatile uint64_t*>(address);
+			value = ReadGuestValue(const_cast<const void*>(address), sizeof(uint64_t));
 			break;
 		default: EXIT("unknown predication op: 0x%08" PRIx32 "\n", op);
 	}
@@ -762,9 +801,14 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	                     stride_in_bytes < (indexed ? sizeof(vk::DrawIndexedIndirectCommand)
 	                                                : sizeof(vk::DrawIndirectCommand)));
 
-	const auto draw_count = count_addr == nullptr
-	                            ? max_count_or_count
-	                            : std::min(uint32_t {*count_addr}, max_count_or_count);
+	auto& buffers = m_renderer.GetBufferCache();
+	// The GPU reads the guest's count itself when it can; the CPU reads it only to draw alone.
+	const bool gpu_count = count_addr != nullptr && m_renderer.GetGraphics().draw_indirect_count_enabled;
+	uint32_t   draw_count = max_count_or_count;
+	if (count_addr != nullptr && !gpu_count) {
+		draw_count = static_cast<uint32_t>(std::min<uint64_t>(
+		    ReadGuestValue(const_cast<const uint32_t*>(count_addr), sizeof(uint32_t)), max_count_or_count));
+	}
 	if (draw_count == 0) {
 		return;
 	}
@@ -772,12 +816,16 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 	auto&      executor  = m_renderer.GetRenderExecutor();
 	const auto args_addr = m_draw_indirect_args_base_addr + data_offset;
-	// NUM_INSTANCES keeps the last draw's instance count.
+	// NUM_INSTANCES keeps the last draw's instance count, read when needed.
 	m_num_instances_addr = args_addr + static_cast<uint64_t>(draw_count - 1) * stride_in_bytes +
 	                       offsetof(vk::DrawIndirectCommand, instanceCount);
+	m_num_instances_count_addr = gpu_count ? reinterpret_cast<uint64_t>(count_addr) : 0;
+	m_num_instances_stride     = stride_in_bytes;
+	m_num_instances_max        = draw_count;
 	// The GPU reads the records if the shaders allow; the VS prolog removes Vulkan's bases
 	// from the index VGPRs and copies them only to the user SGPRs the packet patches.
 	DrawIndirectArgs records {args_addr, draw_count, stride_in_bytes};
+	records.count_address = gpu_count ? reinterpret_cast<uint64_t>(count_addr) : 0;
 	if (IndirectDrawOffsets(registers, records.offsets)) {
 		if (!indexed && executor.DrawAuto(CurrentBuffer(), {.indirect = records})) {
 			return;
@@ -791,7 +839,17 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		}
 	}
 
+	if (gpu_count) {
+		// Drawn one by one: the CPU needs the count after all.
+		draw_count = static_cast<uint32_t>(std::min<uint64_t>(
+		    ReadGuestValue(const_cast<const uint32_t*>(count_addr), sizeof(uint32_t)), max_count_or_count));
+		if (draw_count == 0) {
+			return;
+		}
+	}
 	const uint32_t max_indices = m_index_buffer_size != 0 ? m_index_buffer_size : UINT32_MAX;
+	// The records are read here, on the CPU: GPU work recorded before may write them.
+	buffers.FinishPendingGpuWrites(args_addr, uint64_t {draw_count} * stride_in_bytes);
 	for (uint32_t i = 0; i < draw_count; i++) {
 		const auto addr = args_addr + static_cast<uint64_t>(i) * stride_in_bytes;
 		if (!indexed) {
@@ -833,6 +891,8 @@ void CommandProcessor::ProcessPssr(const Pssr::Request& request) {
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
 	if ((mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
+		m_renderer.GetBufferCache().FinishPendingGpuWrites(args_addr,
+		                                                   sizeof(vk::DispatchIndirectCommand));
 		const auto* args = reinterpret_cast<const vk::DispatchIndirectCommand*>(args_addr);
 		DispatchDirect(args->x, args->y, args->z, mode);
 		return;
@@ -890,6 +950,10 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 	const auto write_label = [this, address](const void* value, uint64_t size) {
 		const auto vaddr   = reinterpret_cast<uint64_t>(address);
 		auto&      buffers = m_renderer.GetBufferCache();
+		// Unified memory: the GPU writes the label when it gets there, as the console does.
+		if (GuestRange {vaddr, size}.Valid() && buffers.WriteGuestMemory(vaddr, value, size)) {
+			return;
+		}
 		if (!GuestRange {vaddr, size}.Valid() || !buffers.IsRegionGpuModified(vaddr, size) ||
 		    buffers.HasGpuDirtyBytes(vaddr, size) ||
 		    !LibKernel::Memory::TryWriteBacking(vaddr, value, size)) {

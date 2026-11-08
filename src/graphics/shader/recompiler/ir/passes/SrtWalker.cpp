@@ -1375,11 +1375,22 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	if (plan.srt_code == nullptr || runtime.user_data.size() < plan.srt_user_data) return false;
 	flat.assign(plan.srt_reads.size(), 0u);
 	using Walker = const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*, uint64_t);
-	t_running_walker = plan.srt_code.get();
-	const auto* end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),
-	                                                     plan.srt_scratch.data(), runtime.shader_base);
-	t_running_walker = nullptr;
+	const auto walk = [&] {
+		t_running_walker = plan.srt_code.get();
+		const auto* result = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),
+		                                                        plan.srt_scratch.data(), runtime.shader_base);
+		t_running_walker = nullptr;
+		return result;
+	};
+	const auto* end = walk();
 	if (end == nullptr) return false;
+	// The tables may come from GPU work recorded before and not done: read them once it is.
+	const auto* first = plan.srt_scratch.data() + plan.srt_captures / 8u;
+	if (runtime.settle_reads != nullptr && end != first &&
+	    runtime.settle_reads(std::span(first, static_cast<size_t>(end - first)))) {
+		end = walk();
+		if (end == nullptr) return false;
+	}
 	if (reads != nullptr) {
 		for (auto* read = plan.srt_scratch.data() + plan.srt_captures / 8u; read != end; ++read)
 			reads->emplace_back(*read, sizeof(uint32_t));

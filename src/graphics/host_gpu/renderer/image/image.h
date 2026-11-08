@@ -30,6 +30,7 @@ struct CachedImageView {
 };
 
 struct ImageUsage {
+	bool storage       = false;
 	bool render_target = false;
 	bool video_out     = false;
 };

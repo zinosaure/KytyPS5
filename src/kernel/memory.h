@@ -4,6 +4,9 @@
 #include "common/abi.h"
 #include "common/common.h"
 #include "common/virtualMemory.h"
+#include <functional>
+#include <span>
+#include <string>
 
 namespace Libs::Graphics {
 class RenderContext;
@@ -133,6 +136,21 @@ int UnmapAmmMemory(uint64_t vaddr, size_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
+// Unified memory: waits for GPU work recorded before that may write one of these 4-byte reads;
+// true when it did. The GPU thread only.
+bool                   SettleGpuWrites(std::span<const uint64_t> addresses);
+// Unified memory (KYTY_UNIFIED_MEMORY): the dma-buf behind the guest's memory, or -1.
+[[nodiscard]] int      UnifiedMemoryFd();
+[[nodiscard]] uint64_t UnifiedMemorySize();
+[[nodiscard]] uint8_t* UnifiedMemoryBase();
+// The guest views around [vaddr, vaddr + size) that one GPU buffer can cover: contiguous in
+// guest addresses and in the dma-buf. False outside unified memory.
+bool FindUnifiedRun(uint64_t vaddr, uint64_t size, uint64_t* run_vaddr, uint64_t* run_size,
+                    uint64_t* run_backing_offset);
+std::string DescribeUnifiedViews(uint64_t vaddr, uint64_t size);
+// The guest views over [vaddr, vaddr + size), clipped: (address, size, offset in the dma-buf).
+void ForEachUnifiedView(uint64_t vaddr, uint64_t size,
+                        const std::function<void(uint64_t, uint64_t, uint64_t)>& func);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);

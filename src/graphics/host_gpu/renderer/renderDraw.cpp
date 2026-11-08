@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/renderDraw.h"
+#include "gpu_blit_shaders/gpu_mesh_indirect_spv.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -1126,6 +1127,12 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		args_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, size, false);
 		EXIT_IF((args_buffer.second & 3u) != 0);
 	}
+	std::pair<Buffer*, uint64_t> count_buffer {};
+	if (emit.indirect.count_address != 0) {
+		count_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.count_address,
+		                                                       sizeof(uint32_t), false);
+		EXIT_IF((count_buffer.second & 3u) != 0);
+	}
 	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state);
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering =
@@ -1226,9 +1233,17 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		}
 	} else if (args_buffer.first == nullptr) {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
+	} else if (draw.indexed && count_buffer.first != nullptr) {
+		vk_buffer.drawIndexedIndirectCount(args_buffer.first->Handle(), args_buffer.second,
+		                                   count_buffer.first->Handle(), count_buffer.second,
+		                                   emit.indirect.count, emit.indirect.stride);
 	} else if (draw.indexed) {
 		vk_buffer.drawIndexedIndirect(args_buffer.first->Handle(), args_buffer.second,
 		                              emit.indirect.count, emit.indirect.stride);
+	} else if (count_buffer.first != nullptr) {
+		vk_buffer.drawIndirectCount(args_buffer.first->Handle(), args_buffer.second,
+		                            count_buffer.first->Handle(), count_buffer.second,
+		                            emit.indirect.count, emit.indirect.stride);
 	} else {
 		vk_buffer.drawIndirect(args_buffer.first->Handle(), args_buffer.second,
 		                       emit.indirect.count, emit.indirect.stride);
@@ -1263,6 +1278,8 @@ static std::optional<DrawEmitInfo> ResolveDrawEmit(const HW::UserConfig&        
 	}
 	if (indirect.address != 0) {
 		if (!vs.indirect_draw ||
+		    // An indirect count in mesh draws needs the CPU: the task shader has one record per group.
+		    (vs.stage.module->info.stage == ShaderType::Mesh && indirect.count_address != 0) ||
 		    ucfg.GetPrimType() == Prospero::PrimitiveType::kQuadListLegacy ||
 		    vs.indirect_offsets != indirect.offsets) {
 			return std::nullopt;

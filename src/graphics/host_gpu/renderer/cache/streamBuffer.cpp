@@ -105,8 +105,56 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	}
 }
 
+Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address,
+               vk::BufferUsageFlags flags, uint64_t size, vk::DeviceMemory memory,
+               uint64_t memory_offset, uint8_t* mapped)
+    : m_graphics(&graphics), m_scheduler(&scheduler), m_cpu_address(cpu_address), m_size(size),
+      m_coherent(true), m_external(true), m_memory_offset(memory_offset), m_mapped(mapped, size) {
+	EXIT_IF(memory == nullptr || size == 0);
+	vk::ExternalMemoryBufferCreateInfo external {};
+	external.handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT;
+	vk::BufferCreateInfo buffer_info {};
+	buffer_info.pNext = &external;
+	buffer_info.size  = size;
+	buffer_info.usage = flags;
+	EXIT_NOT_IMPLEMENTED(graphics.device.createBuffer(&buffer_info, nullptr, &m_buffer) !=
+	                     vk::Result::eSuccess);
+	EXIT_NOT_IMPLEMENTED(graphics.device.bindBufferMemory(m_buffer, memory, memory_offset) !=
+	                     vk::Result::eSuccess);
+	if (flags & vk::BufferUsageFlagBits::eShaderDeviceAddress) {
+		vk::BufferDeviceAddressInfo address_info {};
+		address_info.buffer = m_buffer;
+		m_device_address    = graphics.device.getBufferAddress(address_info);
+		EXIT_IF(m_device_address == 0);
+	}
+}
+
+Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address,
+               vk::BufferUsageFlags flags, uint64_t size, SparseWindow)
+    : m_graphics(&graphics), m_scheduler(&scheduler), m_cpu_address(cpu_address), m_size(size),
+      m_coherent(true), m_external(true) {
+	vk::ExternalMemoryBufferCreateInfo external {};
+	external.handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT;
+	vk::BufferCreateInfo buffer_info {};
+	buffer_info.pNext = &external;
+	buffer_info.flags =
+	    vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency;
+	buffer_info.size  = size;
+	buffer_info.usage = flags;
+	EXIT_NOT_IMPLEMENTED(graphics.device.createBuffer(&buffer_info, nullptr, &m_buffer) !=
+	                     vk::Result::eSuccess);
+	if (flags & vk::BufferUsageFlagBits::eShaderDeviceAddress) {
+		vk::BufferDeviceAddressInfo address_info {};
+		address_info.buffer = m_buffer;
+		m_device_address    = graphics.device.getBufferAddress(address_info);
+		EXIT_IF(m_device_address == 0);
+	}
+}
+
 Buffer::~Buffer() {
-	if (m_buffer != nullptr) {
+	if (m_buffer != nullptr && m_external) {
+		m_graphics->device.destroyBuffer(m_buffer);
+	} else if (m_buffer != nullptr) {
 		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
 	}
 }

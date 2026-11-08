@@ -250,6 +250,7 @@ enum class StageInputKind {
 	BaseVertex,
 	BaseInstance,
 	Parameter,
+	DrawIndex,
 };
 
 enum class StageOutputKind {

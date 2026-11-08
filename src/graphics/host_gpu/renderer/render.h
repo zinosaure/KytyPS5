@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -40,6 +41,8 @@ struct DrawIndirectArgs {
 	uint32_t              count   = 0;
 	uint32_t              stride  = 0;
 	ShaderIndirectOffsets offsets;
+	// The guest's count, read by the GPU, of at most `count` records; 0 when `count` is it.
+	uint64_t              count_address = 0;
 };
 
 struct DrawIndexArgs {

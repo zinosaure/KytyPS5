@@ -364,6 +364,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	    .shader_base                = params.Base(),
 	    .read_specialization_memory = ReadShaderGuestMemory,
 	    .image_heap                 = m_image_heap,
+	    .settle_reads               = Libs::LibKernel::Memory::SettleGpuWrites,
 	};
 	ShaderRecompiler::CompileOptions options {.wave_size = input_info.wave_size};
 	if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
@@ -692,7 +693,8 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
-	if (!tess_active && !mesh_active) {
+	if (!tess_active) {
+		// Mesh shaders read an indirect draw's parameters from a record per draw (P4).
 		vertex_info[0].indirect_offsets = state.indirect_offsets;
 		vertex_info[0].indirect_draw    = state.indirect_draw;
 	}

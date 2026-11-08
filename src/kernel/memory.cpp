@@ -46,6 +46,10 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#if !defined(__APPLE__)
+#include <linux/dma-heap.h>
+#include <sys/ioctl.h>
+#endif
 #endif
 
 namespace Libs::LibKernel::Memory {
@@ -174,6 +178,16 @@ static callback_func_t       g_test_backing_read                        = nullpt
 static uint64_t              g_test_backing_bytes_zeroed                = 0;
 static std::atomic<uint64_t> g_test_free_range_visits {0};
 #endif
+
+// KYTY_UNIFIED_MEMORY=1: the guest's memory is a dma-buf the GPU imports, and reads and writes in
+// place (chantier 41 of GameFlex).
+static bool UnifiedMemoryRequested() {
+	static const bool requested = [] {
+		const char* value = std::getenv("KYTY_UNIFIED_MEMORY");
+		return value != nullptr && value[0] == '1';
+	}();
+	return requested;
+}
 
 #include "memoryAddressSpace.inc"
 
@@ -848,17 +862,58 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return g_guest_address_space->TryReadBacking(vaddr, data, size);
 }
 
+int UnifiedMemoryFd() {
+	return g_guest_address_space != nullptr ? g_guest_address_space->GetUnifiedFd() : -1;
+}
+
+uint64_t UnifiedMemorySize() {
+	return g_guest_address_space != nullptr ? g_guest_address_space->GetBackingSize() : 0;
+}
+
+uint8_t* UnifiedMemoryBase() {
+	return g_guest_address_space != nullptr
+	           ? reinterpret_cast<uint8_t*>(g_guest_address_space->GetBackingBase())
+	           : nullptr;
+}
+
+void ForEachUnifiedView(uint64_t vaddr, uint64_t size,
+                        const std::function<void(uint64_t, uint64_t, uint64_t)>& func) {
+	if (g_guest_address_space != nullptr && g_guest_address_space->GetUnifiedFd() >= 0) {
+		g_guest_address_space->ForEachView(vaddr, size, func);
+	}
+}
+
+std::string DescribeUnifiedViews(uint64_t vaddr, uint64_t size) {
+	return g_guest_address_space != nullptr ? g_guest_address_space->DescribeViews(vaddr, size) : "";
+}
+
+bool FindUnifiedRun(uint64_t vaddr, uint64_t size, uint64_t* run_vaddr, uint64_t* run_size,
+                    uint64_t* run_backing_offset) {
+	return g_guest_address_space != nullptr && g_guest_address_space->GetUnifiedFd() >= 0 &&
+	       g_guest_address_space->FindBackingRun(vaddr, size, run_vaddr, run_size,
+	                                             run_backing_offset);
+}
+
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		if (!Graphics::GuestGpu::IsGpuThread()) {
 			return false;
 		}
 		auto& buffers = GetGpuResources().GetBufferCache();
-		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
+		if (buffers.IsUnified()) {
+			buffers.FinishPendingGpuWrites(vaddr, size);
+		} else if (buffers.HasGpuDirtyBytes(vaddr, size)) {
 			buffers.ReadMemory(vaddr, size);
 		}
 	}
 	return TryReadBacking(vaddr, data, size);
+}
+
+bool SettleGpuWrites(std::span<const uint64_t> addresses) {
+	if (g_gpu_resources == nullptr || !Graphics::GuestGpu::IsGpuThread()) {
+		return false;
+	}
+	return GetGpuResources().GetBufferCache().FinishPendingGpuWritesUnder(addresses);
 }
 
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {

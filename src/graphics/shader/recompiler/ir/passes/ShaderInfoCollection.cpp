@@ -449,6 +449,7 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 				case StageInputKind::LocalInvocationIndex:
 				case StageInputKind::BaseVertex:
 				case StageInputKind::BaseInstance:
+				case StageInputKind::DrawIndex:
 					if (component != 0u) {
 						return Fail("typed scalar builtin component is out of range");
 					}

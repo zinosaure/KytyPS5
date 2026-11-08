@@ -15,11 +15,15 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <bit>
 #include <cinttypes>
 #include <cstring>
 #include <memory>
 #include <utility>
 #include <vector>
+
+#include <fmt/format.h>
+#include <unistd.h>
 
 namespace Libs::Graphics {
 
@@ -257,6 +261,9 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
 	EXIT_IF(null_id != NULL_BUFFER_ID);
 	SetVulkanObjectNameF(m_graphics.device, GetBuffer(null_id).Handle(), "Kyty.NullBuffer");
+	if (m_graphics.unified_memory_import) {
+		ImportUnifiedMemory();
+	}
 	if (!m_graphics.CanReportMemoryUsage()) {
 		return;
 	}
@@ -272,6 +279,14 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 }
 
 BufferCache::~BufferCache() {
+	if (m_unified_memory) {
+		// Views of the guest's memory are destroyed with the slots, after it: Vulkan allows it.
+		if (m_unified_bind_fence) {
+			m_graphics.device.destroyFence(m_unified_bind_fence);
+		}
+		m_graphics.device.freeMemory(m_unified_memory);
+		m_unified_memory = nullptr;
+	}
 	if (!m_gpu_modified_ranges.Empty()) {
 		EXIT("BufferCache: destroyed with pending GPU-modified ranges\n");
 	}
@@ -297,6 +312,12 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     vaddr, size);
 	}
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
+		// Unified memory: nothing to bring back, the bytes are in the guest memory once the GPU
+		// work that writes them is done. A copy back would also land after newer GPU writes.
+		if (IsUnified()) {
+			FinishPendingGpuWrites(vaddr, size);
+			return;
+		}
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
@@ -320,6 +341,11 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 	if (vaddr == 0) {
 		return NULL_BUFFER_ID;
+	}
+	if (IsUnified()) {
+		if (const auto window = UnifiedWindow(vaddr, size)) {
+			return window;
+		}
 	}
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid buffer discovery request\n");
@@ -421,6 +447,9 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
+	if (buffer.IsExternal()) {
+		return is_texel_buffer && !is_written && SynchronizeBufferFromImage(buffer, vaddr, size);
+	}
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
@@ -488,6 +517,23 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
                                                        BufferId id) {
 	EXIT_IF(!(GuestRange {vaddr, size}.Valid()));
 
+	if (IsUnified()) {
+		const auto unified = UnifiedWindow(vaddr, size);
+		if (unified) {
+			// The windows live as long as the cache: they have no LRU entry to touch.
+			auto& buffer = m_slot_buffers[unified];
+			// An image newer than the memory under a texel read still lands in it first.
+			if (is_texel_buffer && !is_written) {
+				(void)SynchronizeBufferFromImage(buffer, vaddr, size);
+			}
+			if (is_written) {
+				ForgetColorMetadataChecks(vaddr, size);
+				RecordUnifiedGpuWrite(vaddr, size);
+			}
+			return {&buffer, buffer.Offset(vaddr)};
+		}
+	}
+
 	if (!is_written && size <= CACHING_PAGESIZE &&
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
 	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
@@ -517,6 +563,15 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
+	// Unified memory: the GPU reads the image from the guest memory, after the work recorded before
+	// it, which may still write there (a DMA copy, a shader). A copy made now would miss it.
+	if (IsUnified()) {
+		if (const auto unified = UnifiedWindow(vaddr, size)) {
+			auto& buffer = m_slot_buffers[unified];
+			return {&buffer, buffer.Offset(vaddr)};
+		}
+		FinishPendingGpuWrites(vaddr, size);
+	}
 	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
 	if (owner != nullptr && *owner) {
 		auto& buffer = m_slot_buffers[*owner];
@@ -554,7 +609,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 		EXIT("BufferCache: invalid fill memory address\n");
 	}
 	(void)m_texture_cache.ClearMeta(vaddr);
-	if (!IsRegionGpuModified(vaddr, size)) {
+	if (!IsUnified() && !IsRegionGpuModified(vaddr, size)) {
 		// Access the guest mapping so write faults invalidate cached buffers and images.
 		auto* destination = reinterpret_cast<uint32_t*>(vaddr);
 		std::fill(destination, destination + size / sizeof(uint32_t), value);
@@ -562,6 +617,11 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	}
 
 	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
+	if (IsUnified()) {
+		// The CPU fill this replaces faulted on every image over the range, not just the one that
+		// starts there: a mip level, a slice. They reload from the guest memory, after the fill.
+		m_texture_cache.InvalidateMemory(vaddr, size);
+	}
 	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
 	dst->Fill(dst_offset, size, value);
 }
@@ -579,7 +639,7 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 		     " size=0x%016" PRIx64 " src_gds=%d dst_gds=%d\n",
 		     src_vaddr, dst_vaddr, size, static_cast<int>(src_gds), static_cast<int>(dst_gds));
 	}
-	if (src_memory && dst_memory && !IsRegionGpuModified(dst_vaddr, size) &&
+	if (!IsUnified() && src_memory && dst_memory && !IsRegionGpuModified(dst_vaddr, size) &&
 	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
 		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
 		            size);
@@ -589,6 +649,10 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	auto& command = m_scheduler.Current();
 	if (dst_memory) {
 		m_texture_cache.InvalidateMemoryFromGPU(dst_vaddr, size);
+		if (IsUnified()) {
+			// As in FillBuffer: every image the copy writes into, after it.
+			m_texture_cache.InvalidateMemory(dst_vaddr, size);
+		}
 	}
 	const auto src_id      = src_memory ? FindBuffer(src_vaddr, size) : BufferId {};
 	const auto dst_id      = dst_memory ? FindBuffer(dst_vaddr, size) : BufferId {};
@@ -602,6 +666,12 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid registered-region query\n");
+	}
+	if (IsUnified()) {
+		auto view = m_unified_views.upper_bound(vaddr + size - 1);
+		if (view != m_unified_views.begin() && std::prev(view)->first + std::prev(view)->second.first > vaddr) {
+			return true;
+		}
 	}
 	// Cached buffers are ordered and non-overlapping. The last buffer beginning before the query
 	// end is therefore the only possible intersection.
@@ -641,7 +711,25 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
-	return m_gpu_modified_ranges.Intersects(vaddr, size);
+	// Unified memory has no downloads: the bytes are in the guest memory once the GPU is done.
+	return m_gpu_modified_ranges.Intersects(vaddr, size) || HasPendingGpuWrites(vaddr, size);
+}
+
+uint64_t BufferCache::GpuDirtyBytes(uint64_t vaddr, uint64_t size) {
+	uint64_t bytes = 0;
+	m_gpu_modified_ranges.ForEachInRange(vaddr, size,
+	                                     [&](uint64_t begin, uint64_t end) { bytes += end - begin; });
+	if (HasPendingGpuWrites(vaddr, size)) {
+		for (const auto& [start, entry]: m_pending_gpu_writes) {
+			if (start >= vaddr + size) {
+				break;
+			}
+			if (entry.first > vaddr) {
+				bytes += std::min(entry.first, vaddr + size) - std::max(start, vaddr);
+			}
+		}
+	}
+	return std::min(bytes, size);
 }
 
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
@@ -715,6 +803,9 @@ RangeSet BufferCache::TakeBdaSync() {
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
+	if (IsUnified()) {
+		(void)BindUnified(vaddr, size);
+	}
 	const auto end = vaddr + size;
 	auto       it  = m_buffers.upper_bound(vaddr);
 	if (it != m_buffers.begin()) {
@@ -728,6 +819,357 @@ void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
 			(void)SynchronizeBuffer(buffer, start, finish - start, false, false);
 		}
 	}
+}
+
+void BufferCache::ImportUnifiedMemory() {
+	const int fd = dup(LibKernel::Memory::UnifiedMemoryFd());
+	EXIT_IF(fd < 0);
+	vk::MemoryFdPropertiesKHR properties {};
+	if (m_graphics.device.getMemoryFdPropertiesKHR(
+	        vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT, fd, &properties) !=
+	        vk::Result::eSuccess ||
+	    properties.memoryTypeBits == 0) {
+		close(fd);
+		Log::WriteToConsoleAndLog("GPU: unified memory off, the device cannot import it.\n");
+		return;
+	}
+	const auto type = static_cast<uint32_t>(std::countr_zero(properties.memoryTypeBits));
+	vk::ImportMemoryFdInfoKHR import {};
+	import.handleType = vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT;
+	import.fd         = fd;
+	vk::MemoryAllocateFlagsInfo flags {};
+	flags.pNext = &import;
+	flags.flags = vk::MemoryAllocateFlagBits::eDeviceAddress;
+	vk::MemoryAllocateInfo allocation {};
+	allocation.pNext           = &flags;
+	allocation.allocationSize  = LibKernel::Memory::UnifiedMemorySize();
+	allocation.memoryTypeIndex = type;
+	if (m_graphics.device.allocateMemory(&allocation, nullptr, &m_unified_memory) !=
+	    vk::Result::eSuccess) {
+		close(fd);
+		m_unified_memory = nullptr;
+		Log::WriteToConsoleAndLog("GPU: unified memory off, the import failed.\n");
+		return;
+	}
+	m_unified_base                  = LibKernel::Memory::UnifiedMemoryBase();
+	m_graphics.unified_memory_bytes = allocation.allocationSize;
+	Log::WriteToConsoleAndLog(fmt::format("GPU: unified guest memory, {} MiB imported (type {}).\n",
+	                                      allocation.allocationSize >> 20u, type));
+}
+
+BufferId BufferCache::UnifiedWindow(uint64_t vaddr, uint64_t size) {
+	const auto index = vaddr >> UnifiedWindowBits;
+	const auto base  = index << UnifiedWindowBits;
+	if (size == 0 || vaddr + size > base + UnifiedWindowSize) {
+		return {};
+	}
+	// Bound already? Every page of the range must be one of the guest's views.
+	const auto page_begin = Common::AlignDown(vaddr, CACHING_PAGESIZE);
+	const auto page_end   = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
+	bool       bound      = false;
+	{
+		auto it = m_unified_views.upper_bound(page_begin);
+		if (it != m_unified_views.begin()) {
+			--it;
+		}
+		auto covered = page_begin;
+		for (; it != m_unified_views.end() && it->first <= covered && covered < page_end; ++it) {
+			covered = std::max(covered, it->first + it->second.first);
+		}
+		bound = covered >= page_end;
+	}
+	if (!bound && !BindUnified(page_begin, page_end - page_begin)) {
+		return {};
+	}
+	auto& id = m_unified_windows[index];
+	if (!id) {
+		id = m_slot_buffers.insert(m_graphics, m_scheduler, base,
+		                           AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress,
+		                           UnifiedWindowSize, SparseWindow {});
+		SetVulkanObjectNameF(m_graphics.device, m_slot_buffers[id].Handle(),
+		                     "Kyty.GuestWindow[guest=0x{:016x}]", base);
+	}
+	return id;
+}
+
+bool BufferCache::BindUnified(uint64_t vaddr, uint64_t size) {
+	const auto begin = Common::AlignDown(vaddr, CACHING_PAGESIZE);
+	const auto end   = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
+	std::vector<std::tuple<uint64_t, uint64_t, uint64_t>> pieces;
+	uint64_t                                              backed = 0;
+	LibKernel::Memory::ForEachUnifiedView(begin, end - begin,
+	                                      [&](uint64_t address, uint64_t bytes, uint64_t offset) {
+		                                      pieces.emplace_back(address, bytes, offset);
+		                                      backed += bytes;
+	                                      });
+	// Unchanged since the last bind: nothing to do.
+	std::vector<std::tuple<uint64_t, uint64_t, uint64_t>> bound;
+	{
+		auto it = m_unified_views.upper_bound(begin);
+		if (it != m_unified_views.begin() && std::prev(it)->first + std::prev(it)->second.first > begin) {
+			--it;
+		}
+		for (; it != m_unified_views.end() && it->first < end; ++it) {
+			const auto piece_begin = std::max(begin, it->first);
+			const auto piece_end   = std::min(end, it->first + it->second.first);
+			bound.emplace_back(piece_begin, piece_end - piece_begin,
+			                   it->second.second + (piece_begin - it->first));
+		}
+	}
+	if (pieces != bound) {
+		BindUnifiedPieces(begin, end, pieces);
+	}
+	return backed == end - begin;
+}
+
+void BufferCache::BindUnifiedPieces(uint64_t begin, uint64_t end,
+                                    const std::vector<std::tuple<uint64_t, uint64_t, uint64_t>>& pieces) {
+	// The GPU may still read the old views: let it finish before they change. A range the game
+	// has just mapped has none, and the GPU has nothing there to finish.
+	auto bound = m_unified_views.upper_bound(begin);
+	if (bound != m_unified_views.begin() && std::prev(bound)->first + std::prev(bound)->second.first > begin) {
+		--bound;
+	}
+	if (bound != m_unified_views.end() && bound->first < end && m_scheduler.Active()) {
+		m_scheduler.Finish();
+	}
+	// Every window that covers part of [begin, end): the one of its GiB and the one before.
+	std::vector<vk::SparseMemoryBind>               binds;
+	std::vector<std::pair<Buffer*, uint32_t>>       windows; // buffer, first bind
+	const auto first_index = (begin >> UnifiedWindowBits) == 0 ? 0 : (begin >> UnifiedWindowBits) - 1;
+	for (auto index = first_index; index <= ((end - 1) >> UnifiedWindowBits); index++) {
+		const auto base = index << UnifiedWindowBits;
+		const auto stop = base + UnifiedWindowSize;
+		const auto from = std::max(begin, base);
+		const auto to   = std::min(end, stop);
+		if (from >= to) {
+			continue;
+		}
+		auto& id = m_unified_windows[index];
+		if (!id) {
+			id = m_slot_buffers.insert(m_graphics, m_scheduler, base,
+			                           AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress,
+			                           UnifiedWindowSize, SparseWindow {});
+			SetVulkanObjectNameF(m_graphics.device, m_slot_buffers[id].Handle(),
+			                     "Kyty.GuestWindow[guest=0x{:016x}]", base);
+		}
+		const auto first = static_cast<uint32_t>(binds.size());
+		// Unbind the whole part first, then bind the views: later binds win.
+		binds.push_back({from - base, to - from, nullptr, 0, {}});
+		for (const auto& [address, bytes, offset]: pieces) {
+			const auto piece_from = std::max(from, address);
+			const auto piece_to   = std::min(to, address + bytes);
+			if (piece_from < piece_to) {
+				binds.push_back({piece_from - base, piece_to - piece_from, m_unified_memory,
+				                 offset + (piece_from - address), {}});
+			}
+		}
+		windows.emplace_back(&m_slot_buffers[id], first);
+	}
+	std::vector<vk::SparseBufferMemoryBindInfo> buffer_binds;
+	for (size_t i = 0; i < windows.size(); i++) {
+		const auto first = windows[i].second;
+		const auto last  = i + 1 < windows.size() ? windows[i + 1].second : static_cast<uint32_t>(binds.size());
+		buffer_binds.push_back({windows[i].first->Handle(), last - first, binds.data() + first});
+	}
+	vk::BindSparseInfo info {};
+	info.bufferBindCount = static_cast<uint32_t>(buffer_binds.size());
+	info.pBufferBinds    = buffer_binds.data();
+	if (!m_unified_bind_fence) {
+		vk::FenceCreateInfo fence_info {};
+		EXIT_NOT_IMPLEMENTED(m_graphics.device.createFence(&fence_info, nullptr, &m_unified_bind_fence) !=
+		                     vk::Result::eSuccess);
+	}
+	{
+		Common::LockGuard lock(m_graphics.queue_mutex);
+		EXIT_NOT_IMPLEMENTED(m_graphics.queue.bindSparse(1, &info, m_unified_bind_fence) !=
+		                     vk::Result::eSuccess);
+	}
+	EXIT_NOT_IMPLEMENTED(m_graphics.device.waitForFences(1, &m_unified_bind_fence, VK_TRUE, UINT64_MAX) !=
+	                     vk::Result::eSuccess);
+	EXIT_NOT_IMPLEMENTED(m_graphics.device.resetFences(1, &m_unified_bind_fence) != vk::Result::eSuccess);
+
+	// The record of what is bound.
+	{
+		auto it = m_unified_views.upper_bound(begin);
+		if (it != m_unified_views.begin() && std::prev(it)->first + std::prev(it)->second.first > begin) {
+			--it;
+		}
+		std::vector<std::pair<uint64_t, std::pair<uint64_t, uint64_t>>> kept;
+		while (it != m_unified_views.end() && it->first < end) {
+			const auto view_begin = it->first;
+			const auto view_end   = it->first + it->second.first;
+			const auto offset     = it->second.second;
+			if (view_begin < begin) {
+				kept.push_back({view_begin, {begin - view_begin, offset}});
+			}
+			if (view_end > end) {
+				kept.push_back({end, {view_end - end, offset + (end - view_begin)}});
+			}
+			it = m_unified_views.erase(it);
+		}
+		for (const auto& entry: kept) {
+			m_unified_views.insert(entry);
+		}
+		for (const auto& [address, bytes, offset]: pieces) {
+			m_unified_views[address] = {bytes, offset};
+		}
+	}
+
+	// The BDA table: each page through the window of its GiB, or nothing.
+	std::vector<vk::DeviceAddress> addresses((end - begin) >> CACHING_PAGEBITS, 0);
+	for (const auto& [address, bytes, offset]: pieces) {
+		for (auto page = address; page < address + bytes; page += CACHING_PAGESIZE) {
+			const auto& window = m_slot_buffers[m_unified_windows[page >> UnifiedWindowBits]];
+			addresses[(page - begin) >> CACHING_PAGEBITS] =
+			    window.BufferDeviceAddress() + (page - window.CpuAddress());
+		}
+	}
+	if (!addresses.empty() && m_scheduler.Active() && !m_scheduler.Current().IsInvalid()) {
+		WriteDataBuffer(m_bda_pagetable_buffer, PageIndex(begin) * sizeof(vk::DeviceAddress),
+		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
+	}
+}
+
+bool BufferCache::PendingGuestWrite(uint64_t vaddr, uint64_t size, uint64_t* value) {
+	if (m_pending_guest_writes.empty()) {
+		return false;
+	}
+	const auto done = m_scheduler.GetMasterSemaphore().KnownGpuTick();
+	std::erase_if(m_pending_guest_writes, [done](const auto& entry) { return entry.second.tick <= done; });
+	const auto found = m_pending_guest_writes.find(vaddr);
+	if (found == m_pending_guest_writes.end() || found->second.size != size) {
+		return false;
+	}
+	*value = found->second.value;
+	return true;
+}
+
+void BufferCache::RecordUnifiedGpuWrite(uint64_t vaddr, uint64_t size) {
+	auto& pending  = m_pending_gpu_writes[vaddr];
+	pending.first  = std::max(pending.first, vaddr + size);
+	pending.second = m_scheduler.CurrentTick();
+	m_pending_gpu_writes_span = std::max(m_pending_gpu_writes_span, pending.first - vaddr);
+	m_unified_gpu_writes.Add(vaddr, size);
+	m_unified_gpu_written.Add(vaddr, size);
+}
+
+void BufferCache::FinishPendingGpuWrites(uint64_t vaddr, uint64_t size) {
+	if (HasPendingGpuWrites(vaddr, size)) {
+		m_scheduler.Finish();
+		m_pending_gpu_writes.clear();
+		m_pending_gpu_writes_span = 0;
+	}
+}
+
+bool BufferCache::HasPendingGpuWrites(uint64_t vaddr, uint64_t size) {
+	if (m_pending_gpu_writes.empty() || size == 0) {
+		return false;
+	}
+	const auto done = m_scheduler.GetMasterSemaphore().KnownGpuTick();
+	std::erase_if(m_pending_gpu_writes, [done](const auto& entry) { return entry.second.second <= done; });
+	for (const auto& [start, entry]: m_pending_gpu_writes) {
+		if (start >= vaddr + size) {
+			break;
+		}
+		if (entry.first > vaddr) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool BufferCache::FinishPendingGpuWritesUnder(std::span<const uint64_t> addresses) {
+	if (m_pending_gpu_writes.empty()) {
+		return false;
+	}
+	const auto done = m_scheduler.GetMasterSemaphore().KnownGpuTick();
+	std::erase_if(m_pending_gpu_writes, [done](const auto& entry) { return entry.second.second <= done; });
+	if (m_pending_gpu_writes.empty()) {
+		m_pending_gpu_writes_span = 0;
+		return false;
+	}
+	for (const auto address: addresses) {
+		const auto from = address > m_pending_gpu_writes_span ? address - m_pending_gpu_writes_span : 0;
+		const auto last = m_pending_gpu_writes.upper_bound(address + sizeof(uint32_t) - 1);
+		for (auto it = m_pending_gpu_writes.lower_bound(from); it != last; ++it) {
+			if (it->second.first > address) {
+				m_scheduler.Finish();
+				m_pending_gpu_writes.clear();
+				m_pending_gpu_writes_span = 0;
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+bool BufferCache::TakeUnifiedGpuWrites(uint64_t vaddr, uint64_t size) {
+	if (!m_unified_gpu_writes.Intersects(vaddr, size)) {
+		return false;
+	}
+	m_unified_gpu_writes.Subtract(vaddr, size);
+	return true;
+}
+
+bool BufferCache::IsUnifiedGpuWritten(uint64_t vaddr, uint64_t size) const {
+	return m_unified_gpu_written.Intersects(vaddr, size);
+}
+
+void BufferCache::ForgetUnifiedRange(uint64_t vaddr, uint64_t size) {
+	if (!IsUnified() || size == 0) {
+		return;
+	}
+	const auto begin = Common::AlignDown(vaddr, CACHING_PAGESIZE);
+	const auto end   = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
+	m_unified_gpu_writes.Subtract(begin, end - begin);
+	m_unified_gpu_written.Subtract(begin, end - begin);
+	auto       it    = m_unified_views.upper_bound(begin);
+	if (it != m_unified_views.begin() && std::prev(it)->first + std::prev(it)->second.first > begin) {
+		--it;
+	}
+	if (it == m_unified_views.end() || it->first >= end) {
+		return;
+	}
+	BindUnifiedPieces(begin, end, {});
+}
+
+bool BufferCache::WriteGuestMemory(uint64_t vaddr, const void* data, uint64_t size) {
+	if (!IsUnified() || ((vaddr | size) & 3u) != 0 || size == 0 || size > 65536) {
+		return false;
+	}
+	const auto id = UnifiedWindow(vaddr, size);
+	if (!id) {
+		return false;
+	}
+	auto&      buffer = m_slot_buffers[id];
+	const auto offset = buffer.Offset(vaddr);
+	auto&      command = m_scheduler.Current();
+	command.EndRendering();
+	const auto native = command.Handle();
+	// Everything recorded before lands first, as the GPU's own end-of-pipe write would.
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr, 0,
+	                       nullptr);
+	native.updateBuffer(buffer.Handle(), offset, size, data);
+	if (size <= sizeof(uint64_t)) {
+		uint64_t value = 0;
+		std::memcpy(&value, data, size);
+		m_pending_guest_writes[vaddr] = {size, m_scheduler.CurrentTick(), value};
+	}
+	RecordUnifiedGpuWrite(vaddr, size);
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
+	                      vk::AccessFlagBits::eHostRead;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eAllCommands |
+	                           vk::PipelineStageFlagBits::eHost,
+	                       {}, 1, &after, 0, nullptr, 0, nullptr);
+	return true;
 }
 
 } // namespace Libs::Graphics
