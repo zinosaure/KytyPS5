@@ -30,12 +30,15 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <functional>
 #include <atomic>
 #include <bit>
 #include <fmt/format.h>
 #include <limits>
 #include <span>
 #include <vector>
+
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
@@ -479,6 +482,11 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 	return false;
 }
 
+size_t RenderExecutor::TextureBindingKeyHash::operator()(const TextureBindingKey& key) const noexcept {
+	return XXH3_64bits(key.dwords.data(), key.dwords.size() * sizeof(uint32_t)) ^
+	       std::hash<const void*> {}(key.resource);
+}
+
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
 	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
@@ -493,6 +501,19 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	auto& texture_cache = m_context.GetTextureCache();
 	if (descriptor.IsNull()) {
 		return {.layout = vk::ImageLayout::eGeneral};
+	}
+	// Found before, for this descriptor and this shader resource, with nothing registered or freed since: the
+	// same image. Heap descriptors depend on what is mapped: they are resolved every time.
+	const TextureBindingKey key {value.dwords, &resource};
+	if (!resource.heap) {
+		if (const auto found = m_texture_bindings.find(key); found != m_texture_bindings.end()) {
+			if (found->second.generation == texture_cache.Generation()) {
+				const auto& cached = found->second;
+				texture_cache.TouchFoundImage(cached.found_id, cached.desc, cached.metadata_base_layer);
+				return {cached.image_id, nullptr, cached.desc};
+			}
+			m_texture_bindings.erase(found);
+		}
 	}
 
 	const auto address         = descriptor.Base40();
@@ -615,11 +636,14 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 	desc.heap = resource.heap;
 
-	auto id = texture_cache.FindImage(desc, shader_conversion);
+	const auto metadata_base_layer = desc.view_info.base_layer;
+	bool       exclusive           = false;
+	auto       id                  = texture_cache.FindImage(desc, shader_conversion, &exclusive);
 	if (!id) {
 		// Another extent at the address holds it; the heap retries once an image is created.
 		return {.desc = std::move(desc), .layout = vk::ImageLayout::eGeneral};
 	}
+	const auto found_id            = id;
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	if (stencil_association) {
@@ -639,6 +663,13 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		                                          resource.skip_degamma);
 		(void)SelectSampledColorView(image->info.pixel_format, desc.view_info.format,
 		                             descriptor.DstSelXYZW());
+	}
+	if (!resource.heap && exclusive) {
+		if (m_texture_bindings.size() >= 4096) {
+			m_texture_bindings.clear();
+		}
+		m_texture_bindings.insert_or_assign(
+		    key, CachedTextureBinding {found_id, id, desc, metadata_base_layer, texture_cache.Generation()});
 	}
 	return {id, nullptr, std::move(desc)};
 }

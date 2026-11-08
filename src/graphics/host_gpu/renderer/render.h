@@ -12,6 +12,7 @@
 
 #include <array>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -200,7 +201,29 @@ private:
 	                                        CommandBuffer& command, uint32_t group_x,
 	                                        uint32_t group_y, uint32_t group_z, uint32_t mode);
 
+	// The texture bound for a descriptor, found once. ResolveTexture decodes the descriptor, computes the
+	// image's layout and searches the cache by pages at every binding of every draw (12 % of the command
+	// thread in Astro Bot), for bindings that repeat image after image: the same descriptor, for the same
+	// shader resource, binds the same image as long as the texture cache registered or freed nothing since
+	// (its generation), when that image was alone over its memory.
+	struct TextureBindingKey {
+		std::array<uint32_t, 8>                     dwords;
+		const ShaderRecompiler::IR::ImageResource* resource;
+		bool operator==(const TextureBindingKey&) const = default;
+	};
+	struct TextureBindingKeyHash {
+		size_t operator()(const TextureBindingKey& key) const noexcept;
+	};
+	struct CachedTextureBinding {
+		ImageId                 found_id; // what FindImage returned
+		ImageId                 image_id; // what is bound (the depth owner of a stencil plane)
+		TextureCache::ImageDesc desc;
+		uint32_t                metadata_base_layer;
+		uint64_t                generation;
+	};
+
 	RenderContext&                        m_context;
+	std::unordered_map<TextureBindingKey, CachedTextureBinding, TextureBindingKeyHash> m_texture_bindings;
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;

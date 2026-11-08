@@ -50,7 +50,15 @@ public:
 	~TextureCache();
 	KYTY_CLASS_NO_COPY(TextureCache);
 
-	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
+	// `exclusive`, when asked: the image found is the only one registered over its memory, so that the same
+	// description finds it again as long as the cache registers or frees nothing (Generation).
+	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false,
+	                                      bool* exclusive = nullptr);
+	// Grows whenever an image is registered or freed: what FindImage returns may change then, not before.
+	[[nodiscard]] uint64_t      Generation() const noexcept { return m_generation; }
+	// An image FindImage found before, bound again: what FindImage does once it holds the image.
+	void                        TouchFoundImage(ImageId id, const ImageDesc& desc,
+	                                            uint32_t metadata_base_layer);
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
@@ -165,6 +173,7 @@ private:
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
+	uint64_t                                          m_generation = 0;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;

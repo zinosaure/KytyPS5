@@ -227,6 +227,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	m_total_used_memory += image.AccountedSize();
+	m_generation++;
 }
 
 void TextureCache::UnregisterImage(ImageId id) {
@@ -242,6 +243,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 	m_lru_cache.Free(image.lru_id);
 	m_total_used_memory -= image.AccountedSize();
 	image.registered = false;
+	m_generation++;
 }
 
 void TextureCache::DeleteImage(ImageId id) {
@@ -1247,7 +1249,17 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	return association;
 }
 
-ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
+void TextureCache::TouchFoundImage(ImageId id, const ImageDesc& desc, uint32_t metadata_base_layer) {
+	{
+		std::scoped_lock lock {m_lock};
+		auto& image              = m_slot_images[id];
+		image.tick_accessed_last = m_scheduler.CurrentTick();
+		TouchImage(image);
+	}
+	MaterializeColorClear(id, desc, metadata_base_layer);
+}
+
+ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool* exclusive) {
 	ValidateImageDesc(desc);
 	EXIT_IF(desc.info.data.Empty());
 	const auto metadata_base_layer = desc.view_info.base_layer;
@@ -1359,6 +1371,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		}
 		image.tick_accessed_last = m_scheduler.CurrentTick();
 		TouchImage(image);
+		if (exclusive != nullptr) {
+			*exclusive = !block_alias && std::none_of(candidates.begin(), candidates.end(),
+			                                          [result](ImageId id) { return id != result; });
+		}
 	}
 	MaterializeColorClear(result, desc, metadata_base_layer);
 	if (desc.type == BindingType::VideoOut &&
