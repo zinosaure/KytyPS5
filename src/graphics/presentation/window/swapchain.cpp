@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "common/gameflexWatchdog.h"
 #include "common/common.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
@@ -108,7 +109,10 @@ public:
 		frame->busy = true;
 		m_mutex.Unlock();
 
-		m_scheduler.Wait(frame->present_tick);
+		{
+			Common::GameFlex::WaitNote gameflex_wait("frame pool: wait for the frame's last present", frame->present_tick);
+			m_scheduler.Wait(frame->present_tick);
+		}
 		return frame;
 	}
 
@@ -1138,11 +1142,13 @@ void Presenter::Impl::Present() {
 	                         swapchain.SetHdr(main_frame->hdr);
 	// Some window systems keep presenting an old swapchain after a resize.
 	if (hdr_changed || swapchain.NeedsResize()) {
+		Common::GameFlex::WaitNote gameflex_wait("presenter: recreate the swapchain");
 		RecoverSwapchain(Swapchain::Status::Recreate);
 	}
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
 		auto status = [&] {
 			ScopedTimer acquire_time(Counter::PresentAcquireNs);
+			Common::GameFlex::WaitNote gameflex_wait("presenter: acquire a swapchain image");
 			return swapchain.AcquireNextImage(present_scheduler);
 		}();
 		if (status != Swapchain::Status::Success) {
@@ -1165,7 +1171,10 @@ void Presenter::Impl::Present() {
 				layer.frame->present_tick = tick;
 			}
 		}
-		status = swapchain.Present();
+		status = [&] {
+			Common::GameFlex::WaitNote gameflex_wait("presenter: queue present");
+			return swapchain.Present();
+		}();
 		if (status != Swapchain::Status::Success) {
 			RecoverSwapchain(status);
 			continue;

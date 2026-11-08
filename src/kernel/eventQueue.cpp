@@ -1,6 +1,7 @@
 #include "kernel/eventQueue.h"
 
 #include "common/assert.h"
+#include "common/gameflexWatchdog.h"
 #include "common/common.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
@@ -389,6 +390,8 @@ int KYTY_SYSV_ABI KernelDeleteEqueue(KernelEqueue eq) {
 int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, int* out,
                                    const KernelUseconds* timo) {
 	PRINT_NAME();
+	Common::GameFlex::WaitNote gameflex_wait("sceKernelWaitEqueue", static_cast<uint64_t>(eq),
+	                                          reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 
 	auto owner = KernelPinEqueue(eq);
 	if (!owner) {

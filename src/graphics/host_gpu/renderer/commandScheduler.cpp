@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "common/gameflexWatchdog.h"
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
@@ -157,6 +158,7 @@ void CommandScheduler::Finish() {
 }
 
 void CommandScheduler::Wait(uint64_t tick) {
+	Common::GameFlex::WaitNote gameflex_wait("host gpu: wait for a submission", tick);
 	EXIT_IF(tick > CurrentTick());
 	if (tick == CurrentTick()) {
 		CheckActive();

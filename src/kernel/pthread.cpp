@@ -1,6 +1,7 @@
 #include "kernel/pthread.h"
 
 #include "common/assert.h"
+#include "common/gameflexWatchdog.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/hostException.h"
@@ -1746,6 +1747,7 @@ int KYTY_SYSV_ABI PthreadMutexDestroy(PthreadMutex* mutex) {
 
 int KYTY_SYSV_ABI PthreadMutexLock(PthreadMutex* mutex) {
 	// PRINT_NAME();
+	Common::GameFlex::WaitNote gameflex_wait("scePthreadMutexLock", mutex, __builtin_return_address(0));
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 
@@ -2843,6 +2845,7 @@ int KYTY_SYSV_ABI PthreadCondSignalto(PthreadCond* cond, Pthread thread) {
 int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
                                        KernelUseconds usec) {
 	// PRINT_NAME();
+	Common::GameFlex::WaitNote gameflex_wait("scePthreadCondTimedwait", cond, __builtin_return_address(0));
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 
@@ -3008,6 +3011,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 
 int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 	PRINT_NAME();
+	Common::GameFlex::WaitNote gameflex_wait("scePthreadCondWait", cond, __builtin_return_address(0));
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 
@@ -3337,6 +3341,7 @@ int KYTY_SYSV_ABI PthreadDetach(Pthread thread) {
 
 int KYTY_SYSV_ABI PthreadJoin(Pthread thread, void** value) {
 	PRINT_NAME();
+	Common::GameFlex::WaitNote gameflex_wait("scePthreadJoin", thread, __builtin_return_address(0));
 
 	if (thread == nullptr) {
 		return KERNEL_ERROR_EINVAL;
@@ -3874,6 +3879,8 @@ void KYTY_SYSV_ABI KernelSetThreadDtors(thread_dtors_func_t dtors) {
 }
 
 int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
+	Common::GameFlex::WaitNote gameflex_wait("sceKernelUsleep", static_cast<uint64_t>(microseconds),
+	                                          reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 	SleepMicroWithSignalPoll(microseconds);
 	return OK;
 }
@@ -3884,6 +3891,7 @@ unsigned int KYTY_SYSV_ABI KernelSleep(unsigned int seconds) {
 }
 
 int KYTY_SYSV_ABI KernelNanosleep(const KernelTimespec* rqtp, KernelTimespec* rmtp) {
+	Common::GameFlex::WaitNote gameflex_wait("sceKernelNanosleep", 0, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 	if (rqtp == nullptr) {
 		return KERNEL_ERROR_EFAULT;
 	}

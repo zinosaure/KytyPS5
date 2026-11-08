@@ -1,6 +1,7 @@
 #include "kernel/semaphore.h"
 
 #include "common/assert.h"
+#include "common/gameflexWatchdog.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -286,6 +287,7 @@ int KYTY_SYSV_ABI KernelDeleteSema(KernelSema sem) {
 }
 
 int KYTY_SYSV_ABI KernelWaitSema(KernelSema sem, int need, KernelUseconds* time) {
+	Common::GameFlex::WaitNote gameflex_wait("sceKernelWaitSema", sem, __builtin_return_address(0));
 	if (sem == nullptr) {
 		return KERNEL_ERROR_ESRCH;
 	}

@@ -2,6 +2,7 @@
 #define EMULATOR_INCLUDE_EMULATOR_LIBS_LIBS_H_
 
 #include "common/abi.h"
+#include "common/gameflexWatchdog.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -48,8 +49,11 @@
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define LIB_FUNC(n, f) LIB_ADD(n, f, Loader::SymbolType::Func)
 
+// GameFlex (0057): each call of the console's libraries is noted for the watchdog (the function, the game's code
+// it comes from, and whether it has returned), whether or not it is printed.
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define PRINT_NAME()                                                                               \
+	const Common::GameFlex::CallNote gameflex_call_note(__func__, __builtin_return_address(0));   \
 	if (PRINT_NAME_ENABLED) {                                                                      \
 		Libs::PrintName(g_library, g_module, __func__);                                              \
 	}

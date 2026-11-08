@@ -2,12 +2,14 @@
 
 #include "common/abi.h"
 #include "common/assert.h"
+#include "common/gameflexWatchdog.h"
 #include "common/common.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/gameflexStatus.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/singleton.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -23,6 +25,7 @@
 #include "libs/errno.h"
 #include "libs/hmd2.h"
 #include "libs/libs.h"
+#include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
 
 #include <cstdio>
@@ -634,6 +637,16 @@ VideoOutDriver::Impl& VideoOutDriver::State() noexcept {
 VideoOutDriver& VideoOutInit(uint32_t width, uint32_t height, Graphics::Presenter& presenter) {
 	EXIT_IF(g_video_out_driver != nullptr);
 	g_video_out_driver = std::make_unique<VideoOutDriver>(width, height, presenter);
+	// The watchdog names the game's code a thread waits from: its module and offset, from the loader.
+	Common::GameFlex::g_describe_address = [](uint64_t address) -> std::string {
+		auto* program = Common::Singleton<Loader::RuntimeLinker>::Instance()->FindProgramByAddr(address);
+		if (program == nullptr) {
+			return fmt::format("{:#x}", address);
+		}
+		return fmt::format("{}+{:#x}", Common::PathToString(program->file_name.filename()),
+		                   address - program->base_vaddr);
+	};
+	Common::GameFlex::StartWatchdog();
 	return *g_video_out_driver;
 }
 
@@ -836,8 +849,12 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		total_wait -= frame_begin - sleep_begin;
 
 		VblankBegin();
-		bool presented = m_flip_queue.Flip();
+		bool presented = [&] {
+			Common::GameFlex::WaitNote gameflex_wait("present thread: flip");
+			return m_flip_queue.Flip();
+		}();
 		if (!presented && m_presenter.NeedsSystemOverlayRefresh()) {
+			Common::GameFlex::WaitNote gameflex_wait("present thread: the last image again, for the overlay");
 			if (!m_presenter.PresentLastFrame()) {
 				m_presenter.Present(m_presenter.PrepareBlankFrame(width, height, true));
 			}
@@ -893,6 +910,7 @@ bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRe
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::FlipsRejected);
 		return false;
 	}
+	Common::GameFlex::g_flips_reserved.fetch_add(1, std::memory_order_relaxed);
 	auto& pending = source == FlipRequestSource::GpuEop ? m_requests : m_cpu_requests;
 
 	Request r {};
@@ -940,6 +958,7 @@ FlipQueue::~FlipQueue() {
 }
 
 void FlipQueue::Cancel(VideoOutConfig& cfg) {
+	Common::GameFlex::WaitNote gameflex_wait("video out: cancel waits for the flip being presented", &cfg);
 	std::vector<Graphics::Presenter::Frame*> frames;
 	m_mutex.Lock();
 	while (std::any_of(m_requests.begin(), m_requests.end(), [&cfg](const auto& r) {
@@ -1075,6 +1094,7 @@ void FlipQueue::Complete(uint64_t request_id) {
 }
 
 void FlipQueue::WaitForSubmitSlot(VideoOutConfig& cfg) {
+	Common::GameFlex::WaitNote gameflex_wait("video out: wait for room in the flip queue", &cfg);
 	Common::LockGuard lock(m_mutex);
 	auto belongs_to_port = [&cfg](const auto& request) { return request.cfg == &cfg; };
 	while (std::count_if(m_requests.begin(), m_requests.end(), belongs_to_port) +
@@ -1088,6 +1108,7 @@ void FlipQueue::WaitForSubmitSlot(VideoOutConfig& cfg) {
 }
 
 void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
+	Common::GameFlex::WaitNote gameflex_wait("video out: wait for a buffer's flips", &cfg);
 	Common::LockGuard lock(m_mutex);
 
 	auto has_request = [this, &cfg, index] {
@@ -1107,6 +1128,7 @@ bool FlipQueue::Flip() {
 	const auto owner = std::find_if(m_requests.begin(), m_requests.end(),
 	                               [](const auto& r) { return r.group == r.id; });
 	if (owner == m_requests.end()) {
+		Common::GameFlex::NoteFlipQueue(Common::GameFlex::FlipQueueEmpty, m_requests.size(), m_cpu_requests.size());
 		m_mutex.Unlock();
 		return false;
 	}
@@ -1116,6 +1138,7 @@ bool FlipQueue::Flip() {
 	    std::any_of(m_requests.begin(), m_requests.end(), [group](const auto& r) {
 		    return r.group == group && r.state != RequestState::Ready;
 	    })) {
+		Common::GameFlex::NoteFlipQueue(Common::GameFlex::FlipQueueNotReady, m_requests.size(), m_cpu_requests.size());
 		m_mutex.Unlock();
 		return false;
 	}
@@ -1153,7 +1176,9 @@ bool FlipQueue::Flip() {
 			                         r.premultiplied_alpha};
 		}
 	}
+	Common::GameFlex::NoteFlipQueue(due ? Common::GameFlex::FlipQueuePresented : Common::GameFlex::FlipQueueNotDue, count, 0);
 	if (due) {
+		Common::GameFlex::g_flips_presented.fetch_add(1, std::memory_order_relaxed);
 		if (hidden != nullptr) {
 			m_presenter.Discard(*hidden);
 		}

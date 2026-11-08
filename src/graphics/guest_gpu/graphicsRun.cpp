@@ -1,6 +1,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 
 #include "common/assert.h"
+#include "common/gameflexWatchdog.h"
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -109,6 +110,7 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 		operation();
 		done->release();
 	});
+	Common::GameFlex::WaitNote gameflex_wait("gpu: wait for the gpu thread to run a command");
 	done->acquire();
 }
 
@@ -222,6 +224,7 @@ void CommandProcessor::BufferWait() {
 
 void CommandProcessor::WaitForRewind(bool valid) {
 	if (!valid) {
+		Common::GameFlex::NoteGpuWait("rewind", 0, 0, 0, 0, 0);
 		SuspendPm4();
 	}
 }
@@ -258,6 +261,8 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 		    TestWaitRegMemValue(static_cast<T>(pending), ref, mask, func)) {
 			return;
 		}
+		Common::GameFlex::NoteGpuWait("wait_reg_mem", reinterpret_cast<uint64_t>(addr), static_cast<uint64_t>(*addr),
+		                           static_cast<uint64_t>(ref), static_cast<uint64_t>(mask), func);
 		SuspendPm4();
 	}
 }
@@ -271,6 +276,7 @@ void CommandProcessor::MemSemaphore(uint64_t* counter, bool signal, bool write) 
 	if (signal) {
 		*counter = write ? 1u : *counter + 1u;
 	} else if (*counter == 0) {
+		Common::GameFlex::NoteGpuWait("mem_semaphore", reinterpret_cast<uint64_t>(counter), 0, 1, 0, 0);
 		SuspendPm4();
 	} else {
 		(*counter)--;
@@ -407,6 +413,7 @@ void GuestGpu::ThreadRun(void* data) {
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
+				Common::GameFlex::WaitNote gameflex_wait("gpu thread: no work");
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
@@ -478,6 +485,7 @@ void GuestGpu::ThreadRun(void* data) {
 			gpu->m_queues[submission.queue_id].push_front(std::move(submission));
 			gpu->m_submission_count++;
 		} else {
+			Common::GameFlex::NoteGpuProgress();
 			for (auto& queue: gpu->m_queues) {
 				if (!queue.empty()) {
 					queue.front().blocked = false;
@@ -705,6 +713,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 				const auto end   = results[db * 2u + 1u];
 				if ((begin & end & ready_bit) == 0) {
 					if (wait_op == 0) {
+						Common::GameFlex::NoteGpuWait("occlusion query", reinterpret_cast<uint64_t>(address), 0, 0, 0, 0);
 						SuspendPm4();
 					} else {
 						m_predicate_skip = false;

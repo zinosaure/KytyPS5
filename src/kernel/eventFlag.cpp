@@ -1,6 +1,7 @@
 #include "kernel/eventFlag.h"
 
 #include "common/assert.h"
+#include "common/gameflexWatchdog.h"
 #include "common/common.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
@@ -286,6 +287,7 @@ int KYTY_SYSV_ABI KernelDeleteEventFlag(KernelEventFlag ef) {
 int KYTY_SYSV_ABI KernelWaitEventFlag(KernelEventFlag ef, uint64_t bit_pattern, uint32_t wait_mode,
                                       uint64_t* result_pat, KernelUseconds* timeout) {
 	PRINT_NAME();
+	Common::GameFlex::WaitNote gameflex_wait("sceKernelWaitEventFlag", ef, __builtin_return_address(0));
 
 	if (ef == nullptr) {
 		return KERNEL_ERROR_ESRCH;
