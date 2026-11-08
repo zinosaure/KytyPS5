@@ -156,12 +156,16 @@ void CommandScheduler::Flush() {
 }
 
 // The submission follows the GPU. The console's command processor consumes the ring as the game fills it; the
-// host GPU only sees what vkQueueSubmit hands it, and every submission costs it a drain and a cold start. So the
-// GPU is fed small buffers when it is about to run dry, and the game's lists are grouped when it has two buffers
-// of lookahead; the fixed points (suspension, flip, waits) submit as before.
+// host GPU only sees what vkQueueSubmit hands it. Every submission costs the GPU a drain and a cold start, and
+// the thread a system call plus the driver's walk of every buffer the submission references: about 0.5 ms here
+// (vkQueueSubmit, 17 % of the command thread in Astro Bot at 52 submissions an image). Every handoff between two
+// buffers costs the GPU 0.6 ms when the next one is not in its queue yet. So: a small buffer only when the GPU has
+// run dry, a full one while it has work queued, and at a boundary of the game's lists a middling one unless the GPU
+// still has a buffer behind the current one; the fixed points (suspension, flip, waits) submit as before.
 namespace {
-constexpr uint32_t kFeedCommands = 64;   // a small buffer, when the GPU is running dry
-constexpr uint32_t kFullCommands = 4096; // a full buffer, when it has lookahead
+constexpr uint32_t kCheckCommands    = 64;   // how often Recorded() looks at the GPU
+constexpr uint32_t kBoundaryCommands = 256;  // enough to submit at a list boundary with one buffer in flight
+constexpr uint32_t kFullCommands     = 2048; // a full buffer
 } // namespace
 
 void CommandScheduler::Recorded() {
@@ -169,14 +173,12 @@ void CommandScheduler::Recorded() {
 		return;
 	}
 	m_commands_recorded++;
-	if (m_commands_recorded % kFeedCommands != 0) {
+	if (m_commands_recorded % kCheckCommands != 0) {
 		return;
 	}
-	// Buffers submitted and not finished, as the GPU says now. One in flight and nothing behind it: this one goes
-	// now, so the GPU finds the next job in its queue when it ends the current one, instead of waiting for the
-	// kernel to wake up and hand it over (0.6 ms a time, measured).
+	// Buffers submitted and not finished, as the GPU says now. None: the GPU is dry, this one goes now.
 	const uint64_t queued = CurrentTick() - 1 - m_master.Progress();
-	if (queued <= 1 || m_commands_recorded >= kFullCommands) {
+	if (queued == 0 || m_commands_recorded >= kFullCommands) {
 		Flush();
 	}
 }
@@ -185,12 +187,15 @@ bool CommandScheduler::FlushAtBoundary() {
 	if (!Active() || m_command.IsInvalid() || !m_buffer_used) {
 		return false;
 	}
+	// Dry: now. One buffer in flight: now if there is enough here for the GPU to find it in its queue when that
+	// one ends, else the next list joins. Two or more: the next list joins, until the buffer is full.
 	const uint64_t queued = CurrentTick() - 1 - m_master.Progress();
-	if (queued >= 2 && m_commands_recorded < kFullCommands) {
-		return false;
+	if (queued == 0 || (queued == 1 && m_commands_recorded >= kBoundaryCommands) ||
+	    m_commands_recorded >= kFullCommands) {
+		Flush();
+		return true;
 	}
-	Flush();
-	return true;
+	return false;
 }
 
 void CommandScheduler::FlushBeforeIdle() {
