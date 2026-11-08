@@ -20,6 +20,7 @@
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <memory>
@@ -3623,7 +3624,33 @@ int KYTY_SYSV_ABI PthreadRename(Pthread thread, const char* name) {
 	return OK;
 }
 
+// GameFlex: a guest thread that yields in a tight loop is waiting for another thread, which has a core of its own
+// on the console. Under Kyty, Unreal's render thread yields about a million times a second and keeps a host core
+// busy. After KYTY_YIELD_SPIN yields in a row (64 by default, 0 keeps the plain yield), the thread sleeps
+// KYTY_YIELD_SLEEP_US microseconds (50 by default) instead. The streak starts again when more than 200
+// microseconds past that sleep go by between two yields: the thread worked in between, its next wait yields first.
+static uint32_t YieldSetting(const char* name, uint32_t fallback) {
+	const char* value = std::getenv(name);
+	return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : fallback;
+}
+
 void KYTY_SYSV_ABI PthreadYield() {
+	static const uint32_t spin     = YieldSetting("KYTY_YIELD_SPIN", 64);
+	static const uint32_t sleep_us = YieldSetting("KYTY_YIELD_SLEEP_US", 50);
+	if (spin != 0 && sleep_us != 0) {
+		thread_local uint32_t                              streak = 0;
+		thread_local std::chrono::steady_clock::time_point last {};
+		const auto                                         now = std::chrono::steady_clock::now();
+		if (now - last > std::chrono::microseconds(200 + sleep_us)) {
+			streak = 0;
+		}
+		last = now;
+		if (++streak > spin) {
+			Common::Thread::SleepMicro(sleep_us);
+			last = std::chrono::steady_clock::now();
+			return;
+		}
+	}
 	SchedulerBackoffOnce();
 }
 
