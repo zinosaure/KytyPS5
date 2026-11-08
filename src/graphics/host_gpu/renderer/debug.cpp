@@ -174,10 +174,21 @@ static void RtCheck(const HW::RenderTarget& rt) {
 				logged = true;
 			}
 		}
-		EXIT_NOT_IMPLEMENTED(rt.attrib3.write_vrs_rate_hint_to_cmask);
+		// Compression metadata (CMASK, DCC) that Kyty does not emulate: the target is drawn
+		// uncompressed. Said once each, not fatal (Final Fantasy VII Rebirth).
+		const auto accept_metadata = [](bool used, bool& logged, const char* what) {
+			if (used && !logged) {
+				LOGF("RenderTarget: temporary: accepting %s\n", what);
+				logged = true;
+			}
+		};
+		static bool vrs_logged = false, combiner_logged = false, clear_key_logged = false;
+		accept_metadata(rt.attrib3.write_vrs_rate_hint_to_cmask, vrs_logged,
+		                "VRS rate hints written to CMASK");
 
-		EXIT_NOT_IMPLEMENTED(rt.dcc.overwrite_combiner_disable != false);
-		EXIT_NOT_IMPLEMENTED(rt.dcc.dcc_clear_key_enable != false);
+		accept_metadata(rt.dcc.overwrite_combiner_disable, combiner_logged,
+		                "a disabled DCC overwrite combiner");
+		accept_metadata(rt.dcc.dcc_clear_key_enable, clear_key_logged, "DCC clear keys");
 	}
 }
 

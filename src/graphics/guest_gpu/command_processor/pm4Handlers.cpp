@@ -1589,8 +1589,9 @@ static constexpr auto MakeContextIndirectTable() {
 			    KYTY_PM4_GET(value, CB_COLOR0_ATTRIB3, CMASK_PIPE_ALIGNED) != 0;
 			const bool dcc_pipe_aligned =
 			    KYTY_PM4_GET(value, CB_COLOR0_ATTRIB3, DCC_PIPE_ALIGNED) != 0;
-			EXIT_NOT_IMPLEMENTED(cmask_pipe_aligned != dcc_pipe_aligned);
-			attrib3.metadata_pipe_aligned = cmask_pipe_aligned;
+			// CMASK and DCC aligned differently (Final Fantasy VII Rebirth, after loading its first
+			// scene): Kyty draws without either, and only checks the flag in its debug pass.
+			attrib3.metadata_pipe_aligned = cmask_pipe_aligned && dcc_pipe_aligned;
 			attrib3.write_vrs_rate_hint_to_cmask =
 			    KYTY_PM4_GET(value, CB_COLOR0_ATTRIB3, WRITE_VRS_RATE_HINT_TO_CMASK) != 0;
 			cp.GetCtx().SetColorAttrib3(slot, attrib3);
