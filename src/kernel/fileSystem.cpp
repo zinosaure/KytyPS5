@@ -13,6 +13,7 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/network.h"
+#include "loader/systemContent.h"
 
 #include <algorithm>
 #include <cctype>
@@ -60,9 +61,12 @@ public:
 	void Umount(const std::string& folder_or_point);
 
 	[[nodiscard]] std::filesystem::path ResolvePath(const std::string& mounted_name);
+	void SetUnrealSavedConfig(const std::string& project);
 
 private:
 	std::vector<MountPair> m_mount_pairs;
+	std::string            m_unreal_config_in_game_folder;
+	std::string            m_unreal_saved_config;
 	Common::Mutex          m_mutex;
 };
 
@@ -349,6 +353,14 @@ static bool HasWindowsForbiddenFilenameCharacter(const std::string& relative_pat
 }
 #endif
 
+// GameFlex: a game of this kind keeps its saved config beside its own files, where nothing can be
+// written (/app0/<project>/saved/config/ps5/engine.ini: KH3). It gets the one UnrealSavedConfig wrote.
+void MountPoints::SetUnrealSavedConfig(const std::string& project) {
+	Common::LockGuard lock(m_mutex);
+	m_unreal_config_in_game_folder = "/app0/" + project + "/saved/config/ps5/engine.ini";
+	m_unreal_saved_config          = "/download0/" + project + "/saved/ps5/engine.ini";
+}
+
 std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) {
 	Common::LockGuard lock(m_mutex);
 
@@ -357,6 +369,9 @@ std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) 
 	normalized.erase(std::unique(normalized.begin(), normalized.end(),
 	                             [](char a, char b) { return a == '/' && b == '/'; }),
 	                 normalized.end());
+	if (normalized == m_unreal_config_in_game_folder) {
+		normalized = m_unreal_saved_config;
+	}
 
 	// Match the entire guest path so a mount root works with or without a trailing slash.
 	const auto mounted_path = Common::FixDirectorySlash(normalized);
@@ -429,15 +444,41 @@ bool IsOpenDescriptor(int d) {
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-// GameFlex: the render size KYTY_UE_SCREEN_PERCENTAGE asks for, 0 if none.
-static unsigned long UnrealScreenPercentage() {
-	static const char* percentage = std::getenv("KYTY_UE_SCREEN_PERCENTAGE");
-	if (percentage == nullptr) {
+// GameFlex: the project of an Unreal game, from its command line (../../../<project>/<project>.uproject),
+// in the lower case of the game's paths.
+static std::string UnrealProject(const std::string& command_line) {
+	const std::string prefix = "../../../";
+	const auto        begin  = command_line.find(prefix);
+	const auto        end    = begin == std::string::npos
+	                               ? std::string::npos
+	                               : command_line.find('/', begin + prefix.size());
+	if (end == std::string::npos) {
+		return {};
+	}
+	auto project = command_line.substr(begin + prefix.size(), end - begin - prefix.size());
+	std::transform(project.begin(), project.end(), project.begin(),
+	               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+	return project;
+}
+
+// GameFlex: the r.ScreenPercentage that gives the scene height KYTY_UE_RENDER_HEIGHT asks for, 0 if
+// none. The engine counts it from the game's output: 1080p for a game that declares it adapts to the
+// screen (FF7 Remake), 4K for the others (KH3), which keep it whatever screen they are told about.
+// Wukong's mode counts from 1080p although it outputs 4K.
+static unsigned long UnrealScreenPercentage(const std::string& project) {
+	static const char* requested = std::getenv("KYTY_UE_RENDER_HEIGHT");
+	if (requested == nullptr) {
 		return 0;
 	}
-	char*      end   = nullptr;
-	const auto value = std::strtoul(percentage, &end, 10);
-	return end == percentage || *end != '\0' || value < 10 || value > 200 ? 0 : value;
+	char*      end    = nullptr;
+	const auto height = std::strtoul(requested, &end, 10);
+	if (end == requested || *end != '\0' || height < 144 || height > 2160) {
+		return 0;
+	}
+	int32_t attribute3 = 0;
+	Loader::SystemContentParamSfoGetInt("ATTRIBUTE3", &attribute3);
+	const unsigned long base = project == "b1" || (attribute3 & 4) != 0 ? 1080 : 2160;
+	return (height * 100 + base / 2) / base;
 }
 
 // GameFlex: gc.EnableTimeoutOnPendingDestroyedObjectInShipping=0 in the saved config of an Unreal
@@ -445,7 +486,8 @@ static unsigned long UnrealScreenPercentage() {
 // section when it rewrites the file). Wukong has no -ini: or -dpcvars= switch. The engine aborts
 // itself when a garbage collection has run over 10 s and objects still wait for the render thread;
 // here the render thread can spend longer than that on a level's new shaders: it is slow, not stuck.
-// r.ScreenPercentage goes there too, for the same reason: it is the only way into such a game.
+// The render size goes there too: r.ScreenPercentage, and r.DynamicRes.OperationMode=0, or a game with
+// dynamic resolution (KH3) keeps choosing its size and takes the setting for nothing.
 // Written when the game reads its command line, before it loads its config.
 static void UnrealSavedConfig(const std::string& guest_path, const std::filesystem::path& real_name) {
 	if (!guest_path.starts_with("/app0/") || !guest_path.ends_with("commandline.txt")) {
@@ -461,19 +503,10 @@ static void UnrealSavedConfig(const std::string& guest_path, const std::filesyst
 		}
 		return content;
 	};
-	// ../../../<project>/<project>.uproject
-	const std::string prefix       = "../../../";
-	const auto        command_line = read_file(real_name);
-	const auto        begin        = command_line.find(prefix);
-	const auto        end          = begin == std::string::npos
-	                                     ? std::string::npos
-	                                     : command_line.find('/', begin + prefix.size());
-	if (end == std::string::npos) {
+	const auto project = UnrealProject(read_file(real_name));
+	if (project.empty()) {
 		return;
 	}
-	auto project = command_line.substr(begin + prefix.size(), end - begin - prefix.size());
-	std::transform(project.begin(), project.end(), project.begin(),
-	               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 	const auto directory = GetRealFilename("/download0/" + project + "/saved/ps5");
 	std::error_code error;
 	std::filesystem::create_directories(directory, error);
@@ -481,11 +514,12 @@ static void UnrealSavedConfig(const std::string& guest_path, const std::filesyst
 	const std::string header   = "[SystemSettings]\n";
 	const std::string timeout  = "gc.EnableTimeoutOnPendingDestroyedObjectInShipping=";
 	const std::string size     = "r.ScreenPercentage=";
-	const auto        percent  = UnrealScreenPercentage();
+	const std::string dynamic  = "r.DynamicRes.OperationMode=";
+	const auto        percent  = UnrealScreenPercentage(project);
 	const auto        existing = read_file(path);
 	auto              settings = timeout + "0\n";
 	if (percent != 0) {
-		settings += size + std::to_string(percent) + "\n";
+		settings += size + std::to_string(percent) + "\n" + dynamic + "0\n";
 	}
 	// The folder outlives the session: what an earlier start wrote goes, the setting may have changed.
 	std::string content;
@@ -493,7 +527,7 @@ static void UnrealSavedConfig(const std::string& guest_path, const std::filesyst
 		const auto line_end = existing.find('\n', line_begin);
 		const auto next     = line_end == std::string::npos ? existing.size() : line_end + 1;
 		const std::string_view line(existing.data() + line_begin, next - line_begin);
-		if (!line.starts_with(timeout) && !line.starts_with(size)) {
+		if (!line.starts_with(timeout) && !line.starts_with(size) && !line.starts_with(dynamic)) {
 			content += line;
 		}
 		line_begin = next;
@@ -506,6 +540,7 @@ static void UnrealSavedConfig(const std::string& guest_path, const std::filesyst
 	std::printf("Unreal saved config: garbage collection timeout off, render size %lu %% (%s)\n", percent,
 	            Common::PathToString(path).c_str());
 	if (content == existing) {
+		g_mount_points->SetUnrealSavedConfig(project);
 		return;
 	}
 	Common::File file;
@@ -514,16 +549,16 @@ static void UnrealSavedConfig(const std::string& guest_path, const std::filesyst
 	}
 	file.Write(content.data(), static_cast<uint32_t>(content.size()));
 	file.Close();
+	g_mount_points->SetUnrealSavedConfig(project);
 }
 
-// GameFlex: KYTY_UE_SCREEN_PERCENTAGE=<n> adds r.ScreenPercentage=<n> to the command line an Unreal
+// GameFlex: KYTY_UE_RENDER_HEIGHT adds its r.ScreenPercentage to the command line an Unreal
 // game reads at start (/app0/ue4commandline.txt, /app0/uecommandline.txt): the engine renders its
 // scene at <n> % of its output, as its own settings would. The game reads a host copy; its files are
 // not touched.
 static std::filesystem::path UnrealCommandLine(const std::string&           guest_path,
                                                const std::filesystem::path& real_name) {
-	const auto value = UnrealScreenPercentage();
-	if (value == 0 || !guest_path.starts_with("/app0/") || !guest_path.ends_with("commandline.txt")) {
+	if (!guest_path.starts_with("/app0/") || !guest_path.ends_with("commandline.txt")) {
 		return {};
 	}
 	std::string  content;
@@ -532,6 +567,10 @@ static std::filesystem::path UnrealCommandLine(const std::string&           gues
 		content.resize(original.Size());
 		original.Read(content.data(), static_cast<uint32_t>(content.size()));
 		original.Close();
+	}
+	const auto value = UnrealScreenPercentage(UnrealProject(content));
+	if (value == 0) {
+		return {};
 	}
 	while (!content.empty() &&
 	       (content.back() == '\n' || content.back() == '\r' || content.back() == '\0')) {
