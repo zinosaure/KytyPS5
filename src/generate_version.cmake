@@ -38,4 +38,22 @@ if(GIT_EXECUTABLE)
 		endif()
 	endif()
 endif()
+# GameFlex: what the shader store's records depend on - the recompiler, and the renderer that
+# describes and creates pipelines (not its memory caches). A build that leaves these sources alone
+# keeps the store, whatever else it changes.
+set(KYTY_SHADER_STORE_STAMP "unknown")
+if(GRAPHICS_SOURCE_DIR)
+	file(GLOB_RECURSE store_sources LIST_DIRECTORIES false RELATIVE "${GRAPHICS_SOURCE_DIR}"
+		"${GRAPHICS_SOURCE_DIR}/shader/*" "${GRAPHICS_SOURCE_DIR}/host_gpu/renderer/*")
+	list(FILTER store_sources EXCLUDE REGEX "^host_gpu/renderer/cache/")
+	list(SORT store_sources)
+	set(store_digests "")
+	foreach(source IN LISTS store_sources)
+		file(SHA256 "${GRAPHICS_SOURCE_DIR}/${source}" digest)
+		string(APPEND store_digests "${source} ${digest}\n")
+	endforeach()
+	if(store_sources)
+		string(SHA256 KYTY_SHADER_STORE_STAMP "${store_digests}")
+	endif()
+endif()
 configure_file("${INPUT_FILE}" "${OUTPUT_FILE}")

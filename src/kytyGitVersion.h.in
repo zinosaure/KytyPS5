@@ -5,6 +5,8 @@
 #define KYTY_GIT_HASH "@KYTY_GIT_HASH@"
 // Full commit identity used for compatibility checks.
 #define KYTY_GIT_REVISION "@KYTY_GIT_REVISION@"
+// GameFlex: the sources the shader store depends on (generate_version.cmake), "unknown" if unread.
+#define KYTY_SHADER_STORE_STAMP "@KYTY_SHADER_STORE_STAMP@"
 
 /* Build provenance, shown in the window title and in crash reports. */
 #if defined(KYTY_OFFICIAL_BUILD)

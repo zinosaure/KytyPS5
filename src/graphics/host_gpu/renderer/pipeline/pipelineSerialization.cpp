@@ -13,6 +13,7 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <ranges>
+#include <string_view>
 #include <xxhash.h>
 #include <zstd.h>
 
@@ -62,9 +63,19 @@ uint64_t BuildStamp() {
 	return error ? 0 : static_cast<uint64_t>(time);
 }
 
+// GameFlex: the sources the records depend on (generate_version.cmake), so a build that changes
+// neither the recompiler nor the pipelines keeps the store. Without them, the executable's date.
+uint64_t StoreStamp() {
+	constexpr std::string_view sources = KYTY_SHADER_STORE_STAMP;
+	if (sources != "unknown") {
+		return XXH3_64bits(sources.data(), sources.size());
+	}
+	return BuildStamp();
+}
+
 // What every record depends on besides its own fields; empty when the build is unknown.
 std::vector<uint8_t> StoreHeader(const GraphicContext& graphics) {
-	const auto stamp = BuildStamp();
+	const auto stamp = StoreStamp();
 	if (stamp == 0) {
 		return {};
 	}
