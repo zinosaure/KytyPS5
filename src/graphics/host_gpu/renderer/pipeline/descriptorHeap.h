@@ -13,6 +13,11 @@ namespace Libs::Graphics {
 struct GraphicContext;
 class MasterSemaphore;
 
+// A descriptor set layout that needs `count` descriptors of `type`: every pool created from now
+// on holds a few such sets. The default quotas are below what some games bind in one set (Final
+// Fantasy VII Rebirth, past its main menu), and a fresh pool that cannot hold one set was fatal.
+void RequireDescriptorPoolSize(vk::DescriptorType type, uint32_t count);
+
 class DescriptorHeap {
 public:
 	DescriptorHeap(GraphicContext& graphics, MasterSemaphore& master_semaphore);

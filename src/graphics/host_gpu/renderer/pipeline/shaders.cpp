@@ -4,6 +4,7 @@
 #include "gpu_blit_shaders/gpu_mesh_indirect_spv.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -114,6 +115,18 @@ static void CreateLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pip
 		     samplers, limits.maxDescriptorSetSamplers);
 	}
 	pipeline.uses_push_descriptors = descriptor_count <= graphics.max_push_descriptors;
+	// A layout too large to be pushed is allocated from the descriptor heap's pools: they must
+	// hold it.
+	if (!pipeline.uses_push_descriptors) {
+		for (const auto type: {vk::DescriptorType::eStorageBuffer, vk::DescriptorType::eSampledImage,
+		                       vk::DescriptorType::eStorageImage, vk::DescriptorType::eSampler}) {
+			uint64_t count = 0;
+			for (const auto& binding: bindings) {
+				if (binding.descriptorType == type) count += binding.descriptorCount;
+			}
+			if (count != 0) RequireDescriptorPoolSize(type, static_cast<uint32_t>(count));
+		}
+	}
 
 	vk::DescriptorSetLayoutCreateInfo create {};
 	create.flags        = pipeline.uses_push_descriptors

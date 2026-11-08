@@ -5,6 +5,10 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
+#include <algorithm>
+#include <atomic>
+#include <cstdio>
+
 namespace Libs::Graphics {
 namespace {
 
@@ -15,8 +19,38 @@ constexpr std::array DescriptorPoolSizes = {
     vk::DescriptorPoolSize {vk::DescriptorType::eStorageImage, 1024},
     vk::DescriptorPoolSize {vk::DescriptorType::eSampler, 1024},
 };
+constexpr std::array<const char*, DescriptorPoolSizes.size()> DescriptorPoolNames = {
+    "storage buffer", "sampled image", "storage image", "sampler"};
+
+// Sets of the largest layout a pool must hold, beyond the default quotas.
+constexpr uint32_t LargeSetsPerPool = 4;
+
+std::array<std::atomic<uint32_t>, DescriptorPoolSizes.size()> g_required_pool_sizes {};
 
 } // namespace
+
+void RequireDescriptorPoolSize(vk::DescriptorType type, uint32_t count) {
+	for (size_t index = 0; index < DescriptorPoolSizes.size(); index++) {
+		if (DescriptorPoolSizes[index].type != type) {
+			continue;
+		}
+		const auto needed  = count * LargeSetsPerPool;
+		auto       current = g_required_pool_sizes[index].load(std::memory_order_relaxed);
+		while (needed > current) {
+			if (g_required_pool_sizes[index].compare_exchange_weak(current, needed,
+			                                                       std::memory_order_relaxed)) {
+				if (count > DescriptorPoolSizes[index].descriptorCount) {
+					std::fprintf(stderr,
+					             "Descriptor pools grow: a set layout needs %u %s descriptors, "
+					             "more than the default %u\n",
+					             count, DescriptorPoolNames[index], DescriptorPoolSizes[index].descriptorCount);
+				}
+				break;
+			}
+		}
+		return;
+	}
+}
 
 DescriptorHeap::DescriptorHeap(GraphicContext& graphics, MasterSemaphore& master_semaphore)
     : m_graphics(graphics), m_master_semaphore(master_semaphore) {
@@ -52,7 +86,13 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
 
 	m_sets.clear();
 	auto& fresh_batch = m_sets[layout];
-	EXIT_IF(!Allocate(layout, fresh_batch));
+	if (!Allocate(layout, fresh_batch)) {
+		// A pool reused from before a larger layout appeared can be too small for it: a new one,
+		// sized for the largest layout seen (RequireDescriptorPoolSize).
+		m_pending_pools.emplace_back(m_current_pool, m_master_semaphore.CurrentTick());
+		CreateDescriptorPool();
+		EXIT_IF(!Allocate(layout, fresh_batch));
+	}
 	return fresh_batch.sets[--fresh_batch.size];
 }
 
@@ -81,10 +121,15 @@ bool DescriptorHeap::Allocate(vk::DescriptorSetLayout layout, Batch& batch) {
 }
 
 void DescriptorHeap::CreateDescriptorPool() {
+	auto sizes = DescriptorPoolSizes;
+	for (size_t index = 0; index < sizes.size(); index++) {
+		sizes[index].descriptorCount = std::max(
+		    sizes[index].descriptorCount, g_required_pool_sizes[index].load(std::memory_order_relaxed));
+	}
 	vk::DescriptorPoolCreateInfo create {};
 	create.maxSets       = DescriptorHeapCount;
-	create.poolSizeCount = static_cast<uint32_t>(DescriptorPoolSizes.size());
-	create.pPoolSizes    = DescriptorPoolSizes.data();
+	create.poolSizeCount = static_cast<uint32_t>(sizes.size());
+	create.pPoolSizes    = sizes.data();
 	EXIT_IF(m_graphics.device.createDescriptorPool(&create, nullptr, &m_current_pool) !=
 	        vk::Result::eSuccess);
 }
