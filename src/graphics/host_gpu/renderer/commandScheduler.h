@@ -94,6 +94,8 @@ private:
 	std::queue<PendingOperation> m_pending_operations;
 	std::queue<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;
+	// GameFlex: PopPendingOperations calls since the driver was last asked where the GPU is.
+	uint32_t m_refresh_skips = 0;
 	std::condition_variable      m_operation_available;
 	std::jthread                 m_priority_thread;
 	uint64_t                     m_priority_active_tick = 0; // 0 while none runs

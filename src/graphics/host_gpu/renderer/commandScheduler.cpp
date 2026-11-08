@@ -173,6 +173,17 @@ void CommandScheduler::Wait(uint64_t tick) {
 }
 
 void CommandScheduler::PopPendingOperations() {
+	// GameFlex: this runs at every draw, and asking the driver where the GPU is costs a system call
+	// (vkGetSemaphoreCounterValue, an ioctl): 9 % of the command thread in Kingdom Hearts III. Ask only
+	// when the oldest pending operation is not already known to be done, and at most once every 16
+	// calls; these operations wait for the GPU anyway, a few draws later changes nothing.
+	{
+		std::lock_guard lock(m_operation_mutex);
+		if (m_pending_operations.empty() ||
+		    (!m_master.IsFree(m_pending_operations.front().tick) && (++m_refresh_skips & 15u) != 0)) {
+			return;
+		}
+	}
 	m_master.Refresh();
 	for (;;) {
 		PendingOperation operation;
