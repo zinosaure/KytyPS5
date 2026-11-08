@@ -15,6 +15,8 @@
 #include "libs/network.h"
 
 #include <algorithm>
+#include <string>
+#include <cstdlib>
 #include <atomic>
 #include <chrono>
 #include <climits>
@@ -426,6 +428,47 @@ bool IsOpenDescriptor(int d) {
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
+// GameFlex: KYTY_UE_SCREEN_PERCENTAGE=<n> adds r.ScreenPercentage=<n> to the command line an Unreal
+// game reads at start (/app0/ue4commandline.txt, /app0/uecommandline.txt): the engine renders its
+// scene at <n> % of its output, as its own settings would. The game reads a host copy; its files are
+// not touched.
+static std::filesystem::path UnrealCommandLine(const std::string&           guest_path,
+                                               const std::filesystem::path& real_name) {
+	static const char* percentage = std::getenv("KYTY_UE_SCREEN_PERCENTAGE");
+	if (percentage == nullptr || !guest_path.starts_with("/app0/") ||
+	    !guest_path.ends_with("commandline.txt")) {
+		return {};
+	}
+	char*      end   = nullptr;
+	const auto value = std::strtoul(percentage, &end, 10);
+	if (end == percentage || *end != '\0' || value < 10 || value > 200) {
+		return {};
+	}
+	std::string  content;
+	Common::File original;
+	if (original.Open(real_name, Common::File::Mode::Read)) {
+		content.resize(original.Size());
+		original.Read(content.data(), static_cast<uint32_t>(content.size()));
+		original.Close();
+	}
+	while (!content.empty() &&
+	       (content.back() == '\n' || content.back() == '\r' || content.back() == '\0')) {
+		content.pop_back();
+	}
+	const auto option = "r.ScreenPercentage=" + std::to_string(value);
+	content += " -ini:Engine:[SystemSettings]:" + option + " -dpcvars=" + option;
+	const auto   copy_path = std::filesystem::temp_directory_path() /
+	                       ("kyty-" + Common::PathToString(real_name.filename()));
+	Common::File copy;
+	if (!copy.Create(copy_path)) {
+		return {};
+	}
+	copy.Write(content.data(), static_cast<uint32_t>(content.size()));
+	copy.Close();
+	std::printf("Unreal render size: %lu %% (%s)\n", value, guest_path.c_str());
+	return copy_path;
+}
+
 int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	PRINT_NAME();
 
@@ -495,6 +538,11 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	if (file->real_name.empty()) {
 		g_files->DeleteDescriptor(descriptor);
 		return KERNEL_ERROR_ENOENT;
+	}
+	if (rw_mode == Common::File::Mode::Read && !directory) {
+		if (auto copy = UnrealCommandLine(file->name, file->real_name); !copy.empty()) {
+			file->real_name = std::move(copy);
+		}
 	}
 	if (Common::IsArchivePath(file->real_name) &&
 	    (rw_mode != Common::File::Mode::Read || trunc || creat)) {
