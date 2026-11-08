@@ -1080,9 +1080,12 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 			return;
 		}
 		mesh_groups = (primitives - 1u) / mesh.primitives_per_group + 1u;
-		if (mesh_groups > limits.maxMeshWorkGroupCount[0] ||
+		// More groups than one launch holds go in several launches, below.
+		const auto launch = std::min(mesh_groups,
+		                             ShaderRecompiler::IR::PushData::MeshGroupsPerLaunch);
+		if (launch > limits.maxMeshWorkGroupCount[0] ||
 		    draw.instance_count > limits.maxMeshWorkGroupCount[1] ||
-		    static_cast<uint64_t>(mesh_groups) * draw.instance_count >
+		    static_cast<uint64_t>(launch) * draw.instance_count >
 		        limits.maxMeshWorkGroupTotalCount) {
 			EXIT("mesh draw exceeds host workgroup limits: %ux%u\n", mesh_groups,
 			     draw.instance_count);
@@ -1211,7 +1214,16 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	if (mesh_task) {
 		vk_buffer.drawMeshTasksEXT(emit.indirect.count, 1, 1);
 	} else if (mesh_active) {
-		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
+		// Each launch says its first group; the first one's is the 0 pushed with the draw.
+		for (uint32_t first = 0; first < mesh_groups; first += PushData::MeshGroupsPerLaunch) {
+			if (first != 0) {
+				vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_stages,
+				                        PushData::MeshFirstGroupDword * sizeof(uint32_t),
+				                        sizeof(uint32_t), &first);
+			}
+			vk_buffer.drawMeshTasksEXT(std::min(mesh_groups - first, PushData::MeshGroupsPerLaunch),
+			                           draw.instance_count, 1);
+		}
 	} else if (args_buffer.first == nullptr) {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
 	} else if (draw.indexed) {

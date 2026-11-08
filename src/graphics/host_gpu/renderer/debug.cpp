@@ -14,11 +14,20 @@
 
 namespace Libs::Graphics {
 
+// A slot is bound when the target mask enables it and it has an address and a format: a
+// COLOR_INVALID target is off, the color block drops what is exported to it (see
+// PipelineCache::GetGraphicsPrograms).
+static bool RenderTargetSlotBound(const HW::Context& hw, uint32_t mask, uint32_t slot) {
+	const auto& rt = hw.GetRenderTarget(slot);
+	return render_target_mask_slot(mask, slot) != 0 && rt.base.addr != 0 &&
+	       rt.info.format != Prospero::ChannelLayout::kInvalid;
+}
+
 static uint32_t render_target_first_bound_slot(const CommandBuffer& buffer) {
 	const auto& hw   = buffer.GetRegisters();
 	const auto  mask = hw.GetRenderTargetMask();
 	for (uint32_t i = 0; i < 8; i++) {
-		if (render_target_mask_slot(mask, i) != 0 && hw.GetRenderTarget(i).base.addr != 0) {
+		if (RenderTargetSlotBound(hw, mask, i)) {
 			return i;
 		}
 	}
@@ -150,9 +159,9 @@ static bool RenderIsColorDimension(uint32_t dimension) {
 static void RtCheck(const HW::RenderTarget& rt) {
 	if (rt.base.addr != 0) {
 		EXIT_NOT_IMPLEMENTED(rt.view.base_array_slice_index > rt.view.last_array_slice_index);
-		// Native MSAA stores expanded samples, independent of FMASK metadata compression.
-		EXIT_NOT_IMPLEMENTED(rt.info.fmask_compression_enable && rt.attrib.num_samples == 0 &&
-		                     rt.attrib.num_fragments == 0);
+		// A single-sample target has no FMASK: the flag means nothing (Final Fantasy VII Rebirth sets
+		// it), and Kyty draws without FMASK anyway. Native MSAA stores expanded samples, independent
+		// of FMASK metadata compression.
 		if (rt.attrib.force_dest_alpha_to_one) {
 			static bool logged = false;
 			if (!logged) {
@@ -680,7 +689,12 @@ void hw_check(const CommandBuffer& buffer) {
 	const auto& aa      = hw.GetAaSampleControl();
 	const auto& ac      = hw.GetAaConfig();
 
-	RtCheck(rt);
+	// Only a target the draw writes is checked. Without one (a depth-only pass), slot 0 keeps
+	// whatever an earlier pass left there, and Final Fantasy VII Rebirth binds a COLOR_INVALID
+	// target at 0x1000 whose other fields mean nothing (tile mode 0x1c): Kyty stopped on them.
+	if (RenderTargetSlotBound(hw, hw.GetRenderTargetMask(), rt_slot)) {
+		RtCheck(rt);
+	}
 	VpCheck(vp, smc);
 	ClipCheck(c);
 	McCheck(mc);

@@ -363,7 +363,12 @@ static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 58u);
 
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
-	static constexpr uint32_t MeshDrawDwordCount = 5;
+	// Mesh draw parameters: vertex count, base vertex, index size, index address (two dwords),
+	// and the first group of the launch. A draw of more groups than one launch holds (the
+	// minimum Vulkan guarantees on every axis) is split; Final Fantasy VII Rebirth draws 135747.
+	static constexpr uint32_t MeshDrawDwordCount   = 6;
+	static constexpr uint32_t MeshFirstGroupDword  = 5;
+	static constexpr uint32_t MeshGroupsPerLaunch  = 65535;
 	// Indirect mesh draws read the draw parameters, then the record's first instance, from the
 	// task payload (gpu_mesh_indirect.task).
 	static constexpr uint32_t MeshTaskPayloadDwordCount = MeshDrawDwordCount + 1;

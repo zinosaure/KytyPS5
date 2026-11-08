@@ -28,7 +28,7 @@ layout(push_constant) uniform Push {
 	Params params;
 };
 
-taskPayloadSharedEXT uint payload[6];
+taskPayloadSharedEXT uint payload[7];
 
 void main() {
 	Record   record        = Record(params.records + uint64_t(gl_WorkGroupID.x) * params.stride);
@@ -49,7 +49,8 @@ void main() {
 	payload[2] = params.index_size;
 	payload[3] = uint(index_address);
 	payload[4] = uint(index_address >> 32);
-	payload[5] = record.dwords[base + 1];
+	payload[5] = 0; // MeshFirstGroupDword: a record is one launch.
+	payload[6] = record.dwords[base + 1];
 	uint groups =
 	    count < params.primitive_size ? 0 : (count - params.primitive_size) / params.group_step + 1;
 	// Past the host launch limits, where direct draws exit, the record draws nothing.
