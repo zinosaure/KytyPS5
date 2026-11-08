@@ -85,15 +85,15 @@ struct MemoryInfo {
 
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
 		if (typed) return false;
-		if (data_bits == 8u) return !formatted && opcode == ValueOpcode::LoadBufferU8;
-		if (data_bits == 16u) return !formatted && opcode == ValueOpcode::LoadBufferU16;
-		return data_bits == 32u &&
-		       (formatted ? opcode == ValueOpcode::LoadBufferU32
-		                  : opcode == ValueOpcode::ReadConstBuffer ||
-		                        opcode == ValueOpcode::LoadBufferU32 ||
-		                        opcode == ValueOpcode::LoadBufferU32x2 ||
-		                        opcode == ValueOpcode::LoadBufferU32x3 ||
-		                        opcode == ValueOpcode::LoadBufferU32x4);
+		const bool dwords = opcode == ValueOpcode::LoadBufferU32 ||
+		                    opcode == ValueOpcode::LoadBufferU32x2 ||
+		                    opcode == ValueOpcode::LoadBufferU32x3 ||
+		                    opcode == ValueOpcode::LoadBufferU32x4;
+		// Formatted loads of any width, D16 included, convert each selected component.
+		if (formatted) return (data_bits == 32u || data_bits == 16u) && dwords;
+		if (data_bits == 8u) return opcode == ValueOpcode::LoadBufferU8;
+		if (data_bits == 16u) return opcode == ValueOpcode::LoadBufferU16;
+		return data_bits == 32u && (opcode == ValueOpcode::ReadConstBuffer || dwords);
 	}
 
 	bool operator==(const MemoryInfo& other) const = default;
