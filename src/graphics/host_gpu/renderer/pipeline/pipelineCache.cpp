@@ -5,6 +5,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/parallelFor.h"
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_format.h"
@@ -15,6 +16,7 @@
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/presentation/systemOverlay.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/Tessellation.h"
@@ -29,11 +31,13 @@
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
 #include <ranges>
 #include <span>
+#include <string_view>
 #include <spirv-tools/libspirv.hpp>
 #include <utility>
 #include <vector>
@@ -44,6 +48,8 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr auto DriverCacheSaveInterval = std::chrono::minutes {5};
+// Compiled aside, translating takes at most one part in this many of the GPU thread's time.
+constexpr int TranslationDutyDivisor = 4;
 
 uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
@@ -330,6 +336,7 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	    .function_code  = {function_code.begin(), function_code.end()},
 	});
 	m_compiled[static_cast<size_t>(key.stage)]++;
+	NotifyShaderCompiled();
 	// Guest geometry shaders are compiled through the host mesh stage.
 	std::printf("Shaders: VS %u | PS %u | CS %u | GS %u | LS %u | HS %u | TES %u\n",
 	            m_compiled[static_cast<size_t>(ShaderType::Vertex)],
@@ -411,6 +418,22 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		if (module != nullptr) return bind(*module);
 	}
 
+	// A new graphics shader waits its turn when compiling aside: the draw is skipped until then.
+	struct TranslationTurn {
+		std::chrono::steady_clock::time_point* next;
+		std::chrono::steady_clock::time_point  start = std::chrono::steady_clock::now();
+		~TranslationTurn() {
+			if (next != nullptr) {
+				const auto end = std::chrono::steady_clock::now();
+				*next          = end + (end - start) * (TranslationDutyDivisor - 1);
+			}
+		}
+	} turn {m_defer_translation ? &m_next_translation : nullptr};
+	if (turn.next != nullptr && turn.start < m_next_translation) {
+		turn.next = nullptr;
+		return nullptr;
+	}
+
 	options.shader_hash     = params.hash;
 	options.user_data       = user_data;
 	options.back_code       = params.back_code;
@@ -469,9 +492,64 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
       m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
+	const char* aside = std::getenv("KYTY_COMPILE_ASIDE");
+	m_compile_aside   = aside != nullptr && std::string_view(aside) != "0" &&
+	                    !Config::GraphicsDebugDumpEnabled();
+	if (m_compile_aside) {
+		// A compile takes a whole core: leave most of them to the game.
+		const auto builders = std::clamp<size_t>(Common::ParallelThreads() / 4, 1, 3);
+		for (size_t i = 0; i < builders; i++) {
+			m_builders.emplace_back([this](std::stop_token stop) { BuildPipelines(stop); });
+		}
+	}
+}
+
+void PipelineCache::BuildPipelines(std::stop_token stop) {
+	std::unique_lock lock(m_build_mutex);
+	while (m_build_ready.wait(lock, stop, [this] { return !m_build_queue.empty(); })) {
+		auto build = std::move(m_build_queue.front());
+		m_build_queue.pop();
+		lock.unlock();
+		{
+			Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
+			                                         Common::DebugCounters::Counter::PipelineCreateNs,
+			                                         Common::DebugCounters::Peak::PipelineCreateNs);
+			CreatePipelineInternal(m_graphics, build.pipeline, build.key, build.stages,
+			                       m_driver_cache);
+		}
+		NotifyShaderCompiled();
+		lock.lock();
+		m_built.push_back(std::move(build));
+	}
+}
+
+void PipelineCache::CollectBuiltPipelines() {
+	std::vector<PipelineBuild> built;
+	{
+		std::scoped_lock lock(m_build_mutex);
+		built.swap(m_built);
+	}
+	for (const auto& build: built) {
+		m_building.erase(build.key);
+		// A draw that may not wait has built its own in the meantime.
+		if (!m_graphics_pipelines.emplace(build.key, build.pipeline).second) {
+			m_graphics.device.destroyPipeline(build.pipeline.pipeline, nullptr);
+			m_graphics.device.destroyPipelineLayout(build.pipeline.pipeline_layout, nullptr);
+			m_graphics.device.destroyDescriptorSetLayout(build.pipeline.descriptor_set_layout, nullptr);
+			continue;
+		}
+		StorePipeline(build.key);
+		CheckpointDriverCache();
+	}
 }
 
 PipelineCache::~PipelineCache() {
+	{
+		std::scoped_lock lock(m_build_mutex);
+		m_build_queue = {};
+	}
+	m_builders.clear();
+	CollectBuiltPipelines();
 	Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& pipeline: pipelines | std::views::values) {
@@ -639,6 +717,7 @@ void PipelineCache::Save() {
 }
 
 void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state) {
+	m_defer_translation = m_compile_aside && state.deferrable;
 	const auto& context           = command.GetRegisters();
 	const auto& user_config       = command.GetUserConfig();
 	const auto& sh                = context.GetShaderRegisters();
@@ -851,8 +930,12 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	uint32_t push_data_cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
 	    mesh_active, object_primitive_id, last_stage.user_clip_planes);
 	if (pixel_active) {
-		const auto& pixel_module = *GetProgram(pixel_params, pixel_info, push_data_cursor);
-		for (const auto& output: pixel_module.info.info.outputs) {
+		const auto* pixel_module = GetProgram(pixel_params, pixel_info, push_data_cursor);
+		// Compiled aside, its turn has not come: no vertex stage means the draw is skipped.
+		if (pixel_module == nullptr) {
+			return;
+		}
+		for (const auto& output: pixel_module->info.info.outputs) {
 			if (output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt ||
 			    output.kind == ShaderRecompiler::IR::StageOutputKind::ObjectPrimitiveId) {
 				state.mrt_mask |= 1u << output.location;
@@ -861,12 +944,16 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		state.mrt_mask &= color_output_mask;
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
-		GetProgram(vertex_params[i], vertex_info[i], push_data_cursor);
+		if (GetProgram(vertex_params[i], vertex_info[i], push_data_cursor) == nullptr) {
+			vertex_info[0].stage = {};
+			return;
+		}
 	}
 }
 
 const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                      ShaderComputeInputInfo&      input_info) {
+	m_defer_translation           = false;
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, input_info);
 	input_info.lds_storage = input_info.lds_size_dwords * 4u >
@@ -875,7 +962,7 @@ const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo
 	return GetProgram(params, input_info, push_data_cursor);
 }
 
-PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,
+PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,
                                                             const DrawRenderState& state) {
 	const auto* colors        = state.color_info;
 	const auto& depth         = state.depth_info;
@@ -1043,10 +1130,29 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		}
 	}
 
+	if (m_compile_aside && state.deferrable) {
+		auto found = m_graphics_pipelines.find(key);
+		if (found == m_graphics_pipelines.end()) {
+			CollectBuiltPipelines();
+			found = m_graphics_pipelines.find(key);
+		}
+		if (found != m_graphics_pipelines.end()) {
+			return &found->second;
+		}
+		if (m_building.insert(key).second) {
+			{
+				std::scoped_lock lock(m_build_mutex);
+				m_build_queue.push({.key = key, .stages = stages, .pipeline = {}});
+			}
+			m_build_ready.notify_one();
+		}
+		return nullptr;
+	}
+
 	auto [iter, inserted] = m_graphics_pipelines.try_emplace(key);
 	auto& pipeline        = iter->second;
 	if (!inserted) {
-		return pipeline;
+		return &pipeline;
 	}
 
 	if (graphics_debug_dump_enabled()) {
@@ -1062,10 +1168,11 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
 		CreatePipelineInternal(m_graphics, pipeline, key, stages, m_driver_cache);
 	}
+	NotifyShaderCompiled();
 	StorePipeline(key);
 	CheckpointDriverCache();
 
-	return pipeline;
+	return &pipeline;
 }
 
 PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info) {
@@ -1089,6 +1196,7 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
 		CreatePipelineInternal(m_graphics, pipeline, module, m_driver_cache);
 	}
+	NotifyShaderCompiled();
 	CheckpointDriverCache();
 
 	return pipeline;

@@ -26,6 +26,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -246,6 +247,10 @@ struct TrophyNotification {
 std::mutex                     g_trophy_notification_mutex;
 std::deque<TrophyNotification> g_trophy_notifications;
 std::atomic<bool>              g_trophy_notification_active {false};
+// The compilation toast: compiles since it appeared, and when the last one was noted.
+constexpr auto                       COMPILE_TOAST_LINGER = std::chrono::milliseconds {1500};
+std::atomic<uint32_t>                g_compile_count {0};
+std::atomic<Clock::duration::rep>    g_compile_last {0};
 std::array<std::filesystem::path, 2> g_splash_paths;
 std::atomic<bool>                    g_splash_active {false};
 std::atomic<Clock::duration::rep>    g_splash_hidden_at {0};
@@ -702,6 +707,15 @@ void ShutdownSystemOverlayInput() {
 	g_input_window = nullptr;
 }
 
+static bool CompileToastActive() noexcept {
+	const auto count = g_compile_count.load(std::memory_order_relaxed);
+	if (count == 0) {
+		return false;
+	}
+	const Clock::duration last {g_compile_last.load(std::memory_order_relaxed)};
+	return Clock::now().time_since_epoch() - last < COMPILE_TOAST_LINGER;
+}
+
 SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const auto core   = CoreIme::GetVisualState();
 	const auto dialog = DialogIme::GetVisualState();
@@ -709,11 +723,13 @@ SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const bool trophy_active = g_trophy_notification_active.load(std::memory_order_acquire);
 	const bool splash        = g_splash_active.load(std::memory_order_acquire);
 	const auto cursor        = GetHostInputTouchPadVisualState();
+	const bool compiling     = CompileToastActive();
 	return {core.active || dialog.active || system.active || trophy_active || splash ||
-	            cursor.enabled,
+	            cursor.enabled || compiling,
 	        core.revision + dialog.revision + system.revision + (trophy_active ? 1u : 0u) +
-	            (splash ? 2u : 0u) + static_cast<decltype(core.revision)>(cursor.revision) +
-	            PerformanceOverlayRevision()};
+	            (splash ? 2u : 0u) + (compiling ? 4u : 0u) +
+	            static_cast<decltype(core.revision)>(g_compile_count.load(std::memory_order_relaxed)) +
+	            static_cast<decltype(core.revision)>(cursor.revision) + PerformanceOverlayRevision()};
 }
 
 bool ProcessSystemOverlayInput(const SDL_Event& event) {
@@ -841,6 +857,17 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 			            static_cast<float>(event.wheel.y)});
 			return true;
 		default: return false;
+	}
+}
+
+void NotifyShaderCompiled() noexcept {
+	static const bool enabled = [] {
+		const char* toast = std::getenv("KYTY_SHADER_TOAST");
+		return toast == nullptr || std::string_view(toast) != "0";
+	}();
+	if (enabled) {
+		g_compile_last.store(Clock::now().time_since_epoch().count(), std::memory_order_relaxed);
+		g_compile_count.fetch_add(1, std::memory_order_relaxed);
 	}
 }
 
@@ -1666,6 +1693,35 @@ struct SystemOverlay::Impl {
 		}
 	}
 
+	// While shaders compile, in the bottom-left corner: the game may stutter, or miss an effect
+	// for a moment, for a reason worth saying.
+	void DrawCompileToast(vk::Extent2D frame_extent) {
+		if (!CompileToastActive()) {
+			g_compile_count.store(0, std::memory_order_relaxed);
+			return;
+		}
+		const float scale = std::clamp(std::min(static_cast<float>(frame_extent.width) / 1920.0f,
+		                                        static_cast<float>(frame_extent.height) / 1080.0f),
+		                               0.65f, 1.25f);
+		// Console language 2 is French; the emulator's other strings have no entry for this one.
+		const auto  count = g_compile_count.load(std::memory_order_relaxed);
+		const auto  text  = Config::GetConsoleLanguage() == 2
+		                        ? fmt::format("Compilation des shaders : {}", count)
+		                        : fmt::format("Compiling shaders: {}", count);
+		const float size = 22.0f * scale;
+		const float pad  = 12.0f * scale;
+		const auto  extent =
+		    ImGui::GetFont()->CalcTextSizeA(size, std::numeric_limits<float>::max(), 0.0f,
+		                                    text.c_str());
+		const ImVec2 bottom_left {24.0f * scale, static_cast<float>(frame_extent.height) - 24.0f * scale};
+		const ImVec2 top_left {bottom_left.x, bottom_left.y - extent.y - 2.0f * pad};
+		const ImVec2 bottom_right {bottom_left.x + extent.x + 2.0f * pad, bottom_left.y};
+		auto*        draw = ImGui::GetForegroundDrawList();
+		draw->AddRectFilled(top_left, bottom_right, IM_COL32(24, 26, 32, 215), 10.0f * scale);
+		draw->AddText(nullptr, size, {top_left.x + pad, top_left.y + pad},
+		              IM_COL32(255, 255, 255, 255), text.c_str());
+	}
+
 	void DrawTrophyNotification(vk::Extent2D frame_extent, Clock::time_point now, float min_top) {
 		std::erase_if(retired_trophy_images, [](const auto& texture) {
 			if (texture->Status != ImTextureStatus_Destroyed) {
@@ -1802,7 +1858,8 @@ struct SystemOverlay::Impl {
 		const auto now = Clock::now();
 		if (!has_overlay && !g_trophy_notification_active.load(std::memory_order_acquire) &&
 		    !g_splash_active.load(std::memory_order_acquire) &&
-		    !GetHostInputTouchPadVisualState().enabled && !PerformanceOverlayEnabled()) {
+		    !GetHostInputTouchPadVisualState().enabled && !PerformanceOverlayEnabled() &&
+		    !CompileToastActive()) {
 			return false;
 		}
 		const auto prepared_session = snapshot.session;
@@ -1843,6 +1900,7 @@ struct SystemOverlay::Impl {
 			}
 		}
 		DrawTrophyNotification(frame_extent, now, performance_bottom);
+		DrawCompileToast(frame_extent);
 		DrawTouchPadCursor(GetHostInputTouchPadVisualState());
 		ImGui::Render();
 		extent = frame_extent;

@@ -849,6 +849,8 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             DrawRenderState& state) {
 	m_context.GetImageHeap().BeginDraw();
+	state.deferrable = draw.indexed && buffer.GetRegisters().GetDepthControl().z_enable &&
+	                   !Prospero::IsRectList(buffer.GetUserConfig().GetPrimType());
 	m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state);
 	// Vertex programs beyond the host mesh limits or with unsupported call targets are not
 	// compiled.
@@ -1133,7 +1135,11 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		                                                       sizeof(uint32_t), false);
 		EXIT_IF((count_buffer.second & 3u) != 0);
 	}
-	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state);
+	auto* ready_pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state);
+	if (ready_pipeline == nullptr) {
+		return; // Compiled aside: this draw is skipped until its pipeline is ready.
+	}
+	auto& pipeline = *ready_pipeline;
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,

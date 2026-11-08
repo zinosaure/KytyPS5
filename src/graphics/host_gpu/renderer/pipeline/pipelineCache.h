@@ -17,6 +17,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -25,6 +26,7 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -142,6 +144,9 @@ struct DrawRenderState {
 	// Input: the user-data slots a GPU-read indirect draw patches.
 	ShaderIndirectOffsets                indirect_offsets;
 	bool                                 indirect_draw = false;
+	// Compiling aside, this draw may wait for its shaders: geometry in a depth pass. A pass that
+	// clears, filters or captures once may not, or its target stays garbage (Wukong turned pink).
+	bool                                 deferrable    = false;
 
 	[[nodiscard]] std::span<const ShaderVertexInputInfo> VertexStages() const {
 		return {vertex_info.data(), vertex_info[1].stage ? 3u : 1u};
@@ -198,7 +203,8 @@ public:
 	const ShaderModule* GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                      ShaderComputeInputInfo&      input_info);
 
-	Pipeline& GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state);
+	// Null while the pipeline is compiled aside (KYTY_COMPILE_ASIDE): the draw waits for it.
+	Pipeline* GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info);
 
 private:
@@ -209,7 +215,8 @@ private:
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		std::vector<ShaderModule>                    modules;
+		// A deque: a module compiled aside keeps its address while the program gains another.
+		std::deque<ShaderModule>                     modules;
 		bool                                         skip_dispatch = false;
 
 		[[nodiscard]] std::span<const uint32_t> FunctionCode() const;
@@ -255,6 +262,25 @@ private:
 	// Records everything first created; closed without a shader store.
 	ShaderStoreWriter m_store;
 
+	// KYTY_COMPILE_ASIDE: for a deferrable draw, a new shader is translated when its turn comes
+	// and its pipeline is built on another thread. The draw is skipped until then, so the GPU
+	// thread does not stop for it. Compute stays synchronous: games read what a dispatch writes.
+	struct PipelineBuild {
+		GraphicsPipelineKey                key;
+		std::array<const ShaderModule*, 4> stages;
+		Pipeline                           pipeline;
+	};
+	bool                                  m_compile_aside = false;
+	bool                                  m_defer_translation = false;
+	std::chrono::steady_clock::time_point m_next_translation;
+	std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash> m_building;
+	std::mutex                            m_build_mutex;
+	std::condition_variable_any           m_build_ready;
+	std::queue<PipelineBuild>             m_build_queue;
+	std::vector<PipelineBuild>            m_built;
+	// Declared last, so they join before the rest is destroyed.
+	std::vector<std::jthread>             m_builders;
+
 	template <typename InputInfo>
 	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,
 	                               uint32_t& push_data_cursor);
@@ -262,6 +288,8 @@ private:
 	                            ShaderRecompiler::CompileOptions  options,
 	                            ShaderRecompiler::TranslateResult translated,
 	                            uint32_t                          push_data_cursor);
+	void BuildPipelines(std::stop_token stop);
+	void CollectBuiltPipelines();
 	void InitializeDriverCache();
 	void CheckpointDriverCache();
 
