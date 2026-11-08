@@ -101,12 +101,15 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 		command();
 		return;
 	}
-	std::binary_semaphore done {0};
-	SendCommand([operation = std::move(command), &done]() mutable {
+	// GameFlex: on the heap. The caller may be a guest thread, whose stack is guest memory: in
+	// unified memory a dma-buf mapping, where the shared futex behind std::binary_semaphore fails
+	// with EFAULT: libstdc++ throws std::system_error (Tekken 8) or a wake is lost (FF XVI).
+	auto done = std::make_shared<std::binary_semaphore>(0);
+	SendCommand([operation = std::move(command), done]() mutable {
 		operation();
-		done.release();
+		done->release();
 	});
-	done.acquire();
+	done->acquire();
 }
 
 void GuestGpu::Submit(std::span<const uint32_t> commands) {
