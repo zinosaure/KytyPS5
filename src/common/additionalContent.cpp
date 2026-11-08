@@ -109,6 +109,70 @@ std::vector<AddContentEntry> FindAddContent(const std::filesystem::path& dir,
 	return entries;
 }
 
+std::vector<AddContentEntry> FindDeclaredAddContent(const std::filesystem::path& app0_dir) {
+	std::vector<AddContentEntry> entries;
+	std::ifstream                stream(app0_dir / "dlc_emu.ini", std::ios::binary);
+	if (!stream) {
+		return entries;
+	}
+
+	const auto trim = [](std::string_view text) {
+		const auto first = text.find_first_not_of(" \t\r");
+		const auto last  = text.find_last_not_of(" \t\r");
+		return first == std::string_view::npos ? std::string_view {}
+		                                       : text.substr(first, last - first + 1);
+	};
+	struct Section {
+		std::string content_id;
+		std::string status;
+		std::string mount_point;
+	};
+	std::vector<Section> sections;
+	std::string          line;
+	while (std::getline(stream, line)) {
+		const auto text = trim(line);
+		if (text.starts_with('[')) {
+			sections.emplace_back();
+			continue;
+		}
+		const auto eq = text.find('=');
+		if (eq == std::string_view::npos || sections.empty()) {
+			continue;
+		}
+		const auto key   = trim(text.substr(0, eq));
+		const auto value = std::string(trim(text.substr(eq + 1)));
+		if (key == "content_id") {
+			sections.back().content_id = value;
+		} else if (key == "download_status") {
+			sections.back().status = value;
+		} else if (key == "mount_point") {
+			sections.back().mount_point = value;
+		}
+	}
+
+	static const std::regex     label_pattern("^[A-Z0-9]{16}$");
+	constexpr std::string_view app0 = "/app0/";
+	for (const auto& section: sections) {
+		const auto dash  = section.content_id.rfind('-');
+		const auto label = dash == std::string::npos ? std::string {} : section.content_id.substr(dash + 1);
+		if (!std::regex_match(label, label_pattern)) {
+			continue;
+		}
+		AddContentEntry entry {section.content_id, label, {}, {}};
+		const std::string_view mount = section.mount_point;
+		if (EqualNoCase(section.status, "INSTALLED") && mount.starts_with(app0) &&
+		    mount.find("..") == std::string_view::npos) {
+			auto            dir = app0_dir / PathFromUtf8(mount.substr(app0.size()));
+			std::error_code ec;
+			if (std::filesystem::is_directory(dir, ec)) {
+				entry.mount_dir = std::move(dir);
+			}
+		}
+		entries.push_back(std::move(entry));
+	}
+	return entries;
+}
+
 std::optional<AddContentEntry> ParseAddContent(std::string_view value) {
 	static const std::regex label_pattern("^[A-Z0-9]{16}$");
 	const auto              eq    = value.find('=');

@@ -23,6 +23,10 @@ std::vector<AddContentEntry> FindAddContent(const std::filesystem::path& dir,
 // Parses a user add-on: "LABEL" without extra data, or "LABEL=DIR" with its data in DIR.
 std::optional<AddContentEntry> ParseAddContent(std::string_view value);
 
+// The add-ons a dumped game declares in <app0>/dlc_emu.ini: one section per add-on, with its
+// content_id, its download_status, and for an INSTALLED one its mount_point under /app0.
+std::vector<AddContentEntry> FindDeclaredAddContent(const std::filesystem::path& app0_dir);
+
 } // namespace Common
 
 #endif /* KYTY_COMMON_ADDITIONAL_CONTENT_H_ */

@@ -178,7 +178,10 @@ void Run(const RunOptions& options) {
 
 	MountSandboxDirs();
 
-	Loader::AddContentLoad(options.addcont_dir, options.addcont, title_id);
+	// Add-ons a dumped game declares in its folder come first; the user's own replace them.
+	auto addcont = Common::FindDeclaredAddContent(options.app0_dir);
+	addcont.insert(addcont.end(), options.addcont.begin(), options.addcont.end());
+	Loader::AddContentLoad(options.addcont_dir, addcont, title_id);
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 	Libs::InitAll(rt->Symbols());
 

@@ -98,9 +98,11 @@ int KYTY_SYSV_ABI PlayGoInitialize(const PlayGoInitParams* init) {
 	     "\t reserved = %" PRId32 "\n",
 	     reinterpret_cast<uint64_t>(init->buf_addr), init->buf_size, init->reserved);
 
-	if (Config::PlayGoHackEnabled() && !ensure_chunks_loaded()) {
+	// A console package always carries its PlayGo chunks. A dump without sce_sys/playgo-chunk.dat
+	// replaced PlayGo with its own library, which Kyty does not load: the game is fully installed.
+	if (!ensure_chunks_loaded()) {
 		g_chunks_num = PLAYGO_DEFAULT_CHUNKS_NUM;
-		LOGF("\t playgo_hack chunks = %" PRIu32 "\n", g_chunks_num);
+		LOGF("\t no PlayGo chunk file: %" PRIu32 " chunks, all installed\n", g_chunks_num);
 	}
 
 	return OK;
