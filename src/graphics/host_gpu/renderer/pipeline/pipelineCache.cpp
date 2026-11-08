@@ -22,6 +22,7 @@
 #include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/shaderCompiler.h"
+#include "gpu_blit_shaders/gpu_layered_quad_spv.h"
 #include "kernel/memory.h"
 #include "loader/systemContent.h"
 
@@ -774,7 +775,7 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	} else {
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
 	}
-	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
+	bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	if (!tess_active) {
 		// Mesh shaders read an indirect draw's parameters from a record per draw (P4).
 		vertex_info[0].indirect_offsets = state.indirect_offsets;
@@ -790,23 +791,40 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		                                                       target.info.channel_type)
 		                         .buffer_format != Prospero::BufferFormat::k32UInt);
 	}
-	if (mesh_active) {
-		// GameFlex: a GPU without mesh shaders (Turnip) drops these draws rather than stop the
-		// game. Objects go missing from the picture, and the overlay says so.
-		if (!m_graphics.mesh_shader_enabled) {
-			static std::atomic_uint64_t dropped = 0;
-			const auto                  count   = dropped.fetch_add(1, std::memory_order_relaxed);
-			if (count == 0) {
-				Log::WriteToConsoleAndLog(fmt::format(
-				    "Warning: this GPU has no mesh shaders, their draws are dropped and objects "
-				    "go missing (first: shader 0x{:016x}).\n",
-				    vertex_params[0].hash));
-				NotifyMeshDrawsDropped();
-			} else if ((count + 1) % 100000 == 0) {
-				Log::WriteToConsoleAndLog(fmt::format("Mesh draws dropped: {}\n", count + 1));
-			}
+	// GameFlex: a GPU without mesh shaders (Turnip) drops these draws rather than stop the game.
+	// Objects go missing from the picture, and the overlay says so.
+	const uint64_t mesh_hash = vertex_params[0].hash;
+	const auto drop_mesh_draw = [mesh_hash]() {
+		static std::atomic_uint64_t dropped = 0;
+		const auto                  count   = dropped.fetch_add(1, std::memory_order_relaxed);
+		if (count == 0) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Warning: this GPU has no mesh shaders, their draws are dropped and objects "
+			    "go missing (first: shader 0x{:016x}).\n",
+			    mesh_hash));
+			NotifyMeshDrawsDropped();
+		} else if ((count + 1) % 100000 == 0) {
+			Log::WriteToConsoleAndLog(fmt::format("Mesh draws dropped: {}\n", count + 1));
+		}
+	};
+	if (mesh_active && !m_graphics.mesh_shader_enabled) {
+		// All but a table a pixel shader computes slice by slice, whose every texel it needs: without
+		// its colour-grading table (one quad per slice of a cube), an Unreal game turns black. Its
+		// vertices do nothing but cover the target, so a built-in vertex stage can stand in for them.
+		const auto& target = context.GetRenderTarget(0);
+		const auto  slices = state.layered_quad_instances;
+		if (slices == 0 || !pixel_active || color_output_mask != 1u ||
+		    context.GetDepthControl().z_enable || target.attrib2.width + 1 != slices ||
+		    target.attrib2.height + 1 != slices ||
+		    target.view.last_array_slice_index + 1 < slices) {
+			drop_mesh_draw();
 			return;
 		}
+		state.layered_quad = true;
+		vertex_info[0]     = {};
+		mesh_active        = false;
+	}
+	if (mesh_active) {
 		auto& mesh              = vertex_info[0].mesh;
 		mesh.host_subgroup_size = m_graphics.subgroup_size;
 		const auto& limits      = m_graphics.mesh_shader_properties;
@@ -962,8 +980,29 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 			}
 		}
 		state.mrt_mask &= color_output_mask;
+		if (state.layered_quad) {
+			const auto& inputs = pixel_module->info.info.inputs;
+			if (pixel_info.input_num > 1u ||
+			    std::ranges::none_of(inputs, [](const auto& input) {
+				    return input.kind == ShaderRecompiler::IR::StageInputKind::Layer;
+			    })) {
+				state.layered_quad = false;
+				drop_mesh_draw();
+				return;
+			}
+		}
 	}
-	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
+	if (state.layered_quad) {
+		if (!m_layered_quad.module) {
+			m_layered_quad.id         = 0x6c61796572717561ull; // No guest program to hash.
+			m_layered_quad.module     = CompileSPV(GPU_LAYERED_QUAD_SPV, m_graphics.device);
+			m_layered_quad.info.stage = ShaderType::Vertex;
+			Log::WriteToConsoleAndLog(
+			    "This GPU has no mesh shaders: a volume's table drawn by a built-in vertex stage.\n");
+		}
+		vertex_info[0].stage = {&m_layered_quad, &m_layered_quad_resources};
+	}
+	for (uint32_t i = 0; !state.layered_quad && i < (tess_active ? 3u : 1u); i++) {
 		if (GetProgram(vertex_params[i], vertex_info[i], push_data_cursor) == nullptr) {
 			vertex_info[0].stage = {};
 			return;

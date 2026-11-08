@@ -851,6 +851,8 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	m_context.GetImageHeap().BeginDraw();
 	state.deferrable = draw.indexed && buffer.GetRegisters().GetDepthControl().z_enable &&
 	                   !Prospero::IsRectList(buffer.GetUserConfig().GetPrimType());
+	state.layered_quad_instances =
+	    !draw.indexed && draw.index_count == 4u && !state.indirect_draw ? draw.instance_count : 0u;
 	m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state);
 	// Vertex programs beyond the host mesh limits or with unsupported call targets are not
 	// compiled.

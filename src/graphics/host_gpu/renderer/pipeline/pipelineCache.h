@@ -147,6 +147,10 @@ struct DrawRenderState {
 	// Compiling aside, this draw may wait for its shaders: geometry in a depth pass. A pass that
 	// clears, filters or captures once may not, or its target stays garbage (Wukong turned pink).
 	bool                                 deferrable    = false;
+	// Input: a 4-vertex strip drawn this many times, which may be a quad per slice of a volume.
+	uint32_t                             layered_quad_instances = 0;
+	// A GPU without mesh shaders draws it with a built-in vertex stage (gpu_layered_quad.vert).
+	bool                                 layered_quad  = false;
 
 	[[nodiscard]] std::span<const ShaderVertexInputInfo> VertexStages() const {
 		return {vertex_info.data(), vertex_info[1].stage ? 3u : 1u};
@@ -270,6 +274,9 @@ private:
 		std::array<const ShaderModule*, 4> stages;
 		Pipeline                           pipeline;
 	};
+	// The built-in vertex stage of a layered quad, and its resources: none.
+	ShaderModule                          m_layered_quad;
+	ShaderRecompiler::IR::ResourceSnapshot m_layered_quad_resources;
 	bool                                  m_compile_aside = false;
 	bool                                  m_defer_translation = false;
 	std::chrono::steady_clock::time_point m_next_translation;
