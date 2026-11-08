@@ -464,8 +464,8 @@ static std::string UnrealProject(const std::string& command_line) {
 // GameFlex: the r.ScreenPercentage that gives the scene height KYTY_UE_RENDER_HEIGHT asks for, 0 if
 // none. The engine counts it from the game's output: 1080p for a game that declares it adapts to the
 // screen (FF7 Remake), 4K for the others (KH3), which keep it whatever screen they are told about.
-// Wukong's mode counts from 1080p although it outputs 4K.
-static unsigned long UnrealScreenPercentage(const std::string& project) {
+// A game that renders below its output says so in its own settings (KYTY_UE_RENDER_BASE: Wukong).
+static unsigned long UnrealScreenPercentage() {
 	static const char* requested = std::getenv("KYTY_UE_RENDER_HEIGHT");
 	if (requested == nullptr) {
 		return 0;
@@ -475,10 +475,24 @@ static unsigned long UnrealScreenPercentage(const std::string& project) {
 	if (end == requested || *end != '\0' || height < 144 || height > 2160) {
 		return 0;
 	}
-	int32_t attribute3 = 0;
-	Loader::SystemContentParamSfoGetInt("ATTRIBUTE3", &attribute3);
-	const unsigned long base = project == "b1" || (attribute3 & 4) != 0 ? 1080 : 2160;
+	unsigned long base = 0;
+	if (const char* declared = std::getenv("KYTY_UE_RENDER_BASE"); declared != nullptr) {
+		base = std::strtoul(declared, nullptr, 10);
+	}
+	if (base != 1080 && base != 2160) {
+		int32_t attribute3 = 0;
+		Loader::SystemContentParamSfoGetInt("ATTRIBUTE3", &attribute3);
+		base = (attribute3 & 4) != 0 ? 1080 : 2160;
+	}
 	return (height * 100 + base / 2) / base;
+}
+
+// GameFlex: the variable that carries that percentage. r.ScreenPercentage for most games; Tekken 8 sets it
+// itself and listens to r.SecondaryScreenPercentage.GameViewport (KYTY_UE_RENDER_VARIABLE).
+static std::string UnrealRenderVariable() {
+	const std::string secondary = "r.SecondaryScreenPercentage.GameViewport";
+	const char*       declared  = std::getenv("KYTY_UE_RENDER_VARIABLE");
+	return declared != nullptr && secondary == declared ? secondary : "r.ScreenPercentage";
 }
 
 // GameFlex: gc.EnableTimeoutOnPendingDestroyedObjectInShipping=0 in the saved config of an Unreal
@@ -513,13 +527,14 @@ static void UnrealSavedConfig(const std::string& guest_path, const std::filesyst
 	const auto        path     = directory / "engine.ini";
 	const std::string header   = "[SystemSettings]\n";
 	const std::string timeout  = "gc.EnableTimeoutOnPendingDestroyedObjectInShipping=";
-	const std::string size     = "r.ScreenPercentage=";
-	const std::string dynamic  = "r.DynamicRes.OperationMode=";
-	const auto        percent  = UnrealScreenPercentage(project);
+	const std::string size      = "r.ScreenPercentage=";
+	const std::string secondary = "r.SecondaryScreenPercentage.GameViewport=";
+	const std::string dynamic   = "r.DynamicRes.OperationMode=";
+	const auto        percent   = UnrealScreenPercentage();
 	const auto        existing = read_file(path);
 	auto              settings = timeout + "0\n";
 	if (percent != 0) {
-		settings += size + std::to_string(percent) + "\n" + dynamic + "0\n";
+		settings += UnrealRenderVariable() + "=" + std::to_string(percent) + "\n" + dynamic + "0\n";
 	}
 	// The folder outlives the session: what an earlier start wrote goes, the setting may have changed.
 	std::string content;
@@ -527,7 +542,8 @@ static void UnrealSavedConfig(const std::string& guest_path, const std::filesyst
 		const auto line_end = existing.find('\n', line_begin);
 		const auto next     = line_end == std::string::npos ? existing.size() : line_end + 1;
 		const std::string_view line(existing.data() + line_begin, next - line_begin);
-		if (!line.starts_with(timeout) && !line.starts_with(size) && !line.starts_with(dynamic)) {
+		if (!line.starts_with(timeout) && !line.starts_with(size) && !line.starts_with(secondary) &&
+		    !line.starts_with(dynamic)) {
 			content += line;
 		}
 		line_begin = next;
@@ -568,7 +584,7 @@ static std::filesystem::path UnrealCommandLine(const std::string&           gues
 		original.Read(content.data(), static_cast<uint32_t>(content.size()));
 		original.Close();
 	}
-	const auto value = UnrealScreenPercentage(UnrealProject(content));
+	const auto value = UnrealScreenPercentage();
 	if (value == 0) {
 		return {};
 	}
@@ -576,7 +592,7 @@ static std::filesystem::path UnrealCommandLine(const std::string&           gues
 	       (content.back() == '\n' || content.back() == '\r' || content.back() == '\0')) {
 		content.pop_back();
 	}
-	const auto option = "r.ScreenPercentage=" + std::to_string(value);
+	const auto option = UnrealRenderVariable() + "=" + std::to_string(value);
 	content += " -ini:Engine:[SystemSettings]:" + option + " -dpcvars=" + option;
 	const auto   copy_path = std::filesystem::temp_directory_path() /
 	                       ("kyty-" + Common::PathToString(real_name.filename()));
