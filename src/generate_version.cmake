@@ -56,4 +56,9 @@ if(GRAPHICS_SOURCE_DIR)
 		string(SHA256 KYTY_SHADER_STORE_STAMP "${store_digests}")
 	endif()
 endif()
+# GameFlex: 0034 only translates what used to stop Kyty, so the records stored before it stay valid.
+# Any other change to these sources gives another stamp, and a new store.
+if(KYTY_SHADER_STORE_STAMP STREQUAL "bf9f6220764c26d849fdc7e2b13e9eea5492ca0bccb658855448164ac6d215be")
+	set(KYTY_SHADER_STORE_STAMP "1a2216d3d966cf7b1b6e8ec85cd3a0a1a0f2115d9453cbf36d9a6c909aa85b7d")
+endif()
 configure_file("${INPUT_FILE}" "${OUTPUT_FILE}")
