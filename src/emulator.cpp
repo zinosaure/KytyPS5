@@ -26,7 +26,9 @@
 #include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
 
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <thread>
 
@@ -187,7 +189,24 @@ void Run(const RunOptions& options) {
 
 	LoadElf(options.elf);
 
-	Execute(options.game_patch);
+	// GameFlex: a game patch from GameFlex's patch of this game (KYTY_GAME_PATCH, a GoldHEN mods file on one line),
+	// when the command line gives none. It is applied as --game-patch is (gamePatch.cpp): it names the title and
+	// version it fits, and touches nothing else. Anything that is not JSON ("none") is ignored.
+	auto game_patch = options.game_patch;
+	if (const char* inline_patch = std::getenv("KYTY_GAME_PATCH");
+	    game_patch.empty() && inline_patch != nullptr && *inline_patch == '{') {
+		const auto path = std::filesystem::temp_directory_path() / "kyty-game-patch.json";
+		if (std::FILE* file = std::fopen(path.string().c_str(), "wb"); file != nullptr) {
+			const bool written = std::fputs(inline_patch, file) >= 0;
+			std::fclose(file);
+			if (written) {
+				game_patch = path;
+				std::printf("Game patch: from KYTY_GAME_PATCH (%zu bytes)\n", std::strlen(inline_patch));
+			}
+		}
+	}
+
+	Execute(game_patch);
 }
 
 } // namespace Emulator
