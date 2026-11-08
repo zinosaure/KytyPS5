@@ -174,9 +174,10 @@ private:
 // The owning renderer serializes access, including saves while the GPU is running.
 class PipelineCache {
 public:
-	// Without a shader store path nothing is kept across runs.
-	PipelineCache(GraphicContext& graphics, ShaderRecompiler::IR::ImageHeapSource* image_heap,
-	              const std::filesystem::path& shader_store = {});
+	PipelineCache(GraphicContext& graphics, ShaderRecompiler::IR::ImageHeapSource* image_heap);
+	// Without a shader store path nothing is kept across runs. Once the image heap exists: a
+	// pipeline that samples it needs its descriptor set layout (RenderContext).
+	void WarmUp(const std::filesystem::path& path);
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	void Save();
@@ -265,7 +266,6 @@ private:
 	void CheckpointDriverCache();
 
 	// pipelineSerialization.cpp
-	void WarmUp(const std::filesystem::path& path);
 	bool LoadRecord(std::span<const uint8_t>& records);
 	void StoreModule(const ProgramKey& key, const Program& program, const ShaderModule& module,
 	                 const std::vector<uint32_t>& spirv);

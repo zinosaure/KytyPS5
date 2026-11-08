@@ -464,13 +464,11 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 }
 
 PipelineCache::PipelineCache(GraphicContext&                         graphics,
-                             ShaderRecompiler::IR::ImageHeapSource* image_heap,
-                             const std::filesystem::path&           shader_store)
+                             ShaderRecompiler::IR::ImageHeapSource* image_heap)
     : m_graphics(graphics), m_image_heap(image_heap),
       m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
-	WarmUp(shader_store);
 }
 
 PipelineCache::~PipelineCache() {
