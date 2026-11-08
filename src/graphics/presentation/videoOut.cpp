@@ -25,6 +25,9 @@
 #include "libs/libs.h"
 #include "loader/systemContent.h"
 
+#include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -487,8 +490,35 @@ static int DeleteVideoOutEvent(int handle, EventQueue::KernelEqueue eq, VideoOut
 	return result == LibKernel::KERNEL_ERROR_ENOENT ? OK : result;
 }
 
+// GameFlex: a frame rate cap (KYTY_FRAME_RATE_CAP), as if the game had asked sceVideoOutSetFlipRate: an image is
+// shown at most every n vblanks. "auto", the default, follows the stream (STREAMEX_FPS on a server,
+// GAMEFLEX_STREAM_FPS on a phone): a game faster than a 30 fps stream hands its images in pairs a few
+// milliseconds apart, the stream catches one of each pair, and the motion jumps. A number caps at that many
+// images per second; 0 or a stream as fast as the vblank: no cap.
+static int FlipRateFloor() {
+	static const int floor = [] {
+		const char* setting = std::getenv("KYTY_FRAME_RATE_CAP");
+		std::string value   = setting != nullptr && *setting != '\0' ? setting : "auto";
+		if (value == "auto") {
+			const char* stream = std::getenv("STREAMEX_FPS");
+			if (stream == nullptr || *stream == '\0') {
+				stream = std::getenv("GAMEFLEX_STREAM_FPS");
+			}
+			value = stream != nullptr ? stream : "0";
+		}
+		const auto cap    = static_cast<uint32_t>(std::strtoul(value.c_str(), nullptr, 10));
+		const auto vblank = std::max<uint32_t>(Config::GetVblankFrequency(), 1);
+		const int  result =
+		    cap == 0 || cap >= vblank ? 0 : static_cast<int>(std::min<uint32_t>((vblank + cap / 2) / cap, 4)) - 1;
+		std::printf("Frame rate cap: %s\n",
+		            result == 0 ? "none" : fmt::format("{} images/s (one every {} vblanks)", vblank / (result + 1), result + 1).c_str());
+		return result;
+	}();
+	return floor;
+}
+
 static bool IsFlipDueLocked(const VideoOutConfig& cfg) {
-	const int interval = cfg.flip_rate + 1;
+	const int interval = std::max(cfg.flip_rate, FlipRateFloor()) + 1;
 
 	return interval <= 1 || (cfg.vblank_status.count % static_cast<uint64_t>(interval)) == 0;
 }
