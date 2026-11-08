@@ -2960,10 +2960,21 @@ private:
 			uint32_t component = 0;
 			const bool indexed = memory == nullptr;
 			if (indexed) {
-				if (handle.NumArgs() != 8u) return false;
+				// Image handles, and buffer handles that TryMakeIndirectBuffer keys per dispatch.
+				const bool buffer = handle.GetOpcode() == ValueOpcode::GetBufferResource;
+				if (handle.NumArgs() != 8u && !buffer) return false;
 				const auto* selected = UniformizedMaterialValue(descriptor.dwords[dword], handle);
-				if (selected == nullptr) return false;
-				const auto* extract = selected->Arg(1).Resolve().TryInstruction();
+				const Inst* lane = nullptr;
+				if (selected == nullptr && buffer) {
+					// The loaded DWORD itself, read by a lane that executed the load.
+					lane = descriptor.dwords[dword].Resolve().TryInstruction();
+					if (lane == nullptr || lane->GetOpcode() != ValueOpcode::ReadFirstLane ||
+					    lane->NumArgs() != 2u || !HasActiveLane(lane->Arg(1).Resolve(), lane->Parent()))
+						return false;
+				} else if (selected == nullptr) {
+					return false;
+				}
+				const auto* extract = (lane != nullptr ? lane->Arg(0) : selected->Arg(1)).Resolve().TryInstruction();
 				if (extract == nullptr || extract->GetOpcode() != ValueOpcode::CompositeExtractU32x4 ||
 				    !ImmediateU32(extract->Arg(1), component) || component >= 4u) return false;
 				read = extract->Arg(0).Resolve().TryInstruction();
@@ -2977,7 +2988,8 @@ private:
 				    memory->data_dwords != 4u ||
 				    !ImmediateU32(read->Arg(2), offset) || offset != 0u ||
 				    !ImmediateU32(read->Arg(3), scalar) || scalar != 0u ||
-				    !EquivalentValue(m_program, read->Arg(4), selected->Arg(0)) ||
+				    !(lane != nullptr ? Implies(lane->Arg(1), read->Arg(4))
+				                      : EquivalentValue(m_program, read->Arg(4), selected->Arg(0))) ||
 				    (dword != 0u && !EquivalentValue(m_program, table_guard, read->Arg(4)))) return false;
 				table_guard = read->Arg(4);
 			}
@@ -3470,7 +3482,7 @@ private:
 		if (!MatchDescriptorReads(handle, descriptor, plan, key, table_offset,
 		                          table_stride, table_immediate) ||
 		    !MakeRuntimeTableSource(*plan.reads[0], table_source) ||
-		    table_stride < 16u || (table_stride & 3u) != 0u) return false;
+		    (!plan.table_indexed && (table_stride < 16u || (table_stride & 3u) != 0u))) return false;
 		DescriptorSource::IndirectDescriptor indirect;
 		indirect.table_stride = table_stride;
 		indirect.table_offset = table_offset;
@@ -3499,6 +3511,25 @@ private:
 			plan.key = key;
 			return true;
 		};
+		if (plan.table_indexed) {
+			// A V# table read by MUBUF index: one candidate per workgroup, or the one a runtime
+			// value selects, read at the table's own stride when the dispatch is materialized.
+			if (!legacy_store || table_source.dword_count != 4u || table_offset != 0u ||
+			    (table_immediate & 3u) != 0u) return false;
+			const auto axis = WorkgroupAxis(key);
+			if (axis != UINT32_MAX) {
+				indirect.workgroup_axis = axis;
+			} else if (ValidateRuntimeValue(m_program, key, RuntimeValueType::Integer)) {
+				indirect.key_count = Value(1u);
+				indirect.selector_first = key;
+			} else {
+				return false;
+			}
+			indirect.table_stride = 0u;
+			indirect.table_immediate = table_immediate;
+			indirect.table_record_bytes = table_immediate + 16u;
+			return finish();
+		}
 		if (const auto* bound = BoundedLoop(key, handle.Parent()); bound != nullptr) {
 			indirect.key_count = bound->Arg(1);
 			indirect.signed_count = bound->GetOpcode() == ValueOpcode::SLessThan32;

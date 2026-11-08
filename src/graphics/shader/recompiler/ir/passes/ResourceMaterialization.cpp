@@ -577,6 +577,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 	uint64_t table_size = UINT64_MAX; // Scalar addresses have no buffer descriptor bounds.
 	DescriptorValue table_value;
 	ShaderBufferResource table;
+	uint32_t table_stride = indirect.table_stride;
 	const auto failed = [&](std::string_view reason, std::string_view details = {}) {
 		const auto* pointer = indirect.pointer_table ? &*indirect.pointer_table : nullptr;
 		return SpecializationFail(fmt::format(
@@ -778,10 +779,18 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			if (!EvaluateIndirectCount(program, indirect, runtime, key_count)) return false;
 			if (!indirect.selector_first.IsEmpty() && !WalkedValue(program, indirect.selector_first, first_key))
 				return false;
-			if (indirect.table_stride == 0u || key_count > MaxIndirectDescriptorProbes ||
+			if (indirect.table_stride == 0u && indirect.table_record_bytes != 0u) {
+				// A table read by MUBUF index steps by its own V#'s stride.
+				if (table.Type() != 0u || table.SwizzleEnabled() || table.AddTid() ||
+				    (table_base & 3u) != 0u || (table.Stride() & 3u) != 0u ||
+				    table.Stride() < indirect.table_record_bytes)
+					return failed("table geometry");
+				table_stride = table.Stride();
+			}
+			if (table_stride == 0u || key_count > MaxIndirectDescriptorProbes ||
 			    (indirect.selector_first.IsEmpty() && key_count != 0u &&
 			         uint64_t {indirect.table_offset} + indirect.table_immediate +
-			         uint64_t {key_count - 1u} * indirect.table_stride + descriptor_bytes >
+			         uint64_t {key_count - 1u} * table_stride + descriptor_bytes >
 			             UINT32_MAX + 1ull)) {
 				return false;
 			}
@@ -830,7 +839,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		candidate.dword_count = dword_count;
 		if (sources.empty()) {
 			table_offset = byte_keys ? key
-			    : uint64_t {(key * indirect.table_stride + indirect.table_offset) & ~3u} +
+			    : uint64_t {(key * table_stride + indirect.table_offset) & ~3u} +
 			          (indirect.table_immediate & ~3u);
 			if (!(byte_keys && key == UINT32_MAX) &&
 			    !ReadScalarTable(table_base, table_size, table_offset, runtime,
