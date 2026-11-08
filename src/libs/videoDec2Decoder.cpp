@@ -387,8 +387,9 @@ private:
 };
 
 bool HighBitDepthProfile(uint32_t codec_type, uint32_t profile) {
-	return (codec_type == CODEC_TYPE_VP9 && profile >= 2u) ||
-	       (codec_type == CODEC_TYPE_HEVC && profile == 2u);
+	// Not VP9: a game copies its frames by what MakeVp9PictureInfo says, and that is 8-bit NV12.
+	// P010 with those words turned Final Fantasy VII Remake's opening video pink and green.
+	return codec_type == CODEC_TYPE_HEVC && profile == 2u;
 }
 
 bool IsCodecSupported(uint32_t codec_type) {
