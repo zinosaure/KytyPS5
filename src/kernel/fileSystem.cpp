@@ -6,6 +6,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/gameflexStatus.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -484,7 +485,12 @@ static unsigned long UnrealScreenPercentage() {
 		Loader::SystemContentParamSfoGetInt("ATTRIBUTE3", &attribute3);
 		base = (attribute3 & 4) != 0 ? 1080 : 2160;
 	}
-	return (height * 100 + base / 2) / base;
+	const auto percent = (height * 100 + base / 2) / base;
+	// GameFlex: the scene that percentage gives, for the window title (16:9 from the base height).
+	const uint64_t scene_width  = (base * 16 / 9 * percent + 50) / 100;
+	const uint64_t scene_height = (base * percent + 50) / 100;
+	Common::GameFlex::g_unreal_scene_size.store(scene_width << 32 | scene_height, std::memory_order_relaxed);
+	return percent;
 }
 
 // GameFlex: the variable that carries that percentage. r.ScreenPercentage for most games; Tekken 8 sets it

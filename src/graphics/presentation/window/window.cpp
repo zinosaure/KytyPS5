@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/gameflexStatus.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -925,6 +926,15 @@ void WindowContext::UpdateTitle(uint64_t frame_num, double current_fps) {
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
 	    device_name, processor_name, frame_num, current_fps);
+	// GameFlex: the scene asked of an Unreal game and the image the game outputs, which GameFlex's
+	// performance panel reads here (sessionstatus.TitleResolution), as it reads the fps.
+	if (const auto scene = Common::GameFlex::g_unreal_scene_size.load(std::memory_order_relaxed);
+	    scene != 0) {
+		text += fmt::format(", render: {}x{}", scene >> 32, scene & 0xffffffffu);
+	}
+	if (const auto output = loop.output_size.load(std::memory_order_relaxed); output != 0) {
+		text += fmt::format(", output: {}x{}", output >> 32, output & 0xffffffffu);
+	}
 
 	SDL_SetWindowTitle(window, text.c_str());
 }

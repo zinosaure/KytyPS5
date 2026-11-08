@@ -27,6 +27,8 @@ struct WindowLoopState {
 	SDL_Event             event {};
 	bool                  need_exit = false;
 	std::atomic<uint64_t> presented_frames {0};
+	// GameFlex: the size of the game's last output image, width << 32 | height, for the title.
+	std::atomic<uint64_t> output_size {0};
 };
 
 struct WindowContext {
