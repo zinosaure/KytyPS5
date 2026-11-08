@@ -9,6 +9,7 @@
 
 namespace Libs::Graphics {
 
+class BufferCache;
 class CommandScheduler;
 struct GraphicContext;
 
@@ -55,6 +56,9 @@ public:
 			PublishDumps();
 		}
 	}
+	// Unified memory: has the GPU write the dumps' counters itself, in command order, without
+	// waiting for it; false when the dumps need Publish.
+	bool PublishOnGpu(BufferCache& buffers);
 
 private:
 	struct PendingDump {

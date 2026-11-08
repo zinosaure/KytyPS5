@@ -1,9 +1,11 @@
 #include "graphics/host_gpu/renderer/occlusionQueries.h"
 
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include <algorithm>
+#include <array>
 
 namespace Libs::Graphics {
 
@@ -50,6 +52,33 @@ void OcclusionQueries::Dump(uint64_t address) {
 		m_open--;
 	}
 	m_dumps.push_back({address, m_scheduler.CurrentTick(), m_begun, m_uncounted});
+}
+
+// A guest occlusion query is a begin dump, the draws it counts, an end dump. With one host query
+// between them and none older unread, the GPU writes the pair as the console's GPU does: every
+// counter ready at zero, then that query's samples in DB 0's end counter. The guest reads
+// end - begin, so the pair need not carry the running count.
+bool OcclusionQueries::PublishOnGpu(BufferCache& buffers) {
+	if (m_dumps.size() != 2u || !buffers.IsUnified()) {
+		return false;
+	}
+	const auto& begin = m_dumps[0];
+	const auto& end   = m_dumps[1];
+	if ((begin.address & 8u) != 0 || end.address != begin.address + 8u || begin.queries != m_read ||
+	    end.queries != begin.queries + 1u || end.uncounted != begin.uncounted) {
+		return false;
+	}
+	std::array<uint64_t, OCCLUSION_QUERY_DBS * 2> counters {};
+	counters.fill(OCCLUSION_QUERY_READY);
+	if (!buffers.WriteGuestMemory(begin.address, counters.data(), sizeof(counters))) {
+		return false;
+	}
+	const auto query = static_cast<uint32_t>(begin.queries % QUERY_COUNT);
+	EXIT_NOT_IMPLEMENTED(!buffers.WriteQueryResult(m_pool, query, end.address));
+	m_scheduler.Current().Handle().resetQueryPool(m_pool, query, 1);
+	m_read = end.queries;
+	m_dumps.clear();
+	return true;
 }
 
 void OcclusionQueries::PublishDumps() {
