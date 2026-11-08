@@ -536,6 +536,41 @@ static void UnrealSavedConfig(const std::string& guest_path, const std::filesyst
 	if (percent != 0) {
 		settings += UnrealRenderVariable() + "=" + std::to_string(percent) + "\n" + dynamic + "0\n";
 	}
+	// GameFlex: the engine settings a game's preset declares (KYTY_UE_ENGINE_SETTINGS, "a=1;b=2"). The
+	// engine may rewrite the file without comments, so the names written last time stay beside it:
+	// a setting taken out of the preset leaves the file at the next start.
+	const auto  names_path = directory / "gameflex-engine-settings.txt";
+	std::string names;
+	if (const char* declared = std::getenv("KYTY_UE_ENGINE_SETTINGS"); declared != nullptr) {
+		const std::string_view list(declared);
+		for (size_t begin = 0; begin < list.size();) {
+			const auto end = std::min(list.find(';', begin), list.size());
+			const auto one = list.substr(begin, end - begin);
+			if (const auto equal = one.find('='); equal != std::string_view::npos && equal != 0) {
+				settings += std::string(one) + "\n";
+				names += std::string(one.substr(0, equal + 1)) + "\n";
+			}
+			begin = end + 1;
+		}
+	}
+	const auto written_before = read_file(names_path);
+	const auto is_written_before = [&](std::string_view line) {
+		for (size_t begin = 0; begin < written_before.size();) {
+			const auto end = std::min(written_before.find('\n', begin), written_before.size());
+			if (end > begin && line.starts_with(std::string_view(written_before).substr(begin, end - begin))) {
+				return true;
+			}
+			begin = end + 1;
+		}
+		return false;
+	};
+	if (names != written_before) {
+		Common::File names_file;
+		if (names_file.Create(names_path)) {
+			names_file.Write(names.data(), static_cast<uint32_t>(names.size()));
+			names_file.Close();
+		}
+	}
 	// The folder outlives the session: what an earlier start wrote goes, the setting may have changed.
 	std::string content;
 	for (size_t line_begin = 0; line_begin < existing.size();) {
@@ -543,7 +578,7 @@ static void UnrealSavedConfig(const std::string& guest_path, const std::filesyst
 		const auto next     = line_end == std::string::npos ? existing.size() : line_end + 1;
 		const std::string_view line(existing.data() + line_begin, next - line_begin);
 		if (!line.starts_with(timeout) && !line.starts_with(size) && !line.starts_with(secondary) &&
-		    !line.starts_with(dynamic)) {
+		    !line.starts_with(dynamic) && !is_written_before(line)) {
 			content += line;
 		}
 		line_begin = next;
@@ -553,7 +588,8 @@ static void UnrealSavedConfig(const std::string& guest_path, const std::filesyst
 	} else {
 		content = header + settings + "\n" + content;
 	}
-	std::printf("Unreal saved config: garbage collection timeout off, render size %lu %% (%s)\n", percent,
+	std::printf("Unreal saved config: garbage collection timeout off, render size %lu %%, engine settings %zu (%s)\n",
+	            percent, static_cast<size_t>(std::count(names.begin(), names.end(), '\n')),
 	            Common::PathToString(path).c_str());
 	if (content == existing) {
 		g_mount_points->SetUnrealSavedConfig(project);
