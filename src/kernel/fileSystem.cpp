@@ -429,11 +429,23 @@ bool IsOpenDescriptor(int d) {
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
+// GameFlex: the render size KYTY_UE_SCREEN_PERCENTAGE asks for, 0 if none.
+static unsigned long UnrealScreenPercentage() {
+	static const char* percentage = std::getenv("KYTY_UE_SCREEN_PERCENTAGE");
+	if (percentage == nullptr) {
+		return 0;
+	}
+	char*      end   = nullptr;
+	const auto value = std::strtoul(percentage, &end, 10);
+	return end == percentage || *end != '\0' || value < 10 || value > 200 ? 0 : value;
+}
+
 // GameFlex: gc.EnableTimeoutOnPendingDestroyedObjectInShipping=0 in the saved config of an Unreal
 // game, the last layer the engine reads (/download0/<project>/saved/ps5/engine.ini; it keeps the
 // section when it rewrites the file). Wukong has no -ini: or -dpcvars= switch. The engine aborts
 // itself when a garbage collection has run over 10 s and objects still wait for the render thread;
 // here the render thread can spend longer than that on a level's new shaders: it is slow, not stuck.
+// r.ScreenPercentage goes there too, for the same reason: it is the only way into such a game.
 // Written when the game reads its command line, before it loads its config.
 static void UnrealSavedConfig(const std::string& guest_path, const std::filesystem::path& real_name) {
 	if (!guest_path.starts_with("/app0/") || !guest_path.ends_with("commandline.txt")) {
@@ -466,19 +478,42 @@ static void UnrealSavedConfig(const std::string& guest_path, const std::filesyst
 	std::error_code error;
 	std::filesystem::create_directories(directory, error);
 	const auto        path     = directory / "engine.ini";
-	const std::string option   = "gc.EnableTimeoutOnPendingDestroyedObjectInShipping=0";
+	const std::string header   = "[SystemSettings]\n";
+	const std::string timeout  = "gc.EnableTimeoutOnPendingDestroyedObjectInShipping=";
+	const std::string size     = "r.ScreenPercentage=";
+	const auto        percent  = UnrealScreenPercentage();
 	const auto        existing = read_file(path);
-	if (existing.find(option) != std::string::npos) {
+	auto              settings = timeout + "0\n";
+	if (percent != 0) {
+		settings += size + std::to_string(percent) + "\n";
+	}
+	// The folder outlives the session: what an earlier start wrote goes, the setting may have changed.
+	std::string content;
+	for (size_t line_begin = 0; line_begin < existing.size();) {
+		const auto line_end = existing.find('\n', line_begin);
+		const auto next     = line_end == std::string::npos ? existing.size() : line_end + 1;
+		const std::string_view line(existing.data() + line_begin, next - line_begin);
+		if (!line.starts_with(timeout) && !line.starts_with(size)) {
+			content += line;
+		}
+		line_begin = next;
+	}
+	if (const auto section = content.find(header); section != std::string::npos) {
+		content.insert(section + header.size(), settings);
+	} else {
+		content = header + settings + "\n" + content;
+	}
+	std::printf("Unreal saved config: garbage collection timeout off, render size %lu %% (%s)\n", percent,
+	            Common::PathToString(path).c_str());
+	if (content == existing) {
 		return;
 	}
-	const auto   content = "[SystemSettings]\n" + option + "\n\n" + existing;
 	Common::File file;
 	if (!file.Create(path)) {
 		return;
 	}
 	file.Write(content.data(), static_cast<uint32_t>(content.size()));
 	file.Close();
-	std::printf("Unreal garbage collection timeout: off (%s)\n", Common::PathToString(path).c_str());
 }
 
 // GameFlex: KYTY_UE_SCREEN_PERCENTAGE=<n> adds r.ScreenPercentage=<n> to the command line an Unreal
@@ -487,14 +522,8 @@ static void UnrealSavedConfig(const std::string& guest_path, const std::filesyst
 // not touched.
 static std::filesystem::path UnrealCommandLine(const std::string&           guest_path,
                                                const std::filesystem::path& real_name) {
-	static const char* percentage = std::getenv("KYTY_UE_SCREEN_PERCENTAGE");
-	if (percentage == nullptr || !guest_path.starts_with("/app0/") ||
-	    !guest_path.ends_with("commandline.txt")) {
-		return {};
-	}
-	char*      end   = nullptr;
-	const auto value = std::strtoul(percentage, &end, 10);
-	if (end == percentage || *end != '\0' || value < 10 || value > 200) {
+	const auto value = UnrealScreenPercentage();
+	if (value == 0 || !guest_path.starts_with("/app0/") || !guest_path.ends_with("commandline.txt")) {
 		return {};
 	}
 	std::string  content;
