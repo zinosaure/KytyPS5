@@ -96,6 +96,16 @@ public:
 	[[nodiscard]] bool HasPendingGpuWrites(uint64_t vaddr, uint64_t size);
 	// As FinishPendingGpuWrites, for the 4-byte reads of the SRT walker; true when it waited.
 	bool FinishPendingGpuWritesUnder(std::span<const uint64_t> addresses);
+	// A word of a table of resources inside a range the GPU may still write, read without waiting once its value
+	// came out of eight waits unchanged; the GPU's value is compared afterwards, a difference revokes it for good.
+	struct SrtSpeculation {
+		uint32_t confirmations = 0; // consecutive waits that changed nothing
+		bool     trusted       = false;
+		bool     revoked       = false; // once wrong, never trusted again
+		uint32_t used          = 0;     // the value read without waiting
+		uint64_t verify_tick   = 0;     // the GPU work it skipped waiting for; 0 when nothing is to verify
+	};
+	void VerifySrtSpeculations();
 	// Unified memory: whether the GPU wrote [vaddr, vaddr + size) since the last call for it. GPU
 	// writes leave no fault: a reader that keeps its own copy (the image heap) asks.
 	[[nodiscard]] bool TakeUnifiedGpuWrites(uint64_t vaddr, uint64_t size);
@@ -214,6 +224,7 @@ private:
 	vk::Fence                                         m_unified_bind_fence {};
 	// Ranges bound for writing, by start: (end, tick of the command buffer that may write them).
 	std::map<uint64_t, std::pair<uint64_t, uint64_t>> m_pending_gpu_writes;
+	std::unordered_map<uint64_t, SrtSpeculation>      m_srt_speculation;
 	// The longest of them: no range starting further before an address can reach it.
 	uint64_t                                          m_pending_gpu_writes_span = 0;
 	// Ranges bound for writing that no TakeUnifiedGpuWrites has taken yet, and all of them.

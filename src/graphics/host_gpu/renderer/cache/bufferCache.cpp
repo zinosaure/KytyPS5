@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <bit>
 #include <cinttypes>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <utility>
@@ -1079,12 +1080,50 @@ bool BufferCache::HasPendingGpuWrites(uint64_t vaddr, uint64_t size) {
 	return false;
 }
 
+// The recompiler reads a shader's tables of resources on the CPU when it records a draw or a dispatch. When a
+// word it reads lies in a range the GPU may still write, the only safe value is the GPU's: submit everything and
+// wait for it (Finish), which leaves the GPU dry while the thread records what follows. Games keep small counters
+// there that a compute pass rewrites every frame to the same value (Astro Bot: two 32-byte counters, 40 waits an
+// image, unchanged 5 196 times out of 5 218): once a word came out of eight waits unchanged, the read takes the
+// value in memory without waiting, and the GPU's value is checked once its work is done. A difference revokes the
+// word for good and says so on the console.
+namespace {
+constexpr uint32_t kSpeculationConfirmations = 8;
+constexpr uint64_t kSpeculationRangeBytes    = 256; // a counter, not a table the GPU fills
+} // namespace
+
+void BufferCache::VerifySrtSpeculations() {
+	const auto done = m_scheduler.GetMasterSemaphore().KnownGpuTick();
+	for (auto& [address, speculation]: m_srt_speculation) {
+		if (speculation.verify_tick == 0 || speculation.verify_tick > done) {
+			continue;
+		}
+		speculation.verify_tick = 0;
+		uint32_t landed = 0;
+		if (!LibKernel::Memory::TryReadBacking(address, &landed, sizeof(landed)) ||
+		    landed == speculation.used) {
+			continue;
+		}
+		speculation.trusted = false;
+		speculation.revoked = true;
+		static uint32_t misses = 0;
+		if (misses++ < 50) {
+			std::printf("SRT speculation: the GPU wrote 0x%08x at 0x%016" PRIx64 " after 0x%08x was used; "
+			            "this word waits again from now on\n",
+			            landed, address, speculation.used);
+		}
+	}
+}
+
 bool BufferCache::FinishPendingGpuWritesUnder(std::span<const uint64_t> addresses) {
 	if (m_pending_gpu_writes.empty()) {
 		return false;
 	}
 	const auto done = m_scheduler.GetMasterSemaphore().KnownGpuTick();
 	std::erase_if(m_pending_gpu_writes, [done](const auto& entry) { return entry.second.second <= done; });
+	if (!m_srt_speculation.empty()) {
+		VerifySrtSpeculations();
+	}
 	if (m_pending_gpu_writes.empty()) {
 		m_pending_gpu_writes_span = 0;
 		return false;
@@ -1093,12 +1132,36 @@ bool BufferCache::FinishPendingGpuWritesUnder(std::span<const uint64_t> addresse
 		const auto from = address > m_pending_gpu_writes_span ? address - m_pending_gpu_writes_span : 0;
 		const auto last = m_pending_gpu_writes.upper_bound(address + sizeof(uint32_t) - 1);
 		for (auto it = m_pending_gpu_writes.lower_bound(from); it != last; ++it) {
-			if (it->second.first > address) {
-				m_scheduler.Finish();
-				m_pending_gpu_writes.clear();
-				m_pending_gpu_writes_span = 0;
-				return true;
+			if (it->second.first <= address) {
+				continue;
 			}
+			auto& speculation = m_srt_speculation[address];
+			if (speculation.trusted) {
+				uint32_t used = 0;
+				if (LibKernel::Memory::TryReadBacking(address, &used, sizeof(used))) {
+					if (speculation.verify_tick == 0) {
+						speculation.used = used;
+					}
+					speculation.verify_tick = std::max(speculation.verify_tick, it->second.second);
+					break;
+				}
+			}
+			uint32_t before = 0;
+			LibKernel::Memory::TryReadBacking(address, &before, sizeof(before));
+			const auto range_size = it->second.first - it->first;
+			m_scheduler.Finish();
+			m_pending_gpu_writes.clear();
+			m_pending_gpu_writes_span = 0;
+			if (!speculation.revoked && range_size <= kSpeculationRangeBytes) {
+				uint32_t after = 0;
+				LibKernel::Memory::TryReadBacking(address, &after, sizeof(after));
+				if (after != before) {
+					speculation.confirmations = 0;
+				} else if (++speculation.confirmations >= kSpeculationConfirmations) {
+					speculation.trusted = true;
+				}
+			}
+			return true;
 		}
 	}
 	return false;
