@@ -721,14 +721,7 @@ uint64_t BufferCache::GpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	m_gpu_modified_ranges.ForEachInRange(vaddr, size,
 	                                     [&](uint64_t begin, uint64_t end) { bytes += end - begin; });
 	if (HasPendingGpuWrites(vaddr, size)) {
-		for (const auto& [start, entry]: m_pending_gpu_writes) {
-			if (start >= vaddr + size) {
-				break;
-			}
-			if (entry.first > vaddr) {
-				bytes += std::min(entry.first, vaddr + size) - std::max(start, vaddr);
-			}
-		}
+		bytes += m_pending_gpu_writes.Bytes(vaddr, size);
 	}
 	return std::min(bytes, size);
 }
@@ -1047,10 +1040,7 @@ bool BufferCache::PendingGuestWrite(uint64_t vaddr, uint64_t size, uint64_t* val
 }
 
 void BufferCache::RecordUnifiedGpuWrite(uint64_t vaddr, uint64_t size) {
-	auto& pending  = m_pending_gpu_writes[vaddr];
-	pending.first  = std::max(pending.first, vaddr + size);
-	pending.second = m_scheduler.CurrentTick();
-	m_pending_gpu_writes_span = std::max(m_pending_gpu_writes_span, pending.first - vaddr);
+	m_pending_gpu_writes.Add(vaddr, size, m_scheduler.CurrentTick());
 	m_unified_gpu_writes.Add(vaddr, size);
 	m_unified_gpu_written.Add(vaddr, size);
 }
@@ -1058,26 +1048,16 @@ void BufferCache::RecordUnifiedGpuWrite(uint64_t vaddr, uint64_t size) {
 void BufferCache::FinishPendingGpuWrites(uint64_t vaddr, uint64_t size) {
 	if (HasPendingGpuWrites(vaddr, size)) {
 		m_scheduler.Finish();
-		m_pending_gpu_writes.clear();
-		m_pending_gpu_writes_span = 0;
+		m_pending_gpu_writes.Clear();
 	}
 }
 
 bool BufferCache::HasPendingGpuWrites(uint64_t vaddr, uint64_t size) {
-	if (m_pending_gpu_writes.empty() || size == 0) {
+	if (m_pending_gpu_writes.Empty() || size == 0) {
 		return false;
 	}
-	const auto done = m_scheduler.GetMasterSemaphore().KnownGpuTick();
-	std::erase_if(m_pending_gpu_writes, [done](const auto& entry) { return entry.second.second <= done; });
-	for (const auto& [start, entry]: m_pending_gpu_writes) {
-		if (start >= vaddr + size) {
-			break;
-		}
-		if (entry.first > vaddr) {
-			return true;
-		}
-	}
-	return false;
+	m_pending_gpu_writes.Expire(m_scheduler.GetMasterSemaphore().KnownGpuTick());
+	return m_pending_gpu_writes.Intersects(vaddr, size);
 }
 
 // The recompiler reads a shader's tables of resources on the CPU when it records a draw or a dispatch. When a
@@ -1116,53 +1096,47 @@ void BufferCache::VerifySrtSpeculations() {
 }
 
 bool BufferCache::FinishPendingGpuWritesUnder(std::span<const uint64_t> addresses) {
-	if (m_pending_gpu_writes.empty()) {
+	if (m_pending_gpu_writes.Empty()) {
 		return false;
 	}
-	const auto done = m_scheduler.GetMasterSemaphore().KnownGpuTick();
-	std::erase_if(m_pending_gpu_writes, [done](const auto& entry) { return entry.second.second <= done; });
+	m_pending_gpu_writes.Expire(m_scheduler.GetMasterSemaphore().KnownGpuTick());
 	if (!m_srt_speculation.empty()) {
 		VerifySrtSpeculations();
 	}
-	if (m_pending_gpu_writes.empty()) {
-		m_pending_gpu_writes_span = 0;
+	if (m_pending_gpu_writes.Empty()) {
 		return false;
 	}
 	for (const auto address: addresses) {
-		const auto from = address > m_pending_gpu_writes_span ? address - m_pending_gpu_writes_span : 0;
-		const auto last = m_pending_gpu_writes.upper_bound(address + sizeof(uint32_t) - 1);
-		for (auto it = m_pending_gpu_writes.lower_bound(from); it != last; ++it) {
-			if (it->second.first <= address) {
+		const auto* range = m_pending_gpu_writes.Find(address);
+		if (range == nullptr) {
+			continue;
+		}
+		auto& speculation = m_srt_speculation[address];
+		if (speculation.trusted) {
+			uint32_t used = 0;
+			if (LibKernel::Memory::TryReadBacking(address, &used, sizeof(used))) {
+				if (speculation.verify_tick == 0) {
+					speculation.used = used;
+				}
+				speculation.verify_tick = std::max(speculation.verify_tick, range->tick);
 				continue;
 			}
-			auto& speculation = m_srt_speculation[address];
-			if (speculation.trusted) {
-				uint32_t used = 0;
-				if (LibKernel::Memory::TryReadBacking(address, &used, sizeof(used))) {
-					if (speculation.verify_tick == 0) {
-						speculation.used = used;
-					}
-					speculation.verify_tick = std::max(speculation.verify_tick, it->second.second);
-					break;
-				}
-			}
-			uint32_t before = 0;
-			LibKernel::Memory::TryReadBacking(address, &before, sizeof(before));
-			const auto range_size = it->second.first - it->first;
-			m_scheduler.Finish();
-			m_pending_gpu_writes.clear();
-			m_pending_gpu_writes_span = 0;
-			if (!speculation.revoked && range_size <= kSpeculationRangeBytes) {
-				uint32_t after = 0;
-				LibKernel::Memory::TryReadBacking(address, &after, sizeof(after));
-				if (after != before) {
-					speculation.confirmations = 0;
-				} else if (++speculation.confirmations >= kSpeculationConfirmations) {
-					speculation.trusted = true;
-				}
-			}
-			return true;
 		}
+		uint32_t before = 0;
+		LibKernel::Memory::TryReadBacking(address, &before, sizeof(before));
+		const auto range_size = range->end - range->start;
+		m_scheduler.Finish();
+		m_pending_gpu_writes.Clear();
+		if (!speculation.revoked && range_size <= kSpeculationRangeBytes) {
+			uint32_t after = 0;
+			LibKernel::Memory::TryReadBacking(address, &after, sizeof(after));
+			if (after != before) {
+				speculation.confirmations = 0;
+			} else if (++speculation.confirmations >= kSpeculationConfirmations) {
+				speculation.trusted = true;
+			}
+		}
+		return true;
 	}
 	return false;
 }

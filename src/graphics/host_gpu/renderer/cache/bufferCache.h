@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
+#include "graphics/host_gpu/renderer/cache/pendingGpuWrites.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <array>
@@ -222,11 +223,9 @@ private:
 	// The guest views bound in the windows: address -> (size, offset in the dma-buf).
 	std::map<uint64_t, std::pair<uint64_t, uint64_t>> m_unified_views;
 	vk::Fence                                         m_unified_bind_fence {};
-	// Ranges bound for writing, by start: (end, tick of the command buffer that may write them).
-	std::map<uint64_t, std::pair<uint64_t, uint64_t>> m_pending_gpu_writes;
+	// The ranges bound for writing in command buffers the GPU has not finished.
+	PendingGpuWrites                                  m_pending_gpu_writes;
 	std::unordered_map<uint64_t, SrtSpeculation>      m_srt_speculation;
-	// The longest of them: no range starting further before an address can reach it.
-	uint64_t                                          m_pending_gpu_writes_span = 0;
 	// Ranges bound for writing that no TakeUnifiedGpuWrites has taken yet, and all of them.
 	RangeSet                                          m_unified_gpu_writes;
 	RangeSet                                          m_unified_gpu_written;
