@@ -1351,6 +1351,24 @@ static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t 
 	if (!AprShared::IsValidGuestRange(destination, size, true)) {
 		return LibKernel::KERNEL_ERROR_EFAULT;
 	}
+	// The console's DMA engine faults on an unmapped page; a host memcpy would crash Kyty.
+	for (uint64_t at = destination; at < destination + size;) {
+		void* start = nullptr;
+		void* end   = nullptr;
+		int   prot  = 0;
+		if (LibKernel::Memory::KernelQueryMemoryProtection(reinterpret_cast<void*>(at), &start, &end,
+		                                                   &prot) != OK ||
+		    prot == 0 || reinterpret_cast<uint64_t>(end) <= at) {
+			static std::atomic<uint32_t> s_logged {0};
+			if (s_logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+				LOGF("\tAPR read into unmapped memory: %s offset=0x%016" PRIx64 " destination=0x%016" PRIx64
+				     " size=0x%016" PRIx64 " unmapped=0x%016" PRIx64 "\n",
+				     Common::PathToString(host_path.filename()).c_str(), file_offset, destination, size, at);
+			}
+			return LibKernel::KERNEL_ERROR_EFAULT;
+		}
+		at = reinterpret_cast<uint64_t>(end);
+	}
 
 	Common::File file;
 	if (!file.Open(host_path, Common::File::Mode::Read)) {
