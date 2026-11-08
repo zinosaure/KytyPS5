@@ -348,16 +348,21 @@ static void audioout2_update_context_locked(AudioOut2ContextState* state) {
 		return;
 	}
 
-	const auto now = audioout2_clock();
-	if (state->last_update == 0 || state->queued == 0) {
+	const auto now   = audioout2_clock();
+	const auto grain = uint64_t {state->num_grains} * 125;
+	// GameFlex: a game pushing without pause keeps what its output clock is late by. Restarting
+	// the clock whenever the queue empties added each late wake-up to the period of a blocking
+	// push (0031): a shade slower than real time, until SDL's queue ran dry and the sound cut
+	// (FF7 Remake). Only a pause of a few grains restarts it.
+	const auto restart_after = grain * 4;
+	if (state->last_update == 0 || (state->queued == 0 && now - state->last_update > restart_after)) {
 		state->last_update = now;
 		return;
 	}
-	if (now <= state->last_update) {
+	if (state->queued == 0 || now <= state->last_update) {
 		return;
 	}
 
-	const auto grain   = uint64_t {state->num_grains} * 125;
 	const auto drained = std::min<uint64_t>(state->queued, (now - state->last_update) / grain);
 	if (drained == 0) {
 		return;
@@ -365,9 +370,6 @@ static void audioout2_update_context_locked(AudioOut2ContextState* state) {
 
 	state->queued -= static_cast<uint32_t>(drained);
 	state->last_update += drained * grain;
-	if (state->queued == 0) {
-		state->last_update = now;
-	}
 }
 
 static AudioOut2PortStateEntry* audioout2_find_port_locked(AudioOut2PortHandle port) {
@@ -639,9 +641,6 @@ int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t bloc
 			audioout2_update_context_locked(state);
 			sleep_micros = audioout2_grain_micros(state->num_grains);
 			if (state->queued < state->queue_depth || use_device_clock) {
-				if (state->queued == 0) {
-					state->last_update = audioout2_clock();
-				}
 				if (state->queued < state->queue_depth) {
 					state->queued++;
 				}
