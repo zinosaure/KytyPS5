@@ -221,6 +221,10 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 	if (const char* occlusion = std::getenv("KYTY_OCCLUSION_QUERIES"); occlusion != nullptr) {
 		options.config.occlusion_queries_enabled = std::string_view(occlusion) != "0";
 	}
+	// KYTY_SHADER_CACHE=1 (0 to disable) sets --shader-cache the same way.
+	if (const char* shader_cache = std::getenv("KYTY_SHADER_CACHE"); shader_cache != nullptr) {
+		options.config.shader_cache_enabled = std::string_view(shader_cache) != "0";
+	}
 
 	for (int i = 1; i < argc; i++) {
 		std::string arg = std::string(argv[i]);

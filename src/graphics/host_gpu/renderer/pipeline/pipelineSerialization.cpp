@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
+#include "kytyGitVersion.h"
 
 #include <algorithm>
 #include <chrono>
@@ -67,8 +68,11 @@ std::vector<uint8_t> StoreHeader(const GraphicContext& graphics) {
 	if (stamp == 0) {
 		return {};
 	}
+	// The Kyty revision as well: under Box64, /proc/self/exe is Box64 itself, whose date stays the
+	// same when Kyty changes - a store written by another Kyty would pass for this one's.
+	const uint64_t revision = XXH3_64bits(KYTY_GIT_REVISION, sizeof(KYTY_GIT_REVISION) - 1);
 	Writer header;
-	IoAll(header, stamp, SpirvProfile(graphics),
+	IoAll(header, stamp, revision, SpirvProfile(graphics),
 	      graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize);
 	return std::move(header.bytes);
 }
