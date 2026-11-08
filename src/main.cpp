@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <charconv>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <string_view>
 #include <vector>
@@ -214,6 +215,12 @@ static constexpr Flag FLAGS[] = {
 
 static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_help) {
 	show_help = false;
+
+	// KYTY_OCCLUSION_QUERIES=1 (0 to disable) sets --occlusion-queries from the environment, for
+	// launchers that pass their settings as environment variables. The flag itself still works.
+	if (const char* occlusion = std::getenv("KYTY_OCCLUSION_QUERIES"); occlusion != nullptr) {
+		options.config.occlusion_queries_enabled = std::string_view(occlusion) != "0";
+	}
 
 	for (int i = 1; i < argc; i++) {
 		std::string arg = std::string(argv[i]);
