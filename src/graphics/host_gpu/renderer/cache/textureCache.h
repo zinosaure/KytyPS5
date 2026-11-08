@@ -54,8 +54,9 @@ public:
 	// description finds it again as long as the cache registers or frees nothing (Generation).
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false,
 	                                      bool* exclusive = nullptr);
-	// Grows whenever an image is registered or freed: what FindImage returns may change then, not before.
-	[[nodiscard]] uint64_t      Generation() const noexcept { return m_generation; }
+	// Grows whenever an image over a block of that memory is registered or freed: what FindImage returns for a
+	// description over it may change then, not before. A sum over 1 MiB blocks (hashed): equal sums, no change.
+	[[nodiscard]] uint64_t      RegionGeneration(uint64_t address, uint64_t size) const noexcept;
 	// An image FindImage found before, bound again: what FindImage does once it holds the image.
 	void                        TouchFoundImage(ImageId id, const ImageDesc& desc,
 	                                            uint32_t metadata_base_layer);
@@ -173,7 +174,11 @@ private:
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
-	uint64_t                                          m_generation = 0;
+	static constexpr uint32_t                         GenerationBlockBits = 20;
+	static constexpr uint32_t                         GenerationBlocks    = 1u << 16u;
+	std::vector<uint32_t>                             m_block_generations =
+	    std::vector<uint32_t>(GenerationBlocks);
+	void                                              TouchGenerations(uint64_t address, uint64_t size) noexcept;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;

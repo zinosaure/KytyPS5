@@ -204,8 +204,8 @@ private:
 	// The texture bound for a descriptor, found once. ResolveTexture decodes the descriptor, computes the
 	// image's layout and searches the cache by pages at every binding of every draw (12 % of the command
 	// thread in Astro Bot), for bindings that repeat image after image: the same descriptor, for the same
-	// shader resource, binds the same image as long as the texture cache registered or freed nothing since
-	// (its generation), when that image was alone over its memory.
+	// shader resource, binds the same image as long as the texture cache registered or freed nothing over
+	// the memory it describes since (the region's generation), when that image was alone over its memory.
 	struct TextureBindingKey {
 		std::array<uint32_t, 8>                     dwords;
 		const ShaderRecompiler::IR::ImageResource* resource;

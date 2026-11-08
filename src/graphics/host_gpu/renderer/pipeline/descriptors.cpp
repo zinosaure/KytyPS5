@@ -502,12 +502,13 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	if (descriptor.IsNull()) {
 		return {.layout = vk::ImageLayout::eGeneral};
 	}
-	// Found before, for this descriptor and this shader resource, with nothing registered or freed since: the
-	// same image. Heap descriptors depend on what is mapped: they are resolved every time.
+	// Found before, for this descriptor and this shader resource, with nothing registered or freed over that
+	// memory since: the same image. Heap descriptors depend on what is mapped: they are resolved every time.
 	const TextureBindingKey key {value.dwords, &resource};
 	if (!resource.heap) {
 		if (const auto found = m_texture_bindings.find(key); found != m_texture_bindings.end()) {
-			if (found->second.generation == texture_cache.Generation()) {
+			const auto& data = found->second.desc.info.data;
+			if (found->second.generation == texture_cache.RegionGeneration(data.address, data.size)) {
 				const auto& cached = found->second;
 				texture_cache.TouchFoundImage(cached.found_id, cached.desc, cached.metadata_base_layer);
 				return {cached.image_id, nullptr, cached.desc};
@@ -669,7 +670,8 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 			m_texture_bindings.clear();
 		}
 		m_texture_bindings.insert_or_assign(
-		    key, CachedTextureBinding {found_id, id, desc, metadata_base_layer, texture_cache.Generation()});
+		    key, CachedTextureBinding {found_id, id, desc, metadata_base_layer,
+		                               texture_cache.RegionGeneration(desc.info.data.address, desc.info.data.size)});
 	}
 	return {id, nullptr, std::move(desc)};
 }

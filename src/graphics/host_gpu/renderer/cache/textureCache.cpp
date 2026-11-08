@@ -227,7 +227,23 @@ void TextureCache::RegisterImage(ImageId id) {
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	m_total_used_memory += image.AccountedSize();
-	m_generation++;
+	TouchGenerations(image.info.data.address, image.info.data.size);
+}
+
+void TextureCache::TouchGenerations(uint64_t address, uint64_t size) noexcept {
+	const uint64_t last = (address + size - 1) >> GenerationBlockBits;
+	for (uint64_t block = address >> GenerationBlockBits; block <= last; block++) {
+		m_block_generations[block & (GenerationBlocks - 1u)]++;
+	}
+}
+
+uint64_t TextureCache::RegionGeneration(uint64_t address, uint64_t size) const noexcept {
+	uint64_t       sum  = 0;
+	const uint64_t last = (address + size - 1) >> GenerationBlockBits;
+	for (uint64_t block = address >> GenerationBlockBits; block <= last; block++) {
+		sum += m_block_generations[block & (GenerationBlocks - 1u)];
+	}
+	return sum;
 }
 
 void TextureCache::UnregisterImage(ImageId id) {
@@ -243,7 +259,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 	m_lru_cache.Free(image.lru_id);
 	m_total_used_memory -= image.AccountedSize();
 	image.registered = false;
-	m_generation++;
+	TouchGenerations(image.info.data.address, image.info.data.size);
 }
 
 void TextureCache::DeleteImage(ImageId id) {
