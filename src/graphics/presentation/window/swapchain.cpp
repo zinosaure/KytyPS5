@@ -32,6 +32,8 @@ namespace Libs::Graphics {
 
 struct Presenter::Frame {
 	VulkanImage   image;
+	// GameFlex: the sRGB image a linear video-out buffer is encoded through (EncodeFrom).
+	VulkanImage   encoded;
 	vk::ImageView view         = nullptr;
 	uint64_t      present_tick = 0;
 	bool          busy         = false;
@@ -41,6 +43,7 @@ struct Presenter::Frame {
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
 	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
 	void CopyFrom(CommandBuffer& command, Image& source);
+	void EncodeFrom(CommandBuffer& command, GraphicContext& graphics, Image& source);
 	void Clear(CommandBuffer& command, const vk::ClearColorValue& color);
 };
 
@@ -54,6 +57,9 @@ public:
 			m_window.graphic_ctx.device.destroyImageView(frame->view, nullptr);
 			if (frame->image.image != nullptr) {
 				m_window.graphic_ctx.DeleteImage(frame->image);
+			}
+			if (frame->encoded.image != nullptr) {
+				m_window.graphic_ctx.DeleteImage(frame->encoded);
 			}
 		}
 	}
@@ -218,6 +224,78 @@ void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
 	                       std::min(source.backing.extent.height, image.extent.height), 1};
 	EXIT_IF(copy.srcSubresource.layerCount != copy.dstSubresource.layerCount);
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, image.image,
+	                  vk::ImageLayout::eTransferDstOptimal, copy);
+}
+
+// GameFlex: a float video-out buffer holds linear light, which the console's video output encodes
+// for the display. Without HDR, the frame gets it sRGB-encoded instead of raw: a blit into an sRGB
+// image applies the transfer function, and its bits are copied unchanged into the 8-bit UNORM frame,
+// which then reaches the window like an 8-bit sRGB buffer (Final Fantasy VII Remake).
+void Presenter::Frame::EncodeFrom(CommandBuffer& command_buffer, GraphicContext& graphics,
+                                  Image& source) {
+	command_buffer.EndRendering();
+	auto command = command_buffer.Handle();
+	if (encoded.image == nullptr || encoded.extent.width != image.extent.width ||
+	    encoded.extent.height != image.extent.height) {
+		if (encoded.image != nullptr) {
+			graphics.DeleteImage(encoded);
+		}
+		vk::ImageCreateInfo create {};
+		create.sType         = vk::StructureType::eImageCreateInfo;
+		create.imageType     = vk::ImageType::e2D;
+		create.extent        = {image.extent.width, image.extent.height, 1};
+		create.mipLevels     = 1;
+		create.arrayLayers   = 1;
+		create.format        = vk::Format::eR8G8B8A8Srgb;
+		create.tiling        = vk::ImageTiling::eOptimal;
+		create.initialLayout = vk::ImageLayout::eUndefined;
+		create.usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
+		create.sharingMode = vk::SharingMode::eExclusive;
+		create.samples     = vk::SampleCountFlagBits::e1;
+		if (!graphics.CreateImage(create, encoded)) {
+			EXIT("failed to allocate the sRGB presentation image, extent=%ux%u\n",
+			     image.extent.width, image.extent.height);
+		}
+	}
+	const auto barrier = [&](vk::ImageLayout from, vk::ImageLayout to, vk::AccessFlags2 before,
+	                         vk::AccessFlags2 after) {
+		vk::ImageMemoryBarrier2 encoded_barrier {};
+		encoded_barrier.srcStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+		encoded_barrier.srcAccessMask       = before;
+		encoded_barrier.dstStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+		encoded_barrier.dstAccessMask       = after;
+		encoded_barrier.oldLayout           = from;
+		encoded_barrier.newLayout           = to;
+		encoded_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		encoded_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		encoded_barrier.image               = encoded.image;
+		encoded_barrier.subresourceRange    = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		vk::DependencyInfo dependency {};
+		dependency.imageMemoryBarrierCount = 1;
+		dependency.pImageMemoryBarriers    = &encoded_barrier;
+		command.pipelineBarrier2(dependency);
+	};
+	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
+	               command);
+	barrier(vk::ImageLayout::eUndefined, vk::ImageLayout::eTransferDstOptimal,
+	        vk::AccessFlagBits2::eTransferRead, vk::AccessFlagBits2::eTransferWrite);
+	const int   width  = static_cast<int>(std::min(source.backing.extent.width, image.extent.width));
+	const int   height = static_cast<int>(std::min(source.backing.extent.height, image.extent.height));
+	vk::ImageBlit region {};
+	region.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	region.srcOffsets[1]  = vk::Offset3D {width, height, 1};
+	region.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	region.dstOffsets[1]  = vk::Offset3D {width, height, 1};
+	command.blitImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, encoded.image,
+	                  vk::ImageLayout::eTransferDstOptimal, 1, &region, vk::Filter::eNearest);
+	barrier(vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eTransferSrcOptimal,
+	        vk::AccessFlagBits2::eTransferWrite, vk::AccessFlagBits2::eTransferRead);
+	Transit(command, vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite);
+	vk::ImageCopy copy {};
+	copy.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.extent         = {static_cast<uint32_t>(width), static_cast<uint32_t>(height), 1};
+	command.copyImage(encoded.image, vk::ImageLayout::eTransferSrcOptimal, image.image,
 	                  vk::ImageLayout::eTransferDstOptimal, copy);
 }
 
@@ -941,6 +1019,11 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 		case vk::Format::eB8G8R8A8Srgb: frame_format = vk::Format::eB8G8R8A8Unorm; break;
 		default: break;
 	}
+	// GameFlex: a float buffer holds linear light; without HDR it is sRGB-encoded (EncodeFrom).
+	const bool encode = !hdr && !headset && frame_format == vk::Format::eR16G16B16A16Sfloat;
+	if (encode) {
+		frame_format = vk::Format::eR8G8B8A8Unorm;
+	}
 	auto* frame = m_impl->frames.Acquire({info.extent.width, info.extent.height}, frame_format);
 	frame->hdr   = hdr;
 	frame->blank = false;
@@ -951,7 +1034,11 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	}
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
-	frame->CopyFrom(buffer, image);
+	if (encode) {
+		frame->EncodeFrom(buffer, m_impl->window.graphic_ctx, image);
+	} else {
+		frame->CopyFrom(buffer, image);
+	}
 	if (headset) {
 		// The frame holds the raw display-encoded pixels the headset needs.
 		frame->Transit(buffer.Handle(), vk::ImageLayout::eTransferSrcOptimal,
