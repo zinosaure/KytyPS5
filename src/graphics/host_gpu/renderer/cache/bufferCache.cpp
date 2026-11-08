@@ -1145,6 +1145,22 @@ bool BufferCache::WriteGuestMemory(uint64_t vaddr, const void* data, uint64_t si
 	auto&      buffer = m_slot_buffers[id];
 	const auto offset = buffer.Offset(vaddr);
 	auto&      command = m_scheduler.Current();
+	// A label is the console's end-of-pipe write: written once everything recorded before is done, without
+	// stopping what follows. The buffer marker is that write; the low word first, so a reader waiting for a
+	// growing value never sees it early. Only the CPU and WAIT_REG_MEM read labels: nothing to release.
+	if (m_graphics.buffer_marker_enabled && (size == 4u || size == 8u)) {
+		uint32_t words[2] {};
+		std::memcpy(words, data, size);
+		for (uint32_t i = 0; i < size / 4u; i++) {
+			command.Handle().writeBufferMarker2AMD(vk::PipelineStageFlagBits2::eAllCommands, buffer.Handle(),
+			                                       offset + i * 4u, words[i]);
+		}
+		uint64_t value = 0;
+		std::memcpy(&value, data, size);
+		m_pending_guest_writes[vaddr] = {size, m_scheduler.CurrentTick(), value};
+		RecordUnifiedGpuWrite(vaddr, size);
+		return true;
+	}
 	command.EndRendering();
 	const auto native = command.Handle();
 	// Everything recorded before lands first, as the GPU's own end-of-pipe write would.

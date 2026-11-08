@@ -8,7 +8,6 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
-#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -34,6 +33,8 @@ void CommandBuffer::Begin() {
 
 void CommandBuffer::End() const {
 	EndRendering();
+	// What the run still owes is released here: a submission boundary orders nothing by itself.
+	m_context.GetGuestSync().Post(Handle());
 	auto buffer = Handle();
 
 	auto result = buffer.end();
@@ -93,10 +94,15 @@ void CommandBuffer::EndRendering() const {
 		Handle().endRendering();
 		m_rendering = false;
 	}
-	if (m_pending_shader_writes && !IsInvalid()) {
-		ShaderWriteBarrier(Handle(), m_pending_shader_writes);
-		m_pending_shader_writes = {};
+}
+
+void CommandBuffer::PostGuestBarrier() const {
+	auto& sync = m_context.GetGuestSync();
+	if (!sync.Due()) {
+		return;
 	}
+	EndRendering();
+	sync.Post(Handle());
 }
 
 } // namespace Libs::Graphics

@@ -1217,18 +1217,9 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
 		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
 	}
-	const auto guest_sync = g_guest_sync_epoch.load(std::memory_order_relaxed);
-	if (shader_write_stages) {
-		// As for dispatches, buffer writes wait for earlier accesses to the memory: once per run of
-		// memory-writing draws (GameFlex), which the console leaves unordered among themselves until the
-		// guest synchronizes.
-		if (!buffer.ContinuesShaderWriteRun(guest_sync)) {
-			buffer.EndRendering();
-			ShaderWriteHazardBarrier(vk_buffer, shader_write_stages);
-		}
-	} else if (buffer.HasPendingShaderWrites()) {
-		buffer.EndRendering();
-	}
+	// The barrier the game asked for since the last one, if any: a draw that writes memory in a run the game
+	// did not synchronize runs unordered with it, as on the console.
+	buffer.PostGuestBarrier();
 	buffer.BeginRendering(rendering);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
 	auto&         occlusion_queries = m_context.GetOcclusionQueries();
@@ -1268,7 +1259,8 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
 
 	if (shader_write_stages) {
-		buffer.DeferShaderWriteBarrier(shader_write_stages, guest_sync);
+		m_context.GetGuestSync().Wrote(GuestSync::Stages2(shader_write_stages),
+		                               vk::AccessFlagBits2::eShaderWrite);
 	}
 }
 

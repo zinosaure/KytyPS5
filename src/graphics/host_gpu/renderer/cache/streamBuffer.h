@@ -92,10 +92,6 @@ protected:
 	[[nodiscard]] CommandScheduler& Scheduler() const noexcept { return *m_scheduler; }
 
 private:
-	[[nodiscard]] vk::BufferMemoryBarrier Barrier(uint64_t offset, uint64_t size,
-	                                              vk::AccessFlags source,
-	                                              vk::AccessFlags destination) const;
-
 	GraphicContext*               m_graphics    = nullptr;
 	CommandScheduler*             m_scheduler   = nullptr;
 	MemoryUsage                   m_usage       = MemoryUsage::DeviceLocal;

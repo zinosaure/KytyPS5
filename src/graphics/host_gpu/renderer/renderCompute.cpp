@@ -376,11 +376,8 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	const auto vk_buffer = buffer.Handle();
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
-	if (HasStorageWrites(input_info, bindings)) {
-		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
-		// while allowing the queue to execute asynchronously.
-		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
-	}
+	// The barrier the game asked for since the last one, if any (GuestSync).
+	m_context.GetGuestSync().PostDue(vk_buffer);
 	if (Config::GraphicsDebugDumpEnabled()) {
 		const auto sampled_images = std::count_if(
 		    program.info.images.begin(), program.info.images.end(), [](const auto& image) {
@@ -467,8 +464,10 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 
-	// The removed host fence also ordered read-only dispatches before later writers.
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	if (HasStorageWrites(input_info, bindings)) {
+		m_context.GetGuestSync().Wrote(vk::PipelineStageFlagBits2::eComputeShader,
+		                               vk::AccessFlagBits2::eShaderWrite);
+	}
 	ResetBindings();
 }
 
@@ -517,21 +516,16 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	const auto vk_buffer = buffer.Handle();
-	if (HasStorageWrites(input_info, bindings)) {
-		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
-	}
-	vk::MemoryBarrier barrier {};
-	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
-	barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
-	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics |
-	                              vk::PipelineStageFlagBits::eComputeShader |
-	                              vk::PipelineStageFlagBits::eTransfer,
-	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
-	                          1, &barrier, 0, nullptr, 0, nullptr);
+	// The barrier the game asked for since the last one, if any (GuestSync): it makes the indirect arguments
+	// visible too, the game synchronizes before a dispatch whose arguments the GPU wrote.
+	m_context.GetGuestSync().PostDue(vk_buffer);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	if (HasStorageWrites(input_info, bindings)) {
+		m_context.GetGuestSync().Wrote(vk::PipelineStageFlagBits2::eComputeShader,
+		                               vk::AccessFlagBits2::eShaderWrite);
+	}
 	ResetBindings();
 }
 

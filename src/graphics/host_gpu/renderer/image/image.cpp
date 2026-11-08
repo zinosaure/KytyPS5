@@ -153,13 +153,9 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 				EXIT_IF(index >= subresource_states.size());
 				auto& subresource_state = subresource_states[index];
 
-				constexpr auto write_access = vk::AccessFlagBits2::eTransferWrite |
-				                              vk::AccessFlagBits2::eShaderWrite |
-				                              vk::AccessFlagBits2::eMemoryWrite;
-				const bool     repeated_write =
-				    static_cast<bool>(subresource_state.access_mask & write_access);
+				// Two writes in a row take no barrier: the game orders them when it needs to (GuestSync).
 				if (subresource_state.layout != destination_layout ||
-				    subresource_state.access_mask != destination_access || repeated_write) {
+				    subresource_state.access_mask != destination_access) {
 					vk::ImageMemoryBarrier2 barrier {};
 					barrier.srcStageMask                    = subresource_state.pl_stage;
 					barrier.srcAccessMask                   = subresource_state.access_mask;
@@ -185,12 +181,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 			subresource_states.clear();
 		}
 	} else {
-		constexpr auto write_access   = vk::AccessFlagBits2::eTransferWrite |
-		                                vk::AccessFlagBits2::eShaderWrite |
-		                                vk::AccessFlagBits2::eMemoryWrite;
-		const bool     repeated_write = static_cast<bool>(state.access_mask & write_access);
-		if (state.layout == destination_layout && state.access_mask == destination_access &&
-		    !repeated_write) {
+		if (state.layout == destination_layout && state.access_mask == destination_access) {
 			return {};
 		}
 

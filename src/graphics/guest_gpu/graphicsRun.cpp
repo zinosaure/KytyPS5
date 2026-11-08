@@ -1,4 +1,3 @@
-#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 
 #include "common/assert.h"
@@ -260,6 +259,10 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 		if (m_renderer.GetBufferCache().PendingGuestWrite(reinterpret_cast<uint64_t>(addr),
 		                                                  sizeof(T), &pending) &&
 		    TestWaitRegMemValue(static_cast<T>(pending), ref, mask, func)) {
+			// The label lands once everything before it is done: the CP waits for all of it, and so does the
+			// barrier the next command posts (GuestSync).
+			m_renderer.GetGuestSync().Wait(vk::PipelineStageFlagBits2::eAllCommands,
+			                               vk::AccessFlagBits2::eMemoryWrite);
 			return;
 		}
 		Common::GameFlex::NoteGpuWait("wait_reg_mem", reinterpret_cast<uint64_t>(addr), static_cast<uint64_t>(*addr),
@@ -1019,13 +1022,29 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 	}
 
 	const auto valid_cache_event_index = event_index == 0x00000000 || event_index == 0x00000007;
-	// GameFlex: partial flushes and cache writebacks order the GPU work on either side; the runs of
-	// memory-writing draws end there.
-	switch (event_type) {
-		case 0x07: case 0x0f: case 0x10: case 0x16: case 0x31: case 0x2a: case 0x2c: case 0x2e:
-			Libs::Graphics::g_guest_sync_epoch.fetch_add(1, std::memory_order_relaxed);
-			break;
-		default: break;
+	// The game waits for a stage of the GPU, or writes back its color and depth caches: the barrier the next
+	// command posts waits for those stages (GuestSync). CS_PARTIAL_FLUSH 0x07, VS_PARTIAL_FLUSH 0x0f,
+	// PS_PARTIAL_FLUSH 0x10, CACHE_FLUSH_AND_INV_EVENT 0x16, FLUSH_AND_INV_CB_PIXEL_DATA 0x31,
+	// DB_CACHE_FLUSH_AND_INV 0x2a, FLUSH_AND_INV_DB_META 0x2c, FLUSH_AND_INV_CB_META 0x2e.
+	{
+		auto&          sync  = m_renderer.GetGuestSync();
+		constexpr auto color = vk::PipelineStageFlagBits2::eColorAttachmentOutput;
+		constexpr auto depth =
+		    vk::PipelineStageFlagBits2::eEarlyFragmentTests | vk::PipelineStageFlagBits2::eLateFragmentTests;
+		switch (event_type) {
+			case 0x07: sync.Wait(vk::PipelineStageFlagBits2::eComputeShader); break;
+			case 0x0f: sync.Wait(vk::PipelineStageFlagBits2::ePreRasterizationShaders); break;
+			case 0x10: sync.Wait(vk::PipelineStageFlagBits2::eFragmentShader | color | depth); break;
+			case 0x16:
+				sync.Wait(color | depth, vk::AccessFlagBits2::eColorAttachmentWrite |
+				                             vk::AccessFlagBits2::eDepthStencilAttachmentWrite);
+				break;
+			case 0x31:
+			case 0x2e: sync.Wait(color, vk::AccessFlagBits2::eColorAttachmentWrite); break;
+			case 0x2a:
+			case 0x2c: sync.Wait(depth, vk::AccessFlagBits2::eDepthStencilAttachmentWrite); break;
+			default: break;
+		}
 	}
 	// Partial flushes and cache writebacks only order GPU work, which the renderer's resource
 	// barriers already order.

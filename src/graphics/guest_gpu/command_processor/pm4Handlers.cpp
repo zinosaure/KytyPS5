@@ -1,4 +1,3 @@
-#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -438,8 +437,9 @@ KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0055800 && cmd_id != 0xc0065800);
-	// GameFlex: the guest orders the GPU work on either side (render: the runs of memory-writing draws).
-	Libs::Graphics::g_guest_sync_epoch.fetch_add(1, std::memory_order_relaxed);
+	// The CP waits for the GPU to be idle and invalidates its caches: the barrier the next command posts waits
+	// for everything recorded before (GuestSync).
+	cp.GetGuestSync().Wait(vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryWrite);
 	return KYTY_PM4_LEN(cmd_id) - 1;
 }
 
@@ -695,6 +695,11 @@ KYTY_CP_OP_PARSER(CpOpDmaData) {
 	    ((control >> 29u) & 0x3u) | ((control2 >> 24u) & 0x4u) | ((control2 >> 25u) & 0x8u));
 
 	cp.DmaData(dst_sel, dst, src_sel, src, num_bytes);
+	// CP_SYNC (bit 31): the CP waits for the transfer before it goes on, what follows is ordered after it
+	// (GuestSync). Clair Obscur zeroes its counters so, then dispatches read them; the GPU hung without it.
+	if ((control & (1u << 31u)) != 0) {
+		cp.GetGuestSync().Wait(vk::PipelineStageFlagBits2::eAllTransfer, vk::AccessFlagBits2::eTransferWrite);
+	}
 
 	return 6;
 }

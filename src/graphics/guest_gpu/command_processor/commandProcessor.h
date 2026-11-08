@@ -64,6 +64,7 @@ public:
 
 	void            BufferInit();
 	void            BufferFlush();
+	GuestSync&      GetGuestSync() const { return m_renderer.GetGuestSync(); }
 	void            BufferWait();
 	HW::Context&    GetCtx() { return m_ctx; }
 	HW::UserConfig& GetUcfg() { return m_ucfg; }

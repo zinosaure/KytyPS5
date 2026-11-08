@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/cache/samplerCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/guestSync.h"
 #include "graphics/host_gpu/renderer/occlusionQueries.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/imageHeap.h"
@@ -52,6 +53,7 @@ public:
 	TextureCache&       GetTextureCache() { return m_texture_cache; }
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
 	OcclusionQueries&   GetOcclusionQueries() { return m_occlusion_queries; }
+	GuestSync&          GetGuestSync() noexcept { return m_guest_sync; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
@@ -73,6 +75,7 @@ private:
 
 	GraphicContext&           m_graphics;
 	Common::Mutex             m_mutex;
+	GuestSync                 m_guest_sync;
 	RenderExecutor            m_render_executor;
 	CommandScheduler          m_command_scheduler;
 	DescriptorHeap            m_descriptor_heap;

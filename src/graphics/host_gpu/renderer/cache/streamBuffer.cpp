@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include "graphics/host_gpu/renderer/renderContext.h"
+
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/profiler.h"
@@ -16,9 +18,6 @@ namespace {
 
 constexpr size_t WATCHES_INITIAL_RESERVE = 0x4000;
 constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
-
-constexpr vk::AccessFlags MEMORY_ACCESS =
-    vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
 
 [[nodiscard]] VmaAllocationCreateFlags AllocationFlags(MemoryUsage usage) {
 	switch (usage) {
@@ -177,24 +176,6 @@ void Buffer::Invalidate(uint64_t offset, uint64_t size) {
 	}
 }
 
-vk::BufferMemoryBarrier Buffer::Barrier(uint64_t offset, uint64_t size, vk::AccessFlags source,
-                                        vk::AccessFlags destination) const {
-	if (Handle() == nullptr || size == 0 || offset > Size() || size > Size() - offset) {
-		EXIT("Buffer: invalid DMA barrier, handle=%p offset=0x%016" PRIx64 " size=0x%016" PRIx64
-		     " capacity=0x%016" PRIx64 "\n",
-		     static_cast<const void*>(Handle()), offset, size, Size());
-	}
-	vk::BufferMemoryBarrier barrier {};
-	barrier.srcAccessMask       = source;
-	barrier.dstAccessMask       = destination;
-	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	barrier.buffer              = Handle();
-	barrier.offset              = offset;
-	barrier.size                = size;
-	return barrier;
-}
-
 void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t source_offset,
                       uint64_t destination_offset, uint64_t size) {
 	if (size == 0 || source_offset > source.Size() || size > source.Size() - source_offset ||
@@ -206,24 +187,15 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 		EXIT("Buffer: overlapping self-copy\n");
 	}
 	command.EndRendering();
-	const vk::BufferMemoryBarrier before[] = {
-	    source.Barrier(source_offset, size, vk::AccessFlagBits::eMemoryWrite,
-	                   vk::AccessFlagBits::eTransferRead),
-	    Barrier(destination_offset, size, MEMORY_ACCESS, vk::AccessFlagBits::eTransferWrite),
-	};
 	const auto native = command.Handle();
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
-	                       0, nullptr, 2, before, 0, nullptr);
+	// A transfer runs unordered with the shaders of its run, as the console's does, until the game synchronizes;
+	// it follows the transfers of the run over the same bytes, as the DMA engine's queue does (GuestSync).
+	auto& sync = command.GetContext().GetGuestSync();
+	sync.BeforeTransfer(native, Handle(), destination_offset, size);
+	sync.BeforeTransfer(native, source.Handle(), source_offset, size);
 	const vk::BufferCopy copy {source_offset, destination_offset, size};
 	native.copyBuffer(source.Handle(), Handle(), 1, &copy);
-	const vk::BufferMemoryBarrier after[] = {
-	    source.Barrier(source_offset, size, vk::AccessFlagBits::eTransferRead, MEMORY_ACCESS),
-	    Barrier(destination_offset, size, vk::AccessFlagBits::eTransferWrite, MEMORY_ACCESS),
-	};
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-	                       vk::PipelineStageFlagBits::eAllCommands,
-	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, after, 0, nullptr);
+	sync.WroteTransfer(Handle(), destination_offset, size);
 }
 
 void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
@@ -232,16 +204,11 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 	}
 	auto& command = Scheduler().Current();
 	command.EndRendering();
-	const auto before = Barrier(offset, size, MEMORY_ACCESS, vk::AccessFlagBits::eTransferWrite);
 	const auto native = command.Handle();
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
-	                       0, nullptr, 1, &before, 0, nullptr);
+	auto& sync = Scheduler().Context().GetGuestSync();
+	sync.BeforeTransfer(native, Handle(), offset, size);
 	native.fillBuffer(Handle(), offset, size, value);
-	const auto after = Barrier(offset, size, vk::AccessFlagBits::eTransferWrite, MEMORY_ACCESS);
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-	                       vk::PipelineStageFlagBits::eAllCommands,
-	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
+	sync.WroteTransfer(Handle(), offset, size);
 }
 
 StreamBuffer::StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
