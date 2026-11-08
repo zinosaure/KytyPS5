@@ -4,6 +4,7 @@
 #include "libs/videoDec2Decoder.h"
 #include "loader/symbolDatabase.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -203,7 +204,7 @@ static void ApplyDecodedOutput(const Decoder::Output& decoded, Videodec2FrameBuf
 	output_info->frame_buffer_size = decoded.buffer_size;
 	if (output_info->this_size == sizeof(Videodec2OutputInfo)) {
 		output_info->frame_format         = VIDEODEC2_FRAME_FORMAT_DEFAULT;
-		output_info->frame_pitch_in_bytes = decoded.pitch;
+		output_info->frame_pitch_in_bytes = decoded.pitch_in_bytes;
 	}
 }
 
@@ -304,15 +305,24 @@ static int32_t KYTY_SYSV_ABI ReleaseComputeQueue(Videodec2ComputeQueue compute_q
 	return compute_queue != nullptr ? OK : VIDEODEC2_ERROR_COMPUTE_QUEUE_ID;
 }
 
-static size_t FrameBufferSize(const Videodec2DecoderConfigInfo& config) {
-	if (config.codec_type != VIDEODEC2_CODEC_TYPE_AVC || config.max_frame_width <= 0 ||
-	    config.max_frame_height <= 0) {
-		return VIDEODEC2_MIN_MEMORY_SIZE;
+// The largest frame this decoder hands out: rows aligned to 256 samples, the luma plane and the
+// interleaved chroma after it, two bytes per sample in a 10-bit profile (P010). Without a maximum
+// size in the configuration, the largest picture Videodec2 decodes (4096x2160).
+static size_t MaxFrameBufferSize(const Videodec2DecoderConfigInfo* config) {
+	const auto sample = Decoder::HighBitDepthProfile(config->codec_type, config->profile) ? 2u : 1u;
+	if (sample == 1u && config->codec_type == VIDEODEC2_CODEC_TYPE_AVC &&
+	    config->max_frame_width > 0 && config->max_frame_height > 0) {
+		// AVC output: 256-byte pitch, 16-line maximum height, and 4096 bytes of metadata.
+		const auto pitch  = (static_cast<size_t>(config->max_frame_width) + 255u) & ~size_t {255};
+		const auto height = (static_cast<size_t>(config->max_frame_height) + 15u) & ~size_t {15};
+		return pitch * height * 3 / 2 + 4096;
 	}
-	// AVC output: 256-byte pitch, 16-line maximum height, and 4096 bytes of metadata.
-	const auto pitch  = (static_cast<size_t>(config.max_frame_width) + 255u) & ~size_t {255};
-	const auto height = (static_cast<size_t>(config.max_frame_height) + 15u) & ~size_t {15};
-	return pitch * height * 3 / 2 + 4096;
+	const auto width =
+	    static_cast<size_t>(config->max_frame_width > 0 ? config->max_frame_width : 4096);
+	const auto height =
+	    static_cast<size_t>(config->max_frame_height > 0 ? config->max_frame_height : 2160);
+	const auto pitch  = ((width + 255u) & ~size_t {255}) * sample;
+	return std::max(VIDEODEC2_MIN_MEMORY_SIZE, pitch * (height + (height + 1u) / 2u));
 }
 
 static int32_t KYTY_SYSV_ABI QueryDecoderMemoryInfo(const Videodec2DecoderConfigInfo* config,
@@ -339,7 +349,7 @@ static int32_t KYTY_SYSV_ABI QueryDecoderMemoryInfo(const Videodec2DecoderConfig
 	memory_info->gpu_memory             = nullptr;
 	memory_info->cpu_gpu_memory_size    = VIDEODEC2_MIN_MEMORY_SIZE;
 	memory_info->cpu_gpu_memory         = nullptr;
-	memory_info->max_frame_buffer_size  = FrameBufferSize(*config);
+	memory_info->max_frame_buffer_size  = MaxFrameBufferSize(config);
 	memory_info->frame_buffer_alignment = 0x100;
 	memory_info->reserved0              = 0;
 
@@ -368,7 +378,7 @@ static int32_t KYTY_SYSV_ABI CreateDecoder(const Videodec2DecoderConfigInfo* con
 	if (memory_info->cpu_memory_size < VIDEODEC2_MIN_MEMORY_SIZE ||
 	    memory_info->gpu_memory_size < VIDEODEC2_MIN_MEMORY_SIZE ||
 	    memory_info->cpu_gpu_memory_size < VIDEODEC2_MIN_MEMORY_SIZE ||
-	    memory_info->max_frame_buffer_size < FrameBufferSize(*config)) {
+	    memory_info->max_frame_buffer_size < MaxFrameBufferSize(config)) {
 		return VIDEODEC2_ERROR_MEMORY_SIZE;
 	}
 
@@ -378,7 +388,8 @@ static int32_t KYTY_SYSV_ABI CreateDecoder(const Videodec2DecoderConfigInfo* con
 	}
 
 	auto* state =
-	    Decoder::Create({config->codec_type, config->max_frame_width, config->max_frame_height});
+	    Decoder::Create({config->codec_type, config->max_frame_width, config->max_frame_height, 2u,
+	                     Decoder::HighBitDepthProfile(config->codec_type, config->profile)});
 	if (state == nullptr) {
 		return VIDEODEC2_ERROR_API_FAIL;
 	}
