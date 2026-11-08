@@ -18,6 +18,7 @@ void GuestSync::Wrote(vk::PipelineStageFlags2 stages, vk::AccessFlags2 access) {
 void GuestSync::WroteTransfer(vk::Buffer buffer, uint64_t offset, uint64_t size) {
 	Wrote(vk::PipelineStageFlagBits2::eAllTransfer, vk::AccessFlagBits2::eTransferWrite);
 	m_transfers.push_back({buffer, offset, size});
+	m_wait = true; // the command after a transfer waits for it (see BeforeTransfer)
 }
 
 bool GuestSync::TransferOverlaps(vk::Buffer buffer, uint64_t offset, uint64_t size) const noexcept {
@@ -61,7 +62,11 @@ void GuestSync::PostDue(vk::CommandBuffer command) {
 
 void GuestSync::BeforeTransfer(vk::CommandBuffer command, vk::Buffer buffer, uint64_t offset,
                                uint64_t size) {
-	if (Due()) {
+	// Shaders wrote since the last barrier: a transfer waits for them. Transfers alone: ordered below, only
+	// over the same bytes.
+	const bool transfers_only =
+	    (m_stages & ~vk::PipelineStageFlags2 {vk::PipelineStageFlagBits2::eAllTransfer}) == vk::PipelineStageFlags2 {};
+	if (Due() || (static_cast<bool>(m_stages) && !transfers_only)) {
 		Post(command);
 		return;
 	}

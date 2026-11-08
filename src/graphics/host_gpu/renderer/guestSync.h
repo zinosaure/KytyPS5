@@ -28,8 +28,8 @@ public:
 	void Wait(vk::PipelineStageFlags2 stages, vk::AccessFlags2 access = {});
 	// A command wrote memory through `stages`: the next barrier releases it.
 	void Wrote(vk::PipelineStageFlags2 stages, vk::AccessFlags2 access);
-	// A transfer wrote `size` bytes of `buffer` at `offset`: the next barrier releases it, and a later transfer
-	// over the same bytes follows it, as the console's DMA engine runs its queue in order.
+	// A transfer wrote `size` bytes of `buffer` at `offset`: the command after it releases it, and a later
+	// transfer over the same bytes follows it, as the console's DMA engine runs its queue in order.
 	void WroteTransfer(vk::Buffer buffer, uint64_t offset, uint64_t size);
 	// Whether the game asked for a wait since the last barrier: one is due before the next command.
 	[[nodiscard]] bool Due() const noexcept { return m_wait && static_cast<bool>(m_stages); }
@@ -37,8 +37,15 @@ public:
 	void Post(vk::CommandBuffer command);
 	// Posts the barrier due, if one is. Outside a render pass.
 	void PostDue(vk::CommandBuffer command);
-	// Before a transfer over `size` bytes of `buffer` at `offset`: the barrier due, or, when a transfer of the
-	// run wrote those bytes, a barrier between the two transfers.
+	// Before a transfer over `size` bytes of `buffer` at `offset`: the barrier for whatever the run wrote, or,
+	// when only transfers wrote and one of them those bytes, a barrier between the two transfers.
+	//
+	// Transfers are the exception to following the game. Clair Obscur fills counters by DMA 6 500 times a
+	// second and reads them from its shaders with no wait the command processor decodes, and the console gets
+	// away with it; left unordered here, the GPU hung on a compute ring after two or three minutes, every
+	// time, and never once with every transfer ordered with the commands around it. So a transfer waits for
+	// the writes before it and the command after it waits for the transfer, until the packet the game relies
+	// on is found.
 	void BeforeTransfer(vk::CommandBuffer command, vk::Buffer buffer, uint64_t offset, uint64_t size);
 
 	// Sync1 stage flags as sync2 flags: the bits coincide.
