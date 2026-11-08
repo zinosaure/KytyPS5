@@ -25,6 +25,13 @@ public:
 	void           EndRendering() { m_command.EndRendering(); }
 	void           Flush();
 	void           Flush(SubmitInfo& submit);
+	// A draw or a dispatch was recorded: the work goes to the GPU when it would otherwise run dry.
+	void           Recorded();
+	// The end of one of the game's command lists: submits unless the GPU has two buffers queued and this one is
+	// not full yet. True when it submitted.
+	bool           FlushAtBoundary();
+	// Before the GPU thread sleeps: whatever is recorded goes to the GPU.
+	void           FlushBeforeIdle();
 	void           Finish();
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
@@ -96,6 +103,10 @@ private:
 	std::mutex                   m_operation_mutex;
 	// GameFlex: PopPendingOperations calls since the driver was last asked where the GPU is.
 	uint32_t m_refresh_skips = 0;
+	// The draws and dispatches recorded in the current buffer, and whether anything at all was (Current() hands
+	// the buffer to whoever records: a label, a transfer, a draw).
+	uint32_t m_commands_recorded = 0;
+	bool     m_buffer_used       = false;
 	std::condition_variable      m_operation_available;
 	std::jthread                 m_priority_thread;
 	uint64_t                     m_priority_active_tick = 0; // 0 while none runs

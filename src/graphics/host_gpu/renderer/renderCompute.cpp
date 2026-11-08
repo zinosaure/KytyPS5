@@ -469,6 +469,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		                               vk::AccessFlagBits2::eShaderWrite);
 	}
 	ResetBindings();
+	m_context.GetCommandScheduler().Recorded();
 }
 
 void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr, uint32_t mode,
@@ -527,6 +528,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 		                               vk::AccessFlagBits2::eShaderWrite);
 	}
 	ResetBindings();
+	m_context.GetCommandScheduler().Recorded();
 }
 
 } // namespace Libs::Graphics

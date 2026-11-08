@@ -142,6 +142,52 @@ void CommandScheduler::Flush() {
 	Flush(submit);
 }
 
+// The submission follows the GPU. The console's command processor consumes the ring as the game fills it; the
+// host GPU only sees what vkQueueSubmit hands it, and every submission costs it a drain and a cold start. So the
+// GPU is fed small buffers when it is about to run dry, and the game's lists are grouped when it has two buffers
+// of lookahead; the fixed points (suspension, flip, waits) submit as before.
+namespace {
+constexpr uint32_t kFeedCommands = 64;   // a small buffer, when the GPU is running dry
+constexpr uint32_t kFullCommands = 4096; // a full buffer, when it has lookahead
+} // namespace
+
+void CommandScheduler::Recorded() {
+	if (m_command.IsInvalid()) {
+		return;
+	}
+	m_commands_recorded++;
+	if (m_commands_recorded % kFeedCommands != 0) {
+		return;
+	}
+	// Buffers submitted and not finished, as the GPU reports now. One in flight and nothing behind it: this one
+	// goes now, so the GPU finds the next job in its queue when it ends the current one, instead of waiting for
+	// the kernel to wake up and hand it over (0.6 ms a time, measured).
+	m_master.Refresh();
+	const uint64_t queued = CurrentTick() - 1 - m_master.KnownGpuTick();
+	if (queued <= 1 || m_commands_recorded >= kFullCommands) {
+		Flush();
+	}
+}
+
+bool CommandScheduler::FlushAtBoundary() {
+	if (!Active() || m_command.IsInvalid() || !m_buffer_used) {
+		return false;
+	}
+	const uint64_t queued = CurrentTick() - 1 - m_master.KnownGpuTick();
+	if (queued >= 2 && m_commands_recorded < kFullCommands) {
+		return false;
+	}
+	Flush();
+	return true;
+}
+
+void CommandScheduler::FlushBeforeIdle() {
+	// Before the first Begin, or after a reset, nothing can have been recorded.
+	if (Active() && !m_command.IsInvalid() && m_buffer_used) {
+		Flush();
+	}
+}
+
 void CommandScheduler::Flush(SubmitInfo& submit) {
 	Submit(submit);
 	BeginNext();
@@ -304,6 +350,7 @@ void CommandScheduler::CheckActive() const {
 
 CommandBuffer& CommandScheduler::Current() {
 	EXIT_IF(m_command.IsInvalid());
+	m_buffer_used = true;
 	return m_command;
 }
 
@@ -354,7 +401,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		EXIT("vkQueueSubmit failed: %s, tick=%" PRIu64 "\n", vk::to_string(result).c_str(), tick);
 	}
 
-	m_command.m_buffer = nullptr;
+	m_command.m_buffer  = nullptr;
+	m_commands_recorded = 0;
+	m_buffer_used       = false;
 	return tick;
 }
 

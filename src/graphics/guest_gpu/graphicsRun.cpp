@@ -217,6 +217,13 @@ void CommandProcessor::BufferFlush() {
 	m_renderer.GetOcclusionQueries().Publish();
 }
 
+// The end of one of the game's command lists: the GPU gets it when it would otherwise run dry.
+void CommandProcessor::BufferFlushAtBoundary() {
+	if (GetScheduler().FlushAtBoundary()) {
+		m_renderer.GetOcclusionQueries().Publish();
+	}
+}
+
 void CommandProcessor::BufferWait() {
 	BufferInit();
 	GetScheduler().Finish();
@@ -415,6 +422,8 @@ void GuestGpu::ThreadRun(void* data) {
 		{
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
+				// Nothing recorded stays behind while the thread sleeps: the game may be waiting for it.
+				gpu->m_renderer.GetCommandScheduler().FlushBeforeIdle();
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
 				Common::GameFlex::WaitNote gameflex_wait("gpu thread: no work");
@@ -439,6 +448,7 @@ void GuestGpu::ThreadRun(void* data) {
 					}
 				}
 				if (selected_queue < 0) {
+					gpu->m_renderer.GetCommandScheduler().FlushBeforeIdle();
 					gpu->m_processing = false;
 					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
 					for (auto& queue: gpu->m_queues) {
@@ -514,7 +524,7 @@ bool GuestGpu::Process(Submission& submission) {
 			complete =
 			    cp.Process(submission.execution, submission.commands) == Pm4ProcessResult::Complete;
 			if (submission.execution.MadeProgress()) {
-				cp.BufferFlush();
+				cp.BufferFlushAtBoundary();
 			}
 			break;
 		case SubmissionType::FlipPreparation:
