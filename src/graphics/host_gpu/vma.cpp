@@ -141,10 +141,23 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 	if (discrete) {
 		return budget - std::min<uint64_t>(budget / 8, 1024ull * 1024 * 1024);
 	}
+	// GameFlex: the imported guest memory takes its share of the heaps, for good, and it is most of
+	// what the reserve kept for the host. An integrated GPU's "device local" heap is only a share of
+	// the same memory (RADV says two thirds): it says nothing of what is left for images. The heaps
+	// are the ceiling: every allocation must fit at each submission, whatever the budget says.
 	usage -= std::min(usage, unified_memory_bytes);
-	constexpr uint64_t system_reserve = 8ull * 1024 * 1024 * 1024;
-	const auto         available      = budget > usage ? budget - usage : uint64_t {0};
-	return std::max(local, available > system_reserve ? available - system_reserve : uint64_t {0});
+	uint64_t heaps = 0;
+	for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
+		heaps += physical_device_memory_properties.memoryHeaps[heap].size;
+	}
+	if (unified_memory_bytes != 0) {
+		budget = std::min(budget, heaps);
+		budget -= std::min(budget, unified_memory_bytes);
+	}
+	const uint64_t system_reserve = (unified_memory_bytes != 0 ? 1ull : 8ull) * 1024 * 1024 * 1024;
+	const auto     available      = budget > usage ? budget - usage : uint64_t {0};
+	const auto     left = available > system_reserve ? available - system_reserve : uint64_t {0};
+	return unified_memory_bytes != 0 ? left : std::max(local, left);
 }
 
 bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image) {
