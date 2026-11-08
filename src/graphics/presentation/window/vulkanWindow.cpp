@@ -81,6 +81,12 @@ static bool HasExtension(const std::vector<const char*>& extensions, const char*
 	                   [name](const char* ext) { return strcmp(ext, name) == 0; });
 }
 
+// VK_KHR_fragment_shader_barycentric is optional (Turnip has none; see ShaderRecompiler.h).
+// KYTY_NO_FRAGMENT_BARYCENTRIC leaves it unused on a device that has it, to try that path.
+static bool FragmentBarycentricWanted() {
+	return std::getenv("KYTY_NO_FRAGMENT_BARYCENTRIC") == nullptr;
+}
+
 static bool HasLayer(const std::vector<vk::LayerProperties>& layers, const char* name) {
 	return std::any_of(layers.begin(), layers.end(),
 	                   [name](const auto& layer) { return strcmp(layer.layerName, name) == 0; });
@@ -443,7 +449,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	if (!add(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME)) {
 		supported.unlink<vk::PhysicalDeviceConditionalRenderingFeaturesEXT>();
 	}
-	if (!add(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME)) {
+	if (!FragmentBarycentricWanted() || !add(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME)) {
 		supported.unlink<vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR>();
 	}
 	if (Libs::LibKernel::Memory::UnifiedMemoryFd() >= 0 &&
@@ -456,6 +462,12 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
 	physical_device.getFeatures2(&supported2);
 	const bool barycentric_supported = barycentric.fragmentShaderBarycentric == VK_TRUE;
+	graphics.fragment_shader_barycentric_enabled = barycentric_supported;
+	// On the console: the one line that says which path the pixel shaders take here.
+	Log::WriteToConsoleAndLog(fmt::format("Vulkan fragment shader barycentric: {}\n",
+	                                      barycentric_supported
+	                                          ? "true"
+	                                          : "false (pixel inputs are host-interpolated)"));
 	if (!barycentric_supported) {
 		Log::WriteToConsoleAndLog(
 		    "WARNING: Your GPU is not fully supported (fragmentShaderBarycentric is unavailable). "

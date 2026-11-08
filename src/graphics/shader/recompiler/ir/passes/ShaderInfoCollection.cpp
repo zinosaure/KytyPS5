@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 
 #include "common/assert.h"
+#include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
@@ -101,6 +102,12 @@ void CollectPixelInputs(const ShaderPixelInputInfo* pixel, ShaderInfo& info,
 				per_vertex[input] = per_vertex[input] || per_vertex[alias] || !same_mode;
 			}
 		}
+	}
+	if (!FragmentBarycentricSupported()) {
+		// No VK_KHR_fragment_shader_barycentric on the host: every parameter is a
+		// host-interpolated varying, the way a flat one already is (v_interp_p2 reads it
+		// directly, so the I/J inputs are not needed). Mixed-mode aliases lose their split.
+		per_vertex.fill(false);
 	}
 	for (uint32_t input = 0; input < pixel->input_num; input++) {
 		AddInput(info, StageInputKind::Parameter, input, 4, fmt::format("in_param_{}", input),
@@ -628,7 +635,14 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 		default: return Fail("unsupported shader stage for info collection");
 	}
 	for (uint32_t i = 0; i < inputs.builtin_count; i++) {
-		AddBuiltinInput(info, inputs.builtins[i]);
+		const auto kind = inputs.builtins[i];
+		if (!FragmentBarycentricSupported() &&
+		    (kind == StageInputKind::BaryCoordSmooth || kind == StageInputKind::BaryCoordSmoothSample ||
+		     kind == StageInputKind::BaryCoordSmoothCentroid ||
+		     kind == StageInputKind::BaryCoordNoPerspective)) {
+			continue; // Read as zero by the emitter: no gl_BaryCoordKHR input.
+		}
+		AddBuiltinInput(info, kind);
 	}
 	program.shader_info_complete = true;
 }

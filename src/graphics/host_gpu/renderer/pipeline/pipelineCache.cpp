@@ -492,6 +492,7 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
     : m_graphics(graphics), m_image_heap(image_heap),
       m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	ShaderRecompiler::SetFragmentBarycentricSupported(graphics.fragment_shader_barycentric_enabled);
 	InitializeDriverCache();
 	const char* aside = std::getenv("KYTY_COMPILE_ASIDE");
 	m_compile_aside   = aside != nullptr && std::string_view(aside) != "0" &&

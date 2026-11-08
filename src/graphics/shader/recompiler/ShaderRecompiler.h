@@ -82,6 +82,13 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
                                            const IR::ResourceSpecialization& specialization,
 	                                       uint32_t push_data_start_dword = 0);
 
+// Whether the host device has VK_KHR_fragment_shader_barycentric (Turnip on Adreno has not).
+// Without it, a pixel parameter is read as a host-interpolated varying - as a flat one already
+// is - instead of three per-vertex inputs blended with gl_BaryCoordKHR, and the barycentric
+// inputs read as zero (v_interp_p2 ignores them). Default: supported.
+void               SetFragmentBarycentricSupported(bool supported);
+[[nodiscard]] bool FragmentBarycentricSupported();
+
 } // namespace Libs::Graphics::ShaderRecompiler
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SHADERRECOMPILER_H_ */

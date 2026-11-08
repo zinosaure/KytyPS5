@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <fmt/format.h>
 #include <functional>
@@ -27,6 +28,18 @@
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler {
+
+namespace {
+std::atomic_bool g_fragment_barycentric_supported {true};
+} // namespace
+
+void SetFragmentBarycentricSupported(bool supported) {
+	g_fragment_barycentric_supported.store(supported, std::memory_order_relaxed);
+}
+
+bool FragmentBarycentricSupported() {
+	return g_fragment_barycentric_supported.load(std::memory_order_relaxed);
+}
 
 namespace {
 
