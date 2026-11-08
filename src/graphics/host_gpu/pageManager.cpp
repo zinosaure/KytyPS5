@@ -286,6 +286,17 @@ bool PageManager::IsReadWatched(uint64_t vaddr) const {
 	return region->pages[page].access_watchers != 0;
 }
 
+uint32_t PageManager::WatcherCounts(uint64_t vaddr) const {
+	auto* region = m_impl->FindRegion(vaddr);
+	if (region == nullptr) {
+		return 0;
+	}
+	const auto page = static_cast<size_t>((vaddr - Common::AlignDown(vaddr, REGION_SIZE)) / PAGE_SIZE);
+	SpinGuard  lock(region->lock);
+	return (static_cast<uint32_t>(region->pages[page].access_watchers) << 16u) |
+	       region->pages[page].write_watchers;
+}
+
 template <bool track>
 void PageManager::UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
 	m_impl->UpdatePageWatchers<track, false>(vaddr, size);

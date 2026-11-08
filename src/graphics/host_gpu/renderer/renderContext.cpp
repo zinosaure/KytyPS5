@@ -81,8 +81,16 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 				default: return "unknown";
 			}
 		};
-		Log::WriteToConsoleAndLog(fmt::format("GPU page fault at {:#x}: reported {}, handled as {}\n",
-		                                      fault_vaddr, name(reported), name(access)));
+		const auto watchers = m_page_manager.WatcherCounts(fault_vaddr);
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "GPU page fault at {:#x}: reported {}, handled as {} (read watchers {}, write watchers {})\n",
+		    fault_vaddr, name(reported), name(access), watchers >> 16u, watchers & 0xffffu));
+	}
+	if (access == PageFaultAccess::Execute && !m_page_manager.IsReadWatched(fault_vaddr)) {
+		// GPU tracking keeps a watched page executable (ProtectTransient): this fault is not
+		// ours. Relayed as a read, it went to the buffer cache, which created a buffer before
+		// any GPU command and stopped in the scheduler instead of saying what happened.
+		return false;
 	}
 	if (access == PageFaultAccess::Write) {
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);

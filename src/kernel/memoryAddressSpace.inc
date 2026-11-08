@@ -794,6 +794,14 @@ public:
 
 	// Tracker protections only read m_mapped; the page tracker orders them per page.
 	bool ProtectTransient(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
+		// Watching a page for the GPU never takes execution away: guest code can share a page
+		// with GPU data, and a host that checks it (Box64 before translating x86 code) stopped
+		// on code that ran a moment before. Only an inaccessible page stays so.
+		if (mode == VirtualMemory::Mode::Read) {
+			mode = VirtualMemory::Mode::ExecuteRead;
+		} else if (mode == VirtualMemory::Mode::ReadWrite) {
+			mode = VirtualMemory::Mode::ExecuteReadWrite;
+		}
 		std::shared_lock lock(m_mutex);
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
