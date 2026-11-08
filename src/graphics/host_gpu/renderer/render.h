@@ -101,7 +101,18 @@ public:
 	[[nodiscard]] bool IsInvalid() const noexcept { return m_buffer == nullptr; }
 
 	void BeginRendering(const RenderState& state) const;
+	// Also lays the write barrier a run of memory-writing draws left pending.
 	void EndRendering() const;
+	// GameFlex: a draw that writes memory continues the run before it when nothing else was recorded in between
+	// and the guest asked for no synchronization; its write barrier waits for the end of the run.
+	[[nodiscard]] bool ContinuesShaderWriteRun(uint64_t epoch) const {
+		return m_pending_shader_writes && m_shader_write_epoch == epoch;
+	}
+	[[nodiscard]] bool HasPendingShaderWrites() const { return static_cast<bool>(m_pending_shader_writes); }
+	void DeferShaderWriteBarrier(vk::PipelineStageFlags stages, uint64_t epoch) const {
+		m_pending_shader_writes |= stages;
+		m_shader_write_epoch = epoch;
+	}
 
 	[[nodiscard]] vk::CommandBuffer Handle() const noexcept { return m_buffer; }
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
@@ -126,6 +137,8 @@ private:
 	vk::CommandBuffer   m_buffer = nullptr;
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
+	mutable vk::PipelineStageFlags m_pending_shader_writes = {};
+	mutable uint64_t               m_shader_write_epoch    = 0;
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;

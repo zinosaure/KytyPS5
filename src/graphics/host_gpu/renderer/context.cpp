@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -88,11 +89,14 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 }
 
 void CommandBuffer::EndRendering() const {
-	if (!m_rendering) {
-		return;
+	if (m_rendering) {
+		Handle().endRendering();
+		m_rendering = false;
 	}
-	Handle().endRendering();
-	m_rendering = false;
+	if (m_pending_shader_writes && !IsInvalid()) {
+		ShaderWriteBarrier(Handle(), m_pending_shader_writes);
+		m_pending_shader_writes = {};
+	}
 }
 
 } // namespace Libs::Graphics

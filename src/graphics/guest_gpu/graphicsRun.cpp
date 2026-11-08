@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 
 #include "common/assert.h"
@@ -1018,6 +1019,14 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 	}
 
 	const auto valid_cache_event_index = event_index == 0x00000000 || event_index == 0x00000007;
+	// GameFlex: partial flushes and cache writebacks order the GPU work on either side; the runs of
+	// memory-writing draws end there.
+	switch (event_type) {
+		case 0x07: case 0x0f: case 0x10: case 0x16: case 0x31: case 0x2a: case 0x2c: case 0x2e:
+			Libs::Graphics::g_guest_sync_epoch.fetch_add(1, std::memory_order_relaxed);
+			break;
+		default: break;
+	}
 	// Partial flushes and cache writebacks only order GPU work, which the renderer's resource
 	// barriers already order.
 	switch (event_type) {

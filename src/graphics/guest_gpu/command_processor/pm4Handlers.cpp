@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -437,6 +438,8 @@ KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0055800 && cmd_id != 0xc0065800);
+	// GameFlex: the guest orders the GPU work on either side (render: the runs of memory-writing draws).
+	Libs::Graphics::g_guest_sync_epoch.fetch_add(1, std::memory_order_relaxed);
 	return KYTY_PM4_LEN(cmd_id) - 1;
 }
 
