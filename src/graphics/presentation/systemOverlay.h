@@ -20,6 +20,10 @@ struct GraphicContext;
 struct SystemOverlayVisualState {
 	bool     active;
 	uint64_t revision;
+	// GameFlex: drawn on the frames the game presents, never a reason to present one more (the
+	// compilation spinner, the mesh shader notice). The presenter refreshes it only when the game
+	// has presented nothing for a while.
+	bool passive = false;
 };
 
 void                     InitializeSplashScreen(const std::filesystem::path& sce_sys);
@@ -28,8 +32,8 @@ void                     InitializeSystemOverlayInput(SDL_Window* window);
 void                     ShutdownSystemOverlayInput();
 bool                     ProcessSystemOverlayInput(const SDL_Event& event);
 SystemOverlayVisualState GetSystemOverlayVisualState() noexcept;
-// A shader or pipeline has just been compiled: shows the compilation toast for a moment. From any
-// thread. KYTY_SHADER_TOAST=0 turns the toast off.
+// A shader or pipeline has just been compiled: shows the compilation spinner for a moment. From any
+// thread. KYTY_SHADER_TOAST=0 turns it off.
 void                     NotifyShaderCompiled() noexcept;
 // The first draw this GPU cannot do has been dropped: says for a moment that objects are missing.
 void                     NotifyMeshDrawsDropped() noexcept;

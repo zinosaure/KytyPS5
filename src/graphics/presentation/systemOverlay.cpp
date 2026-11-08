@@ -733,12 +733,18 @@ SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const auto cursor        = GetHostInputTouchPadVisualState();
 	const bool compiling     = CompileToastActive();
 	const bool mesh_notice   = MeshNoticeActive();
+	// GameFlex: the compilation spinner and the mesh shader notice are passive. Active, they made the
+	// present thread show the last image again at every vblank the game left free, and every new
+	// shader changed the revision: a game at 30 images/s was presented up to 60 times a second
+	// (Astro Bot counted 43, Clair Obscur 25.7 for 9 real images), twice the work for the GPU and the
+	// X screen while shaders compile. They appear and go with the revision, and ride on the game's
+	// frames in between.
 	return {core.active || dialog.active || system.active || trophy_active || splash ||
-	            cursor.enabled || compiling || mesh_notice,
+	            cursor.enabled,
 	        core.revision + dialog.revision + system.revision + (trophy_active ? 1u : 0u) +
 	            (splash ? 2u : 0u) + (compiling ? 4u : 0u) + (mesh_notice ? 8u : 0u) +
-	            static_cast<decltype(core.revision)>(g_compile_count.load(std::memory_order_relaxed)) +
-	            static_cast<decltype(core.revision)>(cursor.revision) + PerformanceOverlayRevision()};
+	            static_cast<decltype(core.revision)>(cursor.revision) + PerformanceOverlayRevision(),
+	        compiling || mesh_notice};
 }
 
 bool ProcessSystemOverlayInput(const SDL_Event& event) {
@@ -1742,10 +1748,33 @@ struct SystemOverlay::Impl {
 			g_compile_count.store(0, std::memory_order_relaxed);
 			return;
 		}
-		const auto count = g_compile_count.load(std::memory_order_relaxed);
-		DrawCornerNotice(french ? fmt::format("Compilation des shaders : {}", count)
-		                        : fmt::format("Compiling shaders: {}", count),
-		                 frame_extent, row);
+		DrawCompileSpinner(frame_extent);
+	}
+
+	// GameFlex: while shaders compile, a small spinner in the top-left corner with the number of
+	// shaders compiled inside — less of the screen than a line of text (the owner, 2026-11-08). The
+	// performance overlay is in the top-right corner. The arc turns with time: it moves on each
+	// frame the game presents, and four times a second when the game is stalled (swapchain.cpp).
+	void DrawCompileSpinner(vk::Extent2D frame_extent) {
+		const float scale  = std::clamp(std::min(static_cast<float>(frame_extent.width) / 1920.0f,
+		                                         static_cast<float>(frame_extent.height) / 1080.0f),
+		                                0.65f, 1.25f);
+		const float radius = 24.0f * scale;
+		const float ring   = 3.0f * scale;
+		const ImVec2 center {24.0f * scale + radius, 24.0f * scale + radius};
+		auto*        draw = ImGui::GetForegroundDrawList();
+		draw->AddCircleFilled(center, radius, IM_COL32(24, 26, 32, 200), 48);
+		draw->AddCircle(center, radius - ring, IM_COL32(255, 255, 255, 48), 48, ring);
+		const float seconds = std::chrono::duration<float>(Clock::now().time_since_epoch()).count();
+		const float start   = std::fmod(seconds * 5.0f, 2.0f * IM_PI);
+		draw->PathArcTo(center, radius - ring, start, start + 1.2f * IM_PI, 32);
+		draw->PathStroke(IM_COL32(255, 255, 255, 230), ImDrawFlags_None, ring);
+		const auto  text = std::to_string(g_compile_count.load(std::memory_order_relaxed));
+		const float size = (text.size() <= 2 ? 19.0f : text.size() == 3 ? 16.0f : 13.0f) * scale;
+		const auto  extent =
+		    ImGui::GetFont()->CalcTextSizeA(size, std::numeric_limits<float>::max(), 0.0f, text.c_str());
+		draw->AddText(nullptr, size, {center.x - extent.x * 0.5f, center.y - extent.y * 0.5f},
+		              IM_COL32(255, 255, 255, 255), text.c_str());
 	}
 
 	void DrawTrophyNotification(vk::Extent2D frame_extent, Clock::time_point now, float min_top) {

@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -415,6 +416,8 @@ struct Presenter::Impl {
 	Common::Mutex         present_mutex;
 	std::array<Layer, 2>  layers {};
 	std::atomic<uint64_t> presented_overlay_revision {0};
+	// GameFlex: when the last present happened (steady clock, ms), for a passive overlay element.
+	std::atomic<int64_t> last_present_ms {0};
 };
 
 vk::SurfaceFormatKHR Swapchain::SelectFormat() {
@@ -1091,8 +1094,17 @@ bool Presenter::IsHdrSupported() const noexcept {
 
 bool Presenter::NeedsSystemOverlayRefresh() const noexcept {
 	const auto visual = GetSystemOverlayVisualState();
-	return visual.active ||
-	       visual.revision != m_impl->presented_overlay_revision.load(std::memory_order_acquire);
+	if (visual.active ||
+	    visual.revision != m_impl->presented_overlay_revision.load(std::memory_order_acquire)) {
+		return true;
+	}
+	// GameFlex: a passive element (the compilation spinner) rides on the game's frames; when the game
+	// has presented nothing for a quarter of a second (a stall while shaders compile), it is shown
+	// again four times a second so that it still turns.
+	const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+	                     std::chrono::steady_clock::now().time_since_epoch())
+	                     .count();
+	return visual.passive && now - m_impl->last_present_ms.load(std::memory_order_relaxed) >= 250;
 }
 
 RenderContext& Presenter::Renderer() const noexcept {
@@ -1160,7 +1172,7 @@ void Presenter::Impl::Present() {
 		auto&      command = present_scheduler.BeginCommand();
 		const bool draw_system_overlay = [&] {
 			ScopedTimer overlay_time(Counter::OverlayNs);
-			return (overlay_visual.active || PerformanceOverlayEnabled()) &&
+			return (overlay_visual.active || overlay_visual.passive || PerformanceOverlayEnabled()) &&
 			       swapchain.PrepareSystemOverlay();
 		}();
 		swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
@@ -1181,6 +1193,10 @@ void Presenter::Impl::Present() {
 		}
 
 		presented_overlay_revision.store(overlay_visual.revision, std::memory_order_release);
+		last_present_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+		                          std::chrono::steady_clock::now().time_since_epoch())
+		                          .count(),
+		                      std::memory_order_relaxed);
 		window.loop.presented_frames.fetch_add(1, std::memory_order_relaxed);
 		return;
 	}
