@@ -1466,7 +1466,9 @@ static constexpr auto MakeContextIndirectTable() {
 			    KYTY_PM4_GET(value, CB_COLOR0_DCC_CONTROL, INDEPENDENT_64B_BLOCKS) != 0;
 			const bool independent_128b =
 			    KYTY_PM4_GET(value, CB_COLOR0_DCC_CONTROL, INDEPENDENT_128B_BLOCKS) != 0;
-			EXIT_NOT_IMPLEMENTED(independent_64b && independent_128b);
+			// Both flags together are a valid RDNA2 setting — DCC kept compatible with shader
+			// writes (Final Fantasy VII Rebirth, past its main menu); 64 bytes is the stricter
+			// constraint. Kyty only keeps the value for its debug dump.
 			dcc.independent_block_size =
 			    independent_64b
 			        ? HW::ColorDccControl::IndependentBlockSize::Bytes64
