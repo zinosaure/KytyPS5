@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -1187,7 +1188,8 @@ Program* RuntimeLinker::LoadProgram(const std::filesystem::path& elf_name) {
 
 	static int32_t id_seq = 0;
 
-	LOGF("Loading: %s\n", Common::PathToString(elf_name).c_str());
+	// On the console too (LOGF is silent by default): which modules a game really loads.
+	Log::WriteToConsoleAndLog(fmt::format("Loading: {}\n", Common::PathToString(elf_name)));
 
 	auto  program_owner = std::make_unique<Program>();
 	auto* program       = program_owner.get();
@@ -1271,7 +1273,16 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 
 	// The runtime automatically loads libc; other PRXs are requested by the application.
 	const auto libc_path = Libs::LibKernel::FileSystem::GetRealFilename("/app0/sce_module/libc.prx");
-	auto* libc = Common::File::IsFileExisting(libc_path) ? LoadProgram(libc_path) : nullptr;
+	const bool libc_found = Common::File::IsFileExisting(libc_path);
+	if (!libc_found) {
+		// Said on the console: without the game's libc its imports become stubs, and the
+		// first call into one crashes far from the cause.
+		const int error = errno;
+		Log::WriteToConsoleAndLog(fmt::format("libc.prx not loaded: {} is not a file (errno {}: {})\n",
+		                                      Common::PathToString(libc_path), error,
+		                                      std::strerror(error)));
+	}
+	auto* libc = libc_found ? LoadProgram(libc_path) : nullptr;
 	RelocateAll();
 
 	if (!game_patch.empty()) {
