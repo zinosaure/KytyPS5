@@ -525,7 +525,8 @@ struct Bindings {
 
 struct ShaderInfo {
 	static constexpr uint32_t MaxBufferRoots  = 64;
-	static constexpr uint32_t MaxImages       = 64;
+	// FF XVI samples more than 64 images in one pixel shader; RADV takes far more per stage.
+	static constexpr uint32_t MaxImages       = 256;
 	static constexpr uint32_t MaxSamplers     = 32;
 
 	std::vector<BufferResource>      buffers;
