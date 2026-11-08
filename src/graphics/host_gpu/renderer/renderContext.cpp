@@ -6,6 +6,8 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <atomic>
+#include <fmt/format.h>
 
 namespace Libs::Graphics {
 
@@ -61,6 +63,26 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	constexpr uint64_t fault_size = 1;
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
+	}
+	const auto reported = access;
+	if (access == PageFaultAccess::Read && !m_page_manager.IsReadWatched(fault_vaddr)) {
+		// A read cannot fault on a page that only watches writes: it is readable. The host
+		// reported a write as a read — Box64 on a phone guesses it from the x86 instruction.
+		// As a read it went to the buffer cache, which created a buffer before any GPU command.
+		access = PageFaultAccess::Write;
+	}
+	static std::atomic_int logged_faults {0};
+	if (logged_faults.fetch_add(1, std::memory_order_relaxed) < 8) {
+		const auto name = [](PageFaultAccess kind) {
+			switch (kind) {
+				case PageFaultAccess::Read: return "read";
+				case PageFaultAccess::Write: return "write";
+				case PageFaultAccess::Execute: return "execute";
+				default: return "unknown";
+			}
+		};
+		Log::WriteToConsoleAndLog(fmt::format("GPU page fault at {:#x}: reported {}, handled as {}\n",
+		                                      fault_vaddr, name(reported), name(access)));
 	}
 	if (access == PageFaultAccess::Write) {
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);

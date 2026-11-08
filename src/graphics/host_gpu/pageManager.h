@@ -18,6 +18,10 @@ public:
 
 	KYTY_CLASS_NO_COPY(PageManager);
 
+	// Whether reads of this page fault (a read watcher made it inaccessible). Elsewhere a
+	// watched page stays readable: only a write can fault on it.
+	[[nodiscard]] bool IsReadWatched(uint64_t vaddr) const;
+
 	template <bool track>
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size);
 	template <bool track, bool is_read = false>
