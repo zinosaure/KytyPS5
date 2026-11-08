@@ -1172,46 +1172,18 @@ bool BufferCache::WriteGuestMemory(uint64_t vaddr, const void* data, uint64_t si
 	return true;
 }
 
-bool BufferCache::WriteQueryResult(vk::QueryPool pool, uint32_t query, uint64_t vaddr) {
-	if (!IsUnified() || (vaddr & 7u) != 0) {
-		return false;
+std::pair<Buffer*, uint64_t> BufferCache::UnifiedGpuWriteTarget(uint64_t vaddr, uint64_t size) {
+	if (!IsUnified()) {
+		return {nullptr, 0};
 	}
-	const auto id = UnifiedWindow(vaddr, sizeof(uint64_t));
+	const auto id = UnifiedWindow(vaddr, size);
 	if (!id) {
-		return false;
+		return {nullptr, 0};
 	}
-	auto&      buffer  = m_slot_buffers[id];
-	const auto offset  = buffer.Offset(vaddr);
-	auto&      command = m_scheduler.Current();
-	command.EndRendering();
-	const auto native = command.Handle();
-	vk::MemoryBarrier before {};
-	before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
-	before.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-	                       vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr, 0,
-	                       nullptr);
-	native.copyQueryPoolResults(pool, query, 1, buffer.Handle(), offset, sizeof(uint64_t),
-	                            vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
-	// One draw's samples stay far below 2^32: the high word only carries the ready bit.
-	vk::MemoryBarrier ordered {};
-	ordered.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
-	ordered.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-	                       vk::PipelineStageFlagBits::eTransfer, {}, 1, &ordered, 0, nullptr, 0,
-	                       nullptr);
-	const uint32_t ready = 1u << 31u;
-	native.updateBuffer(buffer.Handle(), offset + sizeof(uint32_t), sizeof(ready), &ready);
-	RecordUnifiedGpuWrite(vaddr, sizeof(uint64_t));
-	vk::MemoryBarrier after {};
-	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
-	after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
-	                      vk::AccessFlagBits::eHostRead;
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-	                       vk::PipelineStageFlagBits::eAllCommands |
-	                           vk::PipelineStageFlagBits::eHost,
-	                       {}, 1, &after, 0, nullptr, 0, nullptr);
-	return true;
+	auto& buffer = m_slot_buffers[id];
+	ForgetColorMetadataChecks(vaddr, size);
+	RecordUnifiedGpuWrite(vaddr, size);
+	return {&buffer, buffer.Offset(vaddr)};
 }
 
 } // namespace Libs::Graphics

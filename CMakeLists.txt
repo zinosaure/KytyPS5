@@ -293,6 +293,21 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${fault_buffer_shader_header}")
+
+set(occlusion_dumps_shader_source "${gpu_tiler_shader_dir}/occlusion_dumps.comp")
+set(occlusion_dumps_shader_spv "${gpu_tiler_generated_dir}/occlusion_dumps.spv")
+set(occlusion_dumps_shader_header "${gpu_tiler_generated_dir}/occlusion_dumps_spv.h")
+add_custom_command(
+	OUTPUT "${occlusion_dumps_shader_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${occlusion_dumps_shader_spv}" "${occlusion_dumps_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${occlusion_dumps_shader_spv} -DOUTPUT=${occlusion_dumps_shader_header}
+	        -DSYMBOL=OCCLUSION_DUMPS_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${occlusion_dumps_shader_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${occlusion_dumps_shader_header}")
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
 
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")

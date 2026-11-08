@@ -5,10 +5,12 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace Libs::Graphics {
 
+class Buffer;
 class BufferCache;
 class CommandScheduler;
 struct GraphicContext;
@@ -59,6 +61,8 @@ public:
 	// Unified memory: has the GPU write the dumps' counters itself, in command order, without
 	// waiting for it; false when the dumps need Publish.
 	bool PublishOnGpu(BufferCache& buffers);
+	// The running count the GPU keeps for PublishOnGpu, after a Wait: Publish carries it on.
+	[[nodiscard]] uint64_t GpuSamples() const;
 
 private:
 	struct PendingDump {
@@ -72,8 +76,17 @@ private:
 	void    PublishDumps();
 
 	CommandScheduler&        m_scheduler;
+	GraphicContext*          m_graphics = nullptr;
 	vk::Device               m_device;
 	vk::QueryPool            m_pool;
+	// PublishOnGpu: the host queries' results, a range that wraps around the pool continuing past
+	// its end; the running count (host-visible, so Publish can carry it on).
+	std::unique_ptr<Buffer>  m_gpu_results;
+	std::unique_ptr<Buffer>  m_gpu_running;
+	bool                     m_gpu_used = false;
+	vk::DescriptorSetLayout  m_dump_descriptors;
+	vk::PipelineLayout       m_dump_layout;
+	vk::Pipeline             m_dump_pipeline;
 	vk::QueryControlFlags    m_control;
 	std::vector<PendingDump> m_dumps;
 	std::vector<uint64_t>    m_results;

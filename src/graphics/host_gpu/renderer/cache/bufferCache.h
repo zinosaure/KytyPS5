@@ -82,9 +82,9 @@ public:
 	// Writes guest memory in command order (a label, WRITE_DATA): false outside unified memory,
 	// where the caller writes it itself.
 	bool WriteGuestMemory(uint64_t vaddr, const void* data, uint64_t size);
-	// Writes a query's 64-bit result at vaddr in command order, with bit 63 set (a z-pass counter
-	// marked ready), as the GPU dumps its own counters: false outside unified memory.
-	bool WriteQueryResult(vk::QueryPool pool, uint32_t query, uint64_t vaddr);
+	// Unified memory: the buffer and offset through which GPU work writes [vaddr, vaddr + size) of
+	// the guest's memory, recorded as GPU-written; nullptr outside unified memory.
+	[[nodiscard]] std::pair<Buffer*, uint64_t> UnifiedGpuWriteTarget(uint64_t vaddr, uint64_t size);
 	// The value of a label WriteGuestMemory recorded at exactly [vaddr, vaddr + size), that the
 	// GPU has not written yet: work recorded after it sees it, in command order.
 	[[nodiscard]] bool PendingGuestWrite(uint64_t vaddr, uint64_t size, uint64_t* value);

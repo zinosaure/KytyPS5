@@ -1,0 +1,44 @@
+#version 450
+#extension GL_ARB_gpu_shader_int64 : require
+
+// One PIXEL_PIPE_STAT_DUMP, as the CPU writes it without unified memory (WriteZPassCounters): the
+// running z-pass count grows by the samples of the host queries since the last dump, then every DB
+// counter is marked ready, DB 0's holding the count; a begin dump also clears its end counters.
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer results_buf {
+    uint results[];
+};
+
+layout(std430, binding = 1) buffer running_buf {
+    uint64_t running;
+};
+
+layout(std430, binding = 2) buffer counters_buf {
+    uint64_t counters[];
+};
+
+layout(push_constant) uniform params_block {
+    uint first;
+    uint count;
+    uint slot;
+    uint begin;
+    uint uncounted;
+} params;
+
+const uint64_t READY = 1ul << 63u;
+
+void main() {
+    uint64_t samples = running;
+    for (uint i = 0u; i < params.count; i++) {
+        samples += uint64_t(results[params.first + i]);
+    }
+    running = samples;
+    const uint64_t count = READY | ((samples + uint64_t(params.uncounted)) & (READY - 1ul));
+    for (uint db = 0u; db < 16u; db++) {
+        counters[params.slot + db * 2u] = db == 0u ? count : READY;
+        if (params.begin != 0u) {
+            counters[params.slot + db * 2u + 1u] = 0ul;
+        }
+    }
+}
