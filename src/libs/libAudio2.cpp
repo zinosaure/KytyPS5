@@ -648,6 +648,23 @@ int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t bloc
 				auto& submission = audioout2_submission(*state);
 				g_audioout2_state_mutex.Unlock();
 				audioout2_queue_context_audio(ctx, submission, blocking != 0);
+				// GameFlex: a blocking push returns when the queue has room again, as the console's
+				// output does. Wwise wakes its mixer after a push; one that returns while the queue
+				// is still full leaves the mixer asleep until a fallback timer (~140 ms).
+				while (blocking != 0) {
+					g_audioout2_state_mutex.Lock();
+					auto* current = audioout2_find_context_locked(ctx);
+					bool  room    = current == nullptr;
+					if (current != nullptr) {
+						audioout2_update_context_locked(current);
+						room = current->queued < current->queue_depth;
+					}
+					g_audioout2_state_mutex.Unlock();
+					if (room) {
+						break;
+					}
+					Common::Thread::SleepMicro(std::max(sleep_micros / 4, 1000u));
+				}
 				return OK;
 			}
 		}
