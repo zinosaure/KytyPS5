@@ -551,6 +551,15 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		     graphics.mesh_shader_properties.maxMeshSharedMemorySize);
 	}
 	// Device selection checks the other required features.
+	// On the console too (LOGF is silent by default): the paths this device takes. A phone GPU
+	// differs from the desktop ones Kyty is tested on.
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "Vulkan device paths: mesh_shader={} subgroup={}/{}/{} wave64={} shared_int64_atomics={} "
+	    "depth_feedback={} provoking_vertex_last={}\n",
+	    graphics.mesh_shader_enabled, graphics.subgroup_size, graphics.min_subgroup_size,
+	    graphics.max_subgroup_size, graphics.SupportsComputeWave64(),
+	    features12.shaderSharedInt64Atomics != VK_FALSE, graphics.attachment_feedback_loop_enabled,
+	    graphics.provoking_vertex_last_enabled));
 	EXIT_NOT_IMPLEMENTED(supported2.features.shaderInt64 != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported2.features.vertexPipelineStoresAndAtomics != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported2.features.dualSrcBlend != VK_TRUE);

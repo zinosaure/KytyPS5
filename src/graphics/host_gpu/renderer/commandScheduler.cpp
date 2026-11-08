@@ -3,12 +3,18 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
+#include <fmt/format.h>
 #include <optional>
+#include <string>
+#include <unwind.h>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -361,7 +367,31 @@ bool CommandScheduler::IsFree(uint64_t tick) {
 	return m_master.IsFree(tick);
 }
 
+namespace {
+
+_Unwind_Reason_Code CollectFrame(_Unwind_Context* context, void* frames) {
+	auto* list = static_cast<std::vector<uintptr_t>*>(frames);
+	if (list->size() >= 32) {
+		return _URC_END_OF_STACK;
+	}
+	list->push_back(static_cast<uintptr_t>(_Unwind_GetIP(context)));
+	return _URC_NO_REASON;
+}
+
+} // namespace
+
 void CommandScheduler::CheckActive() const {
+	if (!Active()) {
+		// The fatal error below names only this line. The return addresses say which caller
+		// used the scheduler before its first Begin (addr2line on the build, minus its base).
+		std::vector<uintptr_t> frames;
+		_Unwind_Backtrace(CollectFrame, &frames);
+		std::string text = "CommandScheduler used before Begin; backtrace:";
+		for (const auto ip: frames) {
+			text += fmt::format(" {:#x}", ip);
+		}
+		Log::WriteToConsoleAndLog(text + "\n");
+	}
 	EXIT_IF(!Active());
 }
 

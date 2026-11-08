@@ -478,6 +478,8 @@ int wmain(int argc, wchar_t* argv[]) {
 #else
 
 int main(int argc, char* argv[]) {
+	// GameFlex: a line at a time, or what a frozen game did last stays in the buffer of a pipe.
+	std::setvbuf(stdout, nullptr, _IOLBF, 0);
     return Main(argc, argv);
 }
 
