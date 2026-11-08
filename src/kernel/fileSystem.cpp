@@ -462,10 +462,18 @@ static std::string UnrealProject(const std::string& command_line) {
 	return project;
 }
 
+// GameFlex: does the game's preset give the size of its images itself (PS5.DefaultBackBufferWidth in
+// KYTY_UE_ENGINE_SETTINGS)? Otherwise the console's output resolution does (UnrealSavedConfig).
+static bool UnrealPresetGivesSize() {
+	const char* preset = std::getenv("KYTY_UE_ENGINE_SETTINGS");
+	return preset != nullptr && std::string_view(preset).find("PS5.DefaultBackBufferWidth=") != std::string_view::npos;
+}
+
 // GameFlex: the r.ScreenPercentage that gives the scene height KYTY_UE_RENDER_HEIGHT asks for, 0 if
-// none. The engine counts it from the game's output: 1080p for a game that declares it adapts to the
-// screen (FF7 Remake), 4K for the others (KH3), which keep it whatever screen they are told about.
-// A game that renders below its output says so in its own settings (KYTY_UE_RENDER_BASE: Wukong).
+// none. The engine counts it from the game's output, the console's output resolution: Unreal games take it
+// through their back buffer size (UnrealSavedConfig), FF7 Remake reads it from the console. A game that
+// renders below its output says so in its own settings (KYTY_UE_RENDER_BASE: 540, 1080 or 2160), written
+// for a 1080p console: it follows the console's resolution, unless the preset gives the output size itself.
 static unsigned long UnrealScreenPercentage() {
 	static const char* requested = std::getenv("KYTY_UE_RENDER_HEIGHT");
 	if (requested == nullptr) {
@@ -480,10 +488,11 @@ static unsigned long UnrealScreenPercentage() {
 	if (const char* declared = std::getenv("KYTY_UE_RENDER_BASE"); declared != nullptr) {
 		base = std::strtoul(declared, nullptr, 10);
 	}
-	if (base != 1080 && base != 2160) {
-		int32_t attribute3 = 0;
-		Loader::SystemContentParamSfoGetInt("ATTRIBUTE3", &attribute3);
-		base = (attribute3 & 4) != 0 ? 1080 : 2160;
+	const unsigned long console_height = Common::GameFlex::ConsoleOutputHeight();
+	if (base != 540 && base != 1080 && base != 2160) {
+		base = console_height;
+	} else if (!UnrealPresetGivesSize()) {
+		base = base * console_height / 1080;
 	}
 	const auto percent = (height * 100 + base / 2) / base;
 	// GameFlex: the scene that percentage gives, for the window title (16:9 from the base height).
@@ -536,11 +545,20 @@ static void UnrealSavedConfig(const std::string& guest_path, const std::filesyst
 	const std::string size      = "r.ScreenPercentage=";
 	const std::string secondary = "r.SecondaryScreenPercentage.GameViewport=";
 	const std::string dynamic   = "r.DynamicRes.OperationMode=";
+	const std::string bb_width  = "PS5.DefaultBackBufferWidth=";
+	const std::string bb_height = "PS5.DefaultBackBufferHeight=";
 	const auto        percent   = UnrealScreenPercentage();
 	const auto        existing = read_file(path);
 	auto              settings = timeout + "0\n";
 	if (percent != 0) {
 		settings += UnrealRenderVariable() + "=" + std::to_string(percent) + "\n" + dynamic + "0\n";
+	}
+	// GameFlex: the console's output resolution, as the size of the images the game hands to the console. A 1080p
+	// console writes 1920x1080 unless the game's preset gives its own size; a 4K console leaves the game's default.
+	const bool preset_size    = UnrealPresetGivesSize();
+	const auto console_height = Common::GameFlex::ConsoleOutputHeight();
+	if (console_height == 1080 && !preset_size) {
+		settings += bb_width + "1920\n" + bb_height + "1080\n";
 	}
 	// GameFlex: the engine settings a game's preset declares (KYTY_UE_ENGINE_SETTINGS, "a=1;b=2"). The
 	// engine may rewrite the file without comments, so the names written last time stay beside it:
@@ -584,7 +602,8 @@ static void UnrealSavedConfig(const std::string& guest_path, const std::filesyst
 		const auto next     = line_end == std::string::npos ? existing.size() : line_end + 1;
 		const std::string_view line(existing.data() + line_begin, next - line_begin);
 		if (!line.starts_with(timeout) && !line.starts_with(size) && !line.starts_with(secondary) &&
-		    !line.starts_with(dynamic) && !is_written_before(line)) {
+		    !line.starts_with(dynamic) && !line.starts_with(bb_width) && !line.starts_with(bb_height) &&
+		    !is_written_before(line)) {
 			content += line;
 		}
 		line_begin = next;
@@ -594,9 +613,10 @@ static void UnrealSavedConfig(const std::string& guest_path, const std::filesyst
 	} else {
 		content = header + settings + "\n" + content;
 	}
-	std::printf("Unreal saved config: garbage collection timeout off, render size %lu %%, engine settings %zu (%s)\n",
-	            percent, static_cast<size_t>(std::count(names.begin(), names.end(), '\n')),
-	            Common::PathToString(path).c_str());
+	std::printf("Unreal saved config: garbage collection timeout off, console output %up%s, render size %lu %%, "
+	            "engine settings %zu (%s)\n",
+	            console_height, preset_size ? " (the preset gives its own size)" : "", percent,
+	            static_cast<size_t>(std::count(names.begin(), names.end(), '\n')), Common::PathToString(path).c_str());
 	if (content == existing) {
 		g_mount_points->SetUnrealSavedConfig(project);
 		return;

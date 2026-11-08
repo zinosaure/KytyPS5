@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
+#include "common/gameflexStatus.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -1698,15 +1699,13 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 		return VIDEO_OUT_ERROR_INVALID_HANDLE;
 	}
 
-	int32_t attribute3 = 0;
-	Loader::SystemContentParamSfoGetInt("ATTRIBUTE3", &attribute3);
 	int32_t attribute = 0;
 	const bool hdr_allowed = !Loader::SystemContentParamSfoGetInt("ATTRIBUTE", &attribute) ||
 	                         (attribute & 0x20000000) != 0;
 	ctx->mutex.Lock();
-	// Primary output reports 4K unless param.json Video-out Info enables resolution detection.
-	status->resolution =
-	    ((attribute3 & 4) != 0 && driver.width < 3840 && driver.height < 2160 ? 1u : 2u);
+	// GameFlex: the console's output resolution is a setting, the same answer for every game (1: 1080p, 2: 4K), as
+	// on a console set to that resolution. It used to be 4K unless param.json enabled resolution detection.
+	status->resolution = Common::GameFlex::ConsoleOutputHeight() >= 2160 ? 2u : 1u;
 	status->dynamicRange = hdr_allowed && driver.IsHdrSupported() ? 2u : 1u;
 	status->refreshRate =
 	    (ctx->output_mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ || Config::GetVblankFrequency() >= 119
