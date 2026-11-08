@@ -15,6 +15,7 @@
 #include "libs/network.h"
 
 #include <algorithm>
+#include <cctype>
 #include <string>
 #include <cstdlib>
 #include <atomic>
@@ -428,6 +429,58 @@ bool IsOpenDescriptor(int d) {
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
+// GameFlex: gc.EnableTimeoutOnPendingDestroyedObjectInShipping=0 in the saved config of an Unreal
+// game, the last layer the engine reads (/download0/<project>/saved/ps5/engine.ini; it keeps the
+// section when it rewrites the file). Wukong has no -ini: or -dpcvars= switch. The engine aborts
+// itself when a garbage collection has run over 10 s and objects still wait for the render thread;
+// here the render thread can spend longer than that on a level's new shaders: it is slow, not stuck.
+// Written when the game reads its command line, before it loads its config.
+static void UnrealSavedConfig(const std::string& guest_path, const std::filesystem::path& real_name) {
+	if (!guest_path.starts_with("/app0/") || !guest_path.ends_with("commandline.txt")) {
+		return;
+	}
+	const auto read_file = [](const std::filesystem::path& path) {
+		std::string  content;
+		Common::File file;
+		if (file.Open(path, Common::File::Mode::Read)) {
+			content.resize(file.Size());
+			file.Read(content.data(), static_cast<uint32_t>(content.size()));
+			file.Close();
+		}
+		return content;
+	};
+	// ../../../<project>/<project>.uproject
+	const std::string prefix       = "../../../";
+	const auto        command_line = read_file(real_name);
+	const auto        begin        = command_line.find(prefix);
+	const auto        end          = begin == std::string::npos
+	                                     ? std::string::npos
+	                                     : command_line.find('/', begin + prefix.size());
+	if (end == std::string::npos) {
+		return;
+	}
+	auto project = command_line.substr(begin + prefix.size(), end - begin - prefix.size());
+	std::transform(project.begin(), project.end(), project.begin(),
+	               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+	const auto directory = GetRealFilename("/download0/" + project + "/saved/ps5");
+	std::error_code error;
+	std::filesystem::create_directories(directory, error);
+	const auto        path     = directory / "engine.ini";
+	const std::string option   = "gc.EnableTimeoutOnPendingDestroyedObjectInShipping=0";
+	const auto        existing = read_file(path);
+	if (existing.find(option) != std::string::npos) {
+		return;
+	}
+	const auto   content = "[SystemSettings]\n" + option + "\n\n" + existing;
+	Common::File file;
+	if (!file.Create(path)) {
+		return;
+	}
+	file.Write(content.data(), static_cast<uint32_t>(content.size()));
+	file.Close();
+	std::printf("Unreal garbage collection timeout: off (%s)\n", Common::PathToString(path).c_str());
+}
+
 // GameFlex: KYTY_UE_SCREEN_PERCENTAGE=<n> adds r.ScreenPercentage=<n> to the command line an Unreal
 // game reads at start (/app0/ue4commandline.txt, /app0/uecommandline.txt): the engine renders its
 // scene at <n> % of its output, as its own settings would. The game reads a host copy; its files are
@@ -540,6 +593,7 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		return KERNEL_ERROR_ENOENT;
 	}
 	if (rw_mode == Common::File::Mode::Read && !directory) {
+		UnrealSavedConfig(file->name, file->real_name);
 		if (auto copy = UnrealCommandLine(file->name, file->real_name); !copy.empty()) {
 			file->real_name = std::move(copy);
 		}
