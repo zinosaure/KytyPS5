@@ -31,11 +31,19 @@ public:
 	void Refresh();
 	void Wait(uint64_t tick);
 
+	// Where the GPU is, as the word it writes at the end of each command buffer says (SetProgressWord), or as
+	// the driver says when it writes none. Execution only: the writes of that work may still sit in the GPU's
+	// caches, so memory is read and resources are reused after KnownGpuTick, which the kernel signals once the
+	// caches are written back. For the decisions of the scheduler, which asking the driver cost a system call.
+	void                   SetProgressWord(const uint32_t* word) noexcept { m_progress_word = word; }
+	[[nodiscard]] uint64_t Progress();
+
 private:
 	GraphicContext&       m_graphics;
 	vk::Semaphore         m_semaphore = nullptr;
 	std::atomic<uint64_t> m_gpu_tick {0};
 	std::atomic<uint64_t> m_current_tick {1};
+	const uint32_t*       m_progress_word = nullptr; // the low word of the last tick the GPU finished
 };
 
 } // namespace Libs::Graphics

@@ -8,12 +8,15 @@
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <thread>
 #include <vector>
 
 namespace Libs::Graphics {
+
+class Buffer;
 
 class CommandScheduler {
 public:
@@ -107,6 +110,9 @@ private:
 	// the buffer to whoever records: a label, a transfer, a draw).
 	uint32_t m_commands_recorded = 0;
 	bool     m_buffer_used       = false;
+	// The word the GPU writes at the end of each command buffer with the buffer's tick (VK_AMD_buffer_marker):
+	// where the GPU is, read from memory (MasterSemaphore::Progress).
+	std::unique_ptr<Buffer> m_progress;
 	std::condition_variable      m_operation_available;
 	std::jthread                 m_priority_thread;
 	uint64_t                     m_priority_active_tick = 0; // 0 while none runs

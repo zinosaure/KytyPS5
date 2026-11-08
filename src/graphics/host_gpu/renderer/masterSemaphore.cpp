@@ -4,6 +4,8 @@
 #include "common/debugCounters.h"
 #include "graphics/host_gpu/graphicContext.h"
 
+#include <algorithm>
+
 namespace Libs::Graphics {
 
 MasterSemaphore::MasterSemaphore(GraphicContext& graphics): m_graphics(graphics) {
@@ -32,6 +34,22 @@ void MasterSemaphore::Refresh() {
 	       !m_gpu_tick.compare_exchange_weak(known, counter, std::memory_order_release,
 	                                         std::memory_order_relaxed)) {
 	}
+}
+
+uint64_t MasterSemaphore::Progress() {
+	if (m_progress_word == nullptr) {
+		Refresh();
+		return KnownGpuTick();
+	}
+	const uint64_t low     = __atomic_load_n(m_progress_word, __ATOMIC_ACQUIRE);
+	const uint64_t current = CurrentTick();
+	// The word holds the low half of a tick already handed out, below current: the high half is current's,
+	// or the one before when the low half wrapped since.
+	uint64_t progress = (current & ~uint64_t {0xffffffffu}) | low;
+	if (progress >= current) {
+		progress -= uint64_t {1} << 32u;
+	}
+	return std::max(KnownGpuTick(), progress);
 }
 
 void MasterSemaphore::Wait(uint64_t tick) {

@@ -4,8 +4,10 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <algorithm>
+#include <cstring>
 #include <optional>
 
 namespace Libs::Graphics {
@@ -78,7 +80,18 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
     : m_master(graphics), m_context(context), m_graphics(graphics),
       m_command_pool(graphics, m_master), m_command(*this),
-      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
+      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
+	if (graphics.buffer_marker_enabled) {
+		m_progress = std::make_unique<Buffer>(graphics, *this, MemoryUsage::Download, 0,
+		                                      vk::BufferUsageFlagBits::eTransferDst, 64);
+		if (m_progress->IsCoherent() && !m_progress->Mapped().empty()) {
+			std::memset(m_progress->Mapped().data(), 0, m_progress->Mapped().size());
+			m_master.SetProgressWord(reinterpret_cast<const uint32_t*>(m_progress->Mapped().data()));
+		} else {
+			m_progress.reset();
+		}
+	}
+}
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
@@ -159,11 +172,10 @@ void CommandScheduler::Recorded() {
 	if (m_commands_recorded % kFeedCommands != 0) {
 		return;
 	}
-	// Buffers submitted and not finished, as the GPU reports now. One in flight and nothing behind it: this one
-	// goes now, so the GPU finds the next job in its queue when it ends the current one, instead of waiting for
-	// the kernel to wake up and hand it over (0.6 ms a time, measured).
-	m_master.Refresh();
-	const uint64_t queued = CurrentTick() - 1 - m_master.KnownGpuTick();
+	// Buffers submitted and not finished, as the GPU says now. One in flight and nothing behind it: this one goes
+	// now, so the GPU finds the next job in its queue when it ends the current one, instead of waiting for the
+	// kernel to wake up and hand it over (0.6 ms a time, measured).
+	const uint64_t queued = CurrentTick() - 1 - m_master.Progress();
 	if (queued <= 1 || m_commands_recorded >= kFullCommands) {
 		Flush();
 	}
@@ -173,7 +185,7 @@ bool CommandScheduler::FlushAtBoundary() {
 	if (!Active() || m_command.IsInvalid() || !m_buffer_used) {
 		return false;
 	}
-	const uint64_t queued = CurrentTick() - 1 - m_master.KnownGpuTick();
+	const uint64_t queued = CurrentTick() - 1 - m_master.Progress();
 	if (queued >= 2 && m_commands_recorded < kFullCommands) {
 		return false;
 	}
@@ -365,16 +377,22 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(m_command.IsInvalid());
 
+	// This thread alone hands out ticks and submits: the order of the two is the same.
+	const auto tick = m_master.NextTick();
+	if (m_progress != nullptr) {
+		// Where the GPU is, for the CPU to read: this buffer's tick, written once all its work is done.
+		m_command.EndRendering();
+		m_command.Handle().writeBufferMarker2AMD(vk::PipelineStageFlagBits2::eAllCommands,
+		                                          m_progress->Handle(), 0, static_cast<uint32_t>(tick));
+	}
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;
 	auto&      graphics = m_graphics;
 	EXIT_IF(graphics.queue == nullptr);
 
 	vk::Result result;
-	uint64_t   tick;
 	{
 		Common::LockGuard lock(graphics.queue_mutex);
-		tick = m_master.NextTick();
 		submit.AddSignal(m_master.Handle(), tick);
 
 		vk::TimelineSemaphoreSubmitInfo timeline_info {};
