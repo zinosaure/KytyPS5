@@ -11,11 +11,30 @@ PendingGpuWrites::FirstEndingAfter(uint64_t address) const noexcept {
 	                        [](uint64_t value, const Range& range) { return value < range.end; });
 }
 
+void PendingGpuWrites::MarkBlocks(uint64_t start, uint64_t end) noexcept {
+	const auto first = start >> BlockBits;
+	const auto last  = (end - 1) >> BlockBits;
+	if (last - first >= BlockCount - 1) {
+		m_blocks.fill(~uint64_t {0});
+		return;
+	}
+	for (auto block = first; block <= last; block++) {
+		const auto bit = block % BlockCount;
+		m_blocks[bit / 64] |= uint64_t {1} << (bit % 64);
+	}
+}
+
+void PendingGpuWrites::Clear() noexcept {
+	m_ranges.clear();
+	m_blocks.fill(0);
+}
+
 void PendingGpuWrites::Add(uint64_t address, uint64_t size, uint64_t tick) {
 	if (size == 0) {
 		return;
 	}
 	const uint64_t end = address + size;
+	MarkBlocks(address, end);
 	// The first range that ends at or after the new one starts: it touches or overlaps it, or comes after.
 	auto first = std::lower_bound(m_ranges.begin(), m_ranges.end(), address,
 	                              [](const Range& range, uint64_t value) { return range.end < value; });
@@ -40,10 +59,21 @@ void PendingGpuWrites::Expire(uint64_t done_tick) {
 		return;
 	}
 	m_expired_tick = done_tick;
+	const auto before = m_ranges.size();
 	std::erase_if(m_ranges, [done_tick](const Range& range) { return range.tick <= done_tick; });
+	if (m_ranges.size() == before) {
+		return;
+	}
+	m_blocks.fill(0);
+	for (const auto& range: m_ranges) {
+		MarkBlocks(range.start, range.end);
+	}
 }
 
 const PendingGpuWrites::Range* PendingGpuWrites::Find(uint64_t address) const noexcept {
+	if (!MaybeTouched(address)) {
+		return nullptr;
+	}
 	const auto it = FirstEndingAfter(address);
 	return it != m_ranges.end() && it->start <= address ? &*it : nullptr;
 }
@@ -51,6 +81,16 @@ const PendingGpuWrites::Range* PendingGpuWrites::Find(uint64_t address) const no
 bool PendingGpuWrites::Intersects(uint64_t address, uint64_t size) const noexcept {
 	if (size == 0) {
 		return false;
+	}
+	// A small read asks the blocks first; a large one goes straight to the search.
+	if (const auto first = address >> BlockBits, last = (address + size - 1) >> BlockBits; last - first < 4) {
+		bool touched = false;
+		for (auto block = first; block <= last && !touched; block++) {
+			touched = MaybeTouched(block << BlockBits);
+		}
+		if (!touched) {
+			return false;
+		}
 	}
 	const auto it = FirstEndingAfter(address);
 	return it != m_ranges.end() && it->start < address + size;
