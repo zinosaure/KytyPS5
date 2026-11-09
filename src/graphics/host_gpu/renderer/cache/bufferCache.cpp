@@ -1089,15 +1089,19 @@ constexpr uint64_t kSpeculationRangeBytes    = 256; // a counter, not a table th
 
 void BufferCache::VerifySrtSpeculations() {
 	const auto done = m_scheduler.GetMasterSemaphore().KnownGpuTick();
-	for (auto& [address, speculation]: m_srt_speculation) {
-		if (speculation.verify_tick == 0 || speculation.verify_tick > done) {
-			continue;
+	std::erase_if(m_srt_verifications, [&](uint64_t address) {
+		auto& speculation = m_srt_speculation[address];
+		if (speculation.verify_tick == 0) {
+			return true;
+		}
+		if (speculation.verify_tick > done) {
+			return false;
 		}
 		speculation.verify_tick = 0;
 		uint32_t landed = 0;
 		if (!LibKernel::Memory::TryReadBacking(address, &landed, sizeof(landed)) ||
 		    landed == speculation.used) {
-			continue;
+			return true;
 		}
 		speculation.trusted       = false;
 		speculation.confirmations = 0;
@@ -1109,7 +1113,8 @@ void BufferCache::VerifySrtSpeculations() {
 			            landed, address, speculation.used,
 			            speculation.revoked ? " from now on" : " until it holds still for longer");
 		}
-	}
+		return true;
+	});
 }
 
 bool BufferCache::FinishPendingGpuWritesUnder(std::span<const uint64_t> addresses) {
@@ -1118,7 +1123,7 @@ bool BufferCache::FinishPendingGpuWritesUnder(std::span<const uint64_t> addresse
 		return false;
 	}
 	m_pending_gpu_writes.Expire(m_scheduler.GetMasterSemaphore().KnownGpuTick());
-	if (!m_srt_speculation.empty()) {
+	if (!m_srt_verifications.empty()) {
 		VerifySrtSpeculations();
 	}
 	if (m_pending_gpu_writes.Empty()) {
@@ -1135,6 +1140,7 @@ bool BufferCache::FinishPendingGpuWritesUnder(std::span<const uint64_t> addresse
 			if (LibKernel::Memory::TryReadBacking(address, &used, sizeof(used))) {
 				if (speculation.verify_tick == 0) {
 					speculation.used = used;
+					m_srt_verifications.push_back(address);
 				}
 				speculation.verify_tick = std::max(speculation.verify_tick, range->tick);
 				continue;
@@ -1171,20 +1177,24 @@ constexpr uint32_t kFlagConfirmations = 4;
 
 void BufferCache::VerifyFlagSpeculations() {
 	const auto done = m_scheduler.GetMasterSemaphore().KnownGpuTick();
-	for (auto& [address, flag]: m_flag_speculation) {
-		if (flag.verify_tick == 0 || flag.verify_tick > done) {
-			continue;
+	std::erase_if(m_flag_verifications, [&](uint64_t address) {
+		auto& flag = m_flag_speculation[address];
+		if (flag.verify_tick == 0) {
+			return true;
+		}
+		if (flag.verify_tick > done) {
+			return false;
 		}
 		const auto verify_tick = flag.verify_tick;
 		flag.verify_tick       = 0;
 		// A shader recorded later may write it again: nothing to say then.
 		if (const auto* range = m_pending_gpu_writes.Find(address); range != nullptr && range->tick > verify_tick) {
-			continue;
+			return true;
 		}
 		uint64_t landed = 0;
 		if (!LibKernel::Memory::TryReadBacking(address, &landed, flag.size) ||
 		    TestWaitRegMemValue(landed, flag.ref, flag.mask, flag.func)) {
-			continue;
+			return true;
 		}
 		flag.trusted = false;
 		flag.revoked = true;
@@ -1194,7 +1204,8 @@ void BufferCache::VerifyFlagSpeculations() {
 			            "the wait wanted 0x%" PRIx64 "; this address waits again from now on\n",
 			            address, landed, flag.ref);
 		}
-	}
+		return true;
+	});
 }
 
 bool BufferCache::TrustPendingGpuWrite(uint64_t vaddr, uint64_t size, uint32_t func, uint64_t ref, uint64_t mask) {
@@ -1202,7 +1213,7 @@ bool BufferCache::TrustPendingGpuWrite(uint64_t vaddr, uint64_t size, uint32_t f
 		return false;
 	}
 	m_pending_gpu_writes.Expire(m_scheduler.GetMasterSemaphore().KnownGpuTick());
-	if (!m_flag_speculation.empty()) {
+	if (!m_flag_verifications.empty()) {
 		VerifyFlagSpeculations();
 	}
 	const auto* range = m_pending_gpu_writes.Find(vaddr);
@@ -1221,6 +1232,9 @@ bool BufferCache::TrustPendingGpuWrite(uint64_t vaddr, uint64_t size, uint32_t f
 	flag.size        = static_cast<uint32_t>(size);
 	flag.ref         = ref;
 	flag.mask        = mask;
+	if (flag.verify_tick == 0) {
+		m_flag_verifications.push_back(vaddr);
+	}
 	flag.verify_tick = std::max(flag.verify_tick, range->tick);
 	return true;
 }

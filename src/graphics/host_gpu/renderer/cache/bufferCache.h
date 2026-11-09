@@ -237,6 +237,10 @@ private:
 	// The ranges bound for writing in command buffers the GPU has not finished.
 	PendingGpuWrites                                  m_pending_gpu_writes;
 	std::unordered_map<uint64_t, SrtSpeculation>      m_srt_speculation;
+	// The words and addresses whose prediction waits to be checked, with the GPU tick in their entry: the checks
+	// walk these, not every address ever seen (a ring of flags grows the maps for good).
+	std::vector<uint64_t>                             m_srt_verifications;
+	std::vector<uint64_t>                             m_flag_verifications;
 	struct FlagSpeculation {
 		uint32_t confirmations = 0;
 		bool     waiting       = false; // suspended on a pending shader write, value not found yet
