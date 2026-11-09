@@ -1150,6 +1150,87 @@ bool BufferCache::FinishPendingGpuWritesUnder(std::span<const uint64_t> addresse
 	return false;
 }
 
+// The command processor's own comparison (graphicsRun.cpp).
+bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func);
+
+// Astro Bot's graphics queue waits about nine times an image for a flag its compute work sets to 1, each time
+// submitting, then polling until the GPU wrote it: 35 ms an image, the GPU and the thread taking turns. The
+// compute work is recorded before, on the same Vulkan queue: the wait needs only a barrier, if the flag lands.
+namespace {
+constexpr uint32_t kFlagConfirmations = 4;
+} // namespace
+
+void BufferCache::VerifyFlagSpeculations() {
+	const auto done = m_scheduler.GetMasterSemaphore().KnownGpuTick();
+	for (auto& [address, flag]: m_flag_speculation) {
+		if (flag.verify_tick == 0 || flag.verify_tick > done) {
+			continue;
+		}
+		const auto verify_tick = flag.verify_tick;
+		flag.verify_tick       = 0;
+		// A shader recorded later may write it again: nothing to say then.
+		if (const auto* range = m_pending_gpu_writes.Find(address); range != nullptr && range->tick > verify_tick) {
+			continue;
+		}
+		uint64_t landed = 0;
+		if (!LibKernel::Memory::TryReadBacking(address, &landed, flag.size) ||
+		    TestWaitRegMemValue(landed, flag.ref, flag.mask, flag.func)) {
+			continue;
+		}
+		flag.trusted = false;
+		flag.revoked = true;
+		static uint32_t misses = 0;
+		if (misses++ < 50) {
+			std::printf("Guest wait speculation: 0x%016" PRIx64 " holds 0x%" PRIx64 " once the shader's work is done, "
+			            "the wait wanted 0x%" PRIx64 "; this address waits again from now on\n",
+			            address, landed, flag.ref);
+		}
+	}
+}
+
+bool BufferCache::TrustPendingGpuWrite(uint64_t vaddr, uint64_t size, uint32_t func, uint64_t ref, uint64_t mask) {
+	if (m_pending_gpu_writes.Empty()) {
+		return false;
+	}
+	m_pending_gpu_writes.Expire(m_scheduler.GetMasterSemaphore().KnownGpuTick());
+	if (!m_flag_speculation.empty()) {
+		VerifyFlagSpeculations();
+	}
+	const auto* range = m_pending_gpu_writes.Find(vaddr);
+	if (range == nullptr) {
+		return false;
+	}
+	auto& flag = m_flag_speculation[vaddr];
+	if (flag.revoked) {
+		return false;
+	}
+	if (!flag.trusted) {
+		flag.waiting = true;
+		return false;
+	}
+	flag.func        = func;
+	flag.size        = static_cast<uint32_t>(size);
+	flag.ref         = ref;
+	flag.mask        = mask;
+	flag.verify_tick = std::max(flag.verify_tick, range->tick);
+	return true;
+}
+
+void BufferCache::GuestWaitPassed(uint64_t vaddr) {
+	if (m_flag_speculation.empty()) {
+		return;
+	}
+	const auto found = m_flag_speculation.find(vaddr);
+	if (found == m_flag_speculation.end() || !found->second.waiting) {
+		return;
+	}
+	auto& flag   = found->second;
+	flag.waiting = false;
+	if (!flag.revoked && ++flag.confirmations >= kFlagConfirmations) {
+		flag.trusted = true;
+	}
+}
+
 bool BufferCache::TakeUnifiedGpuWrites(uint64_t vaddr, uint64_t size) {
 	if (!m_unified_gpu_writes.Intersects(vaddr, size)) {
 		return false;

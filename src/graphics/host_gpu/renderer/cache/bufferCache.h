@@ -107,6 +107,14 @@ public:
 		uint64_t verify_tick   = 0;     // the GPU work it skipped waiting for; 0 when nothing is to verify
 	};
 	void VerifySrtSpeculations();
+	// GameFlex: a guest wait (WAIT_REG_MEM) for a value a shader recorded before will write. The GPU runs the
+	// stream in order: behind a barrier, everything recorded after the wait runs after that shader, which is all
+	// the wait asks, as long as the shader writes the value. An address is trusted once four waits there ended
+	// with the value; each trusted wait is checked when the writer's work is done, and a miss revokes the
+	// address for good. True: the wait may go on.
+	[[nodiscard]] bool TrustPendingGpuWrite(uint64_t vaddr, uint64_t size, uint32_t func, uint64_t ref, uint64_t mask);
+	// The guest wait at vaddr found its value in memory.
+	void GuestWaitPassed(uint64_t vaddr);
 	// Unified memory: whether the GPU wrote [vaddr, vaddr + size) since the last call for it. GPU
 	// writes leave no fault: a reader that keeps its own copy (the image heap) asks.
 	[[nodiscard]] bool TakeUnifiedGpuWrites(uint64_t vaddr, uint64_t size);
@@ -226,6 +234,19 @@ private:
 	// The ranges bound for writing in command buffers the GPU has not finished.
 	PendingGpuWrites                                  m_pending_gpu_writes;
 	std::unordered_map<uint64_t, SrtSpeculation>      m_srt_speculation;
+	struct FlagSpeculation {
+		uint32_t confirmations = 0;
+		bool     waiting       = false; // suspended on a pending shader write, value not found yet
+		bool     trusted       = false;
+		bool     revoked       = false; // once wrong, never trusted again
+		uint32_t func          = 0;     // the last trusted wait's condition, checked at verify_tick
+		uint32_t size          = 0;
+		uint64_t ref           = 0;
+		uint64_t mask          = 0;
+		uint64_t verify_tick   = 0;     // the writer's work; 0 when nothing is to verify
+	};
+	void VerifyFlagSpeculations();
+	std::unordered_map<uint64_t, FlagSpeculation>     m_flag_speculation;
 	// Ranges bound for writing that no TakeUnifiedGpuWrites has taken yet, and all of them.
 	RangeSet                                          m_unified_gpu_writes;
 	RangeSet                                          m_unified_gpu_written;
