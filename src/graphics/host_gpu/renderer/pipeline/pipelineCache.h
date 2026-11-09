@@ -221,6 +221,9 @@ private:
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		// A deque: a module compiled aside keeps its address while the program gains another.
 		std::deque<ShaderModule>                     modules;
+		// The module found last: consecutive draws of a program mostly want the same one, and comparing the
+		// specialization with every module in turn cost 1.2 % of the command thread in Astro Bot.
+		ShaderModule*                                last_module   = nullptr;
 		bool                                         skip_dispatch = false;
 
 		[[nodiscard]] std::span<const uint32_t> FunctionCode() const;
