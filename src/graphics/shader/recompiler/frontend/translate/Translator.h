@@ -250,6 +250,13 @@ private:
 	void S_WQM(const Decoder::Instruction& inst, bool wide);
 	void V_MOVRELS_B32(const Decoder::Instruction& inst);
 	void V_MOVRELD_B32(const Decoder::Instruction& inst);
+	// The registers from the base up to the shader's last one, put after the element M0 names; in_range is false
+	// past them, where the element is the base's.
+	struct VgprIndex {
+		IR::U32 token;
+		IR::U1  in_range;
+	};
+	VgprIndex VgprIndexBegin(uint32_t base);
 	void V_READFIRSTLANE_B32(const Decoder::Instruction& inst);
 	void V_READLANE_B32(const Decoder::Instruction& inst);
 	void V_WRITELANE_B32(const Decoder::Instruction& inst);

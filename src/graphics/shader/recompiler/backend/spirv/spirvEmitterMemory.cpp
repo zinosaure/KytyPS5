@@ -1708,6 +1708,100 @@ uint32_t EmitGetBufferResourceIndex(ValueEmitContext& ctx, const IR::Inst& inst)
 	                                 buffer.indirect_search_iterations, UINT32_MAX);
 }
 
+// GameFlex: an M0-indexed VGPR access (VgprIndex*, spirvEmitterInternal.h for the parts). The token is the element
+// the access names; a register is put at its position, and the element read or written in every part at its
+// offset there, clamped to the part's first register when the element is not in it.
+namespace {
+uint32_t VgprIndexPointer(ValueEmitContext& ctx, size_t part, uint32_t offset) {
+	auto&      state   = ctx.state;
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+	                          pointer, state.vgpr_index_parts[ctx.half][part], offset);
+	return pointer;
+}
+
+uint32_t VgprIndexPositionPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
+	const auto position = inst.Arg(1).U32();
+	return VgprIndexPointer(ctx, position / VgprIndexPart, ConstantU32(ctx.state, position % VgprIndexPart));
+}
+
+struct VgprIndexSlot {
+	uint32_t pointer = 0;
+	uint32_t in_part = 0; // 0 when there is one part
+};
+
+std::vector<VgprIndexSlot> VgprIndexSlots(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&      state   = ctx.state;
+	const auto element = ctx.Arg(inst, 0);
+	const auto parts   = state.vgpr_index_parts[ctx.half].size();
+	if (parts == 1) {
+		return {{VgprIndexPointer(ctx, 0, element)}};
+	}
+	std::vector<VgprIndexSlot> slots;
+	for (size_t part = 0; part < parts; part++) {
+		const auto offset  = state.builder.AllocateId();
+		const auto in_part = state.builder.AllocateId();
+		const auto clamped = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpISub, TypeU32(state), offset, element,
+		                          ConstantU32(state, static_cast<uint32_t>(part) * VgprIndexPart));
+		state.builder.AddFunction(spv::OpULessThan, TypeBool(state), in_part, offset,
+		                          ConstantU32(state, VgprIndexPartSize(state.program, part)));
+		state.builder.AddFunction(spv::OpSelect, TypeU32(state), clamped, in_part, offset, ConstantU32(state, 0));
+		slots.push_back({VgprIndexPointer(ctx, part, clamped), in_part});
+	}
+	return slots;
+}
+} // namespace
+
+void EmitVgprIndexBegin(ValueEmitContext& ctx, const IR::Inst& inst) {
+	ctx.Define(inst, ctx.Arg(inst, 0));
+}
+
+void EmitVgprIndexPut(ValueEmitContext& ctx, const IR::Inst& inst) {
+	ctx.state.builder.AddFunction(spv::OpStore, VgprIndexPositionPointer(ctx, inst), ctx.Arg(inst, 2));
+	ctx.Define(inst, ctx.Arg(inst, 0));
+}
+
+void EmitVgprIndexGet(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&    builder = ctx.state.builder;
+	uint32_t value   = 0;
+	for (const auto& slot: VgprIndexSlots(ctx, inst)) {
+		const auto loaded = builder.AllocateId();
+		builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), loaded, slot.pointer);
+		if (value == 0) {
+			value = loaded;
+			continue;
+		}
+		const auto selected = builder.AllocateId();
+		builder.AddFunction(spv::OpSelect, TypeU32(ctx.state), selected, slot.in_part, loaded, value);
+		value = selected;
+	}
+	ctx.Define(inst, value);
+}
+
+void EmitVgprIndexSet(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&      builder = ctx.state.builder;
+	const auto value   = ctx.Arg(inst, 1);
+	for (const auto& slot: VgprIndexSlots(ctx, inst)) {
+		auto stored = value;
+		if (slot.in_part != 0) {
+			// A part the element is not in gets back what its clamped register holds.
+			const auto old = builder.AllocateId();
+			stored         = builder.AllocateId();
+			builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), old, slot.pointer);
+			builder.AddFunction(spv::OpSelect, TypeU32(ctx.state), stored, slot.in_part, value, old);
+		}
+		builder.AddFunction(spv::OpStore, slot.pointer, stored);
+	}
+	ctx.Define(inst, ctx.Arg(inst, 0));
+}
+
+void EmitVgprIndexTake(ValueEmitContext& ctx, const IR::Inst& inst) {
+	const auto value = ctx.state.builder.AllocateId();
+	ctx.state.builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), value, VgprIndexPositionPointer(ctx, inst));
+	ctx.Define(inst, value);
+}
+
 void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto  op  = inst.GetOpcode();
 	const auto& mem = ctx.Memory(inst);

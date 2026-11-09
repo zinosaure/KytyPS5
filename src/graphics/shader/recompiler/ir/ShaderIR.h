@@ -744,6 +744,8 @@ struct Program: ResourcePlan {
 	BlockList                           blocks;
 	uint32_t                      wave_size      = 64;
 	uint32_t                      scratch_dwords = 0;
+	// The most registers an M0-indexed access may reach (VgprIndexPut): the size of the local array it goes through.
+	uint32_t                      vgpr_index_registers = 0;
 	bool                          dispatcher_fallback = false;
 	struct ScalarWrite { uint32_t pc; ScalarReg reg; Value value; };
 	std::vector<ScalarWrite>      scalar_writes;

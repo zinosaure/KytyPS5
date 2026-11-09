@@ -25,6 +25,14 @@ VALUE_OPCODE(GetScalarRegister, U32, ScalarReg)
 VALUE_OPCODE(SetScalarRegister, Void, ScalarReg, U32)
 VALUE_OPCODE(GetVectorRegister, U32, VectorReg)
 VALUE_OPCODE(SetVectorRegister, Void, VectorReg, U32)
+// V_MOVRELS/V_MOVRELD: the element an M0-indexed access names (Begin) and the registers it may reach, put one
+// by one (Put: token, position, value); then the named element read (Get) or written (Set: token, value), and
+// the registers read back one by one (Take: token, position). Each returns the token the next one takes.
+VALUE_OPCODE(VgprIndexBegin, U32, U32)
+VALUE_OPCODE(VgprIndexPut, U32, U32, U32, U32)
+VALUE_OPCODE(VgprIndexGet, U32, U32)
+VALUE_OPCODE(VgprIndexSet, U32, U32, U32)
+VALUE_OPCODE(VgprIndexTake, U32, U32, U32)
 VALUE_OPCODE(GetGotoVariable, U1, U32)
 VALUE_OPCODE(SetGotoVariable, Void, U32, U1)
 VALUE_OPCODE(GetScc, U1)
