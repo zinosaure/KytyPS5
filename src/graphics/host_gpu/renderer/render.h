@@ -243,6 +243,19 @@ private:
 	RenderContext&                        m_context;
 	std::unordered_map<TextureBindingKey, CachedTextureBinding, TextureBindingKeyHash> m_texture_bindings;
 	std::array<ContinuedTarget, RENDER_COLOR_ATTACHMENTS_MAX> m_continued_targets;
+	// The depth target the draw before found, under the same conditions: its description and image depend on the
+	// depth registers alone (the depth and stencil tests are taken from their registers at every draw).
+	struct ContinuedDepth {
+		HW::DepthRenderTarget   registers;
+		bool                    valid     = false;
+		uint64_t                tick      = 0;
+		uint64_t                textures  = 0;
+		uint64_t                transfers = 0;
+		uint64_t                breaks    = 0;
+		TextureCache::ImageDesc desc;
+		ImageId                 image_id;
+	};
+	ContinuedDepth                                            m_continued_depth;
 	// Advances at every dispatch and at every draw spent on an image operation (metadata, copy, resolve).
 	uint64_t                                                  m_chain_breaks = 0;
 	GraphicsBindings                     m_graphics_bindings;
