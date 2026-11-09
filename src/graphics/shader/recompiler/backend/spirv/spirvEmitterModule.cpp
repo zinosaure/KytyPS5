@@ -723,6 +723,13 @@ void DefineModule(EmitterState& state) {
 			state.scratch_variable[half] = state.builder.AllocateId();
 		}
 	}
+	for (uint32_t half = 0; half < 2; half++) {
+		state.vgpr_index_parts[half].clear();
+		for (uint32_t part = 0; half < state.lane_count && part * VgprIndexPart < state.program.vgpr_index_registers;
+		     part++) {
+			state.vgpr_index_parts[half].push_back(state.builder.AllocateId());
+		}
+	}
 	state.main_func = state.builder.AllocateId();
 	if (state.program.stage == ShaderType::Mesh) {
 		state.mesh_guest_func = state.builder.AllocateId();

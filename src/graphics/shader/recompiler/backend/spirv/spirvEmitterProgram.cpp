@@ -704,6 +704,14 @@ void EmitProgram(EmitterState& state) {
 			    state.scratch_variable[half], spv::StorageClassFunction);
 		}
 	}
+	for (const auto& parts: state.vgpr_index_parts) {
+		for (size_t part = 0; part < parts.size(); part++) {
+			state.builder.AddFunction(
+			    spv::OpVariable,
+			    TypeU32ArrayPointer(state, spv::StorageClassFunction, VgprIndexPartSize(state.program, part)),
+			    parts[part], spv::StorageClassFunction);
+		}
+	}
 	if (state.pixel_valid_mask_variable != 0) {
 		state.builder.AddFunction(spv::OpVariable,
 		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),

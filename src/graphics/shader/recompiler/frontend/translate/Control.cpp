@@ -399,15 +399,26 @@ void Translator::V_MOVRELS_B32(const Decoder::Instruction& inst) {
 	    inst.src0.dpp) {
 		EXIT("V_MOVRELS_B32 modifiers are not implemented at pc 0x%08x", inst.pc);
 	}
-	const auto base     = inst.src0.reg;
-	const auto m0       = ir.BitwiseAnd(ReadU32(ConditionOperand(Decoder::OperandKind::M0)),
-	                                    IR::U32(IR::Value(0xffu)));
-	auto       selected = ir.GetVectorReg(static_cast<IR::VectorReg>(base));
-	for (uint32_t index = base + 1u; index < current_vector_limit; index++) {
-		const auto match = ir.IEqual(m0, IR::U32(IR::Value(index - base)));
-		selected = ir.Select(match, ir.GetVectorReg(static_cast<IR::VectorReg>(index)), selected);
+	// M0 is one value for the whole wave and the console reads a single register. Comparing M0 with every register
+	// above the base cost Astro Bot's foliage ~2 500 comparisons and selects a vertex, and RADV spilled their masks:
+	// the registers go through a local array instead, read once at the element M0 names.
+	const auto index = VgprIndexBegin(inst.src0.reg);
+	WriteOperand(DestinationOperand(inst), IR::U32(ir.Emit(IR::ValueOpcode::VgprIndexGet, {index.token})));
+}
+
+Translator::VgprIndex Translator::VgprIndexBegin(uint32_t base) {
+	const auto count   = current_vector_limit - base;
+	const auto m0      = ir.BitwiseAnd(ReadU32(ConditionOperand(Decoder::OperandKind::M0)),
+	                                   IR::U32(IR::Value(0xffu)));
+	const auto in_range = ir.ULessThan(m0, IR::U32(IR::Value(count)));
+	program.vgpr_index_registers = std::max(program.vgpr_index_registers, count);
+	auto token = IR::U32(ir.Emit(IR::ValueOpcode::VgprIndexBegin, {ir.Select(in_range, m0, IR::U32(IR::Value(0u)))}));
+	for (uint32_t position = 0; position < count; position++) {
+		token = IR::U32(ir.Emit(IR::ValueOpcode::VgprIndexPut,
+		                        {token, IR::Value(position),
+		                         ir.GetVectorReg(static_cast<IR::VectorReg>(base + position))}));
 	}
-	WriteOperand(DestinationOperand(inst), selected);
+	return {token, in_range};
 }
 
 void Translator::V_MOVRELD_B32(const Decoder::Instruction& inst) {
@@ -419,15 +430,17 @@ void Translator::V_MOVRELD_B32(const Decoder::Instruction& inst) {
 	    inst.src0.dpp) {
 		EXIT("V_MOVRELD_B32 modifiers are not implemented at pc 0x%08x", inst.pc);
 	}
+	// The registers through the local array, as for V_MOVRELS_B32: the element M0 names written where EXEC allows,
+	// past the shader's registers nothing.
 	const auto base  = inst.dst.reg;
 	const auto value = ReadU32(inst.src0);
-	const auto m0    = ir.BitwiseAnd(ReadU32(ConditionOperand(Decoder::OperandKind::M0)),
-	                                 IR::U32(IR::Value(0xffu)));
-	for (uint32_t index = base; index < current_vector_limit; index++) {
-		const auto reg   = static_cast<IR::VectorReg>(index);
-		const auto match = ir.IEqual(m0, IR::U32(IR::Value(index - base)));
-		const auto write = ir.LogicalAnd(ir.GetExec(), match);
-		ir.SetVectorReg(reg, ir.Select(write, value, ir.GetVectorReg(reg)));
+	const auto index = VgprIndexBegin(base);
+	const auto old   = IR::U32(ir.Emit(IR::ValueOpcode::VgprIndexGet, {index.token}));
+	const auto write = ir.LogicalAnd(ir.GetExec(), index.in_range);
+	const auto token = IR::U32(ir.Emit(IR::ValueOpcode::VgprIndexSet, {index.token, ir.Select(write, value, old)}));
+	for (uint32_t position = 0; base + position < current_vector_limit; position++) {
+		ir.SetVectorReg(static_cast<IR::VectorReg>(base + position),
+		                IR::U32(ir.Emit(IR::ValueOpcode::VgprIndexTake, {token, IR::Value(position)})));
 	}
 }
 

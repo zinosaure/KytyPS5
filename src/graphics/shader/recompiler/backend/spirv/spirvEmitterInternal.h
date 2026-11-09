@@ -134,6 +134,7 @@ struct EmitterState {
 	uint32_t                                         lds_variable            = 0;
 	uint32_t                                         lds_u64_variable        = 0;
 	std::array<uint32_t, 2>                          scratch_variable {};
+	std::array<std::vector<uint32_t>, 2>             vgpr_index_parts {}; // IR::Program::vgpr_index_registers, per half
 	std::array<ImageDefinition, IR::ImageBindingCount> images {};
 	std::array<ImageDefinition, IR::ImageBindingCount> heap_images {};
 	uint32_t                   sampler_variable                      = 0;
@@ -190,6 +191,15 @@ uint32_t TypeStorageBufferElementPointer(EmitterState& state, uint32_t bits = 32
 uint32_t TypePhysicalU32Pointer(EmitterState& state);
 uint32_t TypePushConstantElementPointer(EmitterState& state);
 uint32_t TypeU32ArrayPointer(EmitterState& state, spv::StorageClass storage_class, uint32_t dwords);
+
+// GameFlex: the local array an M0-indexed VGPR access goes through (VgprIndex*), in parts of at most this many
+// registers. RADV keeps a private array of up to 256 bytes in registers, its indexed accesses turned into a binary
+// tree of branches, and moves a larger one to scratch memory (ac_nir_lower_indirect_derefs): a 128-register array
+// cost a vertex shader of Astro Bot's garden 32 KiB of memory a wave.
+inline constexpr uint32_t VgprIndexPart = 64;
+inline uint32_t VgprIndexPartSize(const IR::Program& program, size_t part) {
+	return std::min(VgprIndexPart, program.vgpr_index_registers - static_cast<uint32_t>(part) * VgprIndexPart);
+}
 uint32_t TypeU32ElementPointer(EmitterState& state, spv::StorageClass storage_class);
 
 inline void EmitLabel(EmitterState& state, uint32_t label) {
