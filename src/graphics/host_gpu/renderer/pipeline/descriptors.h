@@ -46,6 +46,22 @@ struct PreparedBindings {
 	vk::DescriptorBufferInfo              shader_data_buffer;
 	vk::DescriptorBufferInfo              shared_memory;
 	std::vector<uint32_t>                 shader_data;
+
+	// What these images and samplers were resolved from, for the draw after (RenderExecutor::PrepareBindings): the
+	// program, its image and sampler descriptors, and the state of the caches then. `continued` says this draw took
+	// them again as they were.
+	struct Chain {
+		const void*                                         module = nullptr;
+		std::vector<ShaderRecompiler::IR::DescriptorValue> images;
+		std::vector<ShaderRecompiler::IR::DescriptorValue> samplers;
+		uint64_t                                            tick      = 0;
+		uint64_t                                            textures  = 0; // TextureCache::Epoch
+		uint64_t                                            transfers = 0; // BufferCache::Transfers
+		uint64_t                                            breaks    = 0; // RenderExecutor's chain breaks
+		bool                                                valid     = false;
+	};
+	Chain chain;
+	bool  continued = false;
 };
 
 [[nodiscard]] vk::DescriptorType

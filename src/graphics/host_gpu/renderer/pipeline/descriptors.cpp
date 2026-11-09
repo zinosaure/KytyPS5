@@ -742,24 +742,51 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.flattened_srt = {};
 	prepared.shader_data_buffer = {};
 	prepared.shared_memory = {};
-	prepared.images.resize(program.info.images.size());
-	prepared.samplers.clear();
 	prepared.shader_data.clear();
-	for (uint32_t i = 0; i < program.info.images.size(); i++) {
-		if (program.info.images[i].heap) {
-			prepared.images[i] = {};
-			continue;
+	// Astro Bot's draws repeat the program and the image and sampler descriptors of the draw before, stage by
+	// stage (80 % of vertex stages, 55 % of pixel stages), and resolving each texture again cost most of the
+	// 11.5 ms an image of texture work. As for the color targets (0081), the images and samplers are taken again
+	// as they are when nothing but register writes came between the two draws.
+	auto&      texture_cache = m_context.GetTextureCache();
+	auto&      buffer_cache  = m_context.GetBufferCache();
+	auto&      chain         = prepared.chain;
+	const auto tick          = m_context.GetCommandScheduler().CurrentTick();
+	prepared.continued = chain.valid && chain.module == runtime.module && chain.tick == tick &&
+	                     chain.breaks == m_chain_breaks && chain.textures == texture_cache.Epoch() &&
+	                     chain.transfers == buffer_cache.Transfers() && chain.images == snapshot.images &&
+	                     chain.samplers == snapshot.samplers;
+	if (prepared.continued) {
+		for (uint32_t i = 0; i < program.info.images.size(); i++) {
+			BindImage(prepared.images[i].image_id,
+			          prepared.images[i].desc.type == TextureCache::BindingType::Storage);
 		}
-		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
-		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
-		binding.mip_views.swap(prepared.images[i].mip_views);
-		binding.mip_views.clear();
-		prepared.images[i] = std::move(binding);
-	}
-	prepared.samplers.reserve(program.info.samplers.size());
-	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
-		prepared.samplers.push_back(NativeSampler(
-		    m_context, program, i, snapshot.samplers[program.info.samplers[i].snapshot_index]));
+	} else {
+		prepared.images.resize(program.info.images.size());
+		prepared.samplers.clear();
+		for (uint32_t i = 0; i < program.info.images.size(); i++) {
+			if (program.info.images[i].heap) {
+				prepared.images[i] = {};
+				continue;
+			}
+			auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
+			BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
+			binding.mip_views.swap(prepared.images[i].mip_views);
+			binding.mip_views.clear();
+			prepared.images[i] = std::move(binding);
+		}
+		prepared.samplers.reserve(program.info.samplers.size());
+		for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
+			prepared.samplers.push_back(NativeSampler(
+			    m_context, program, i, snapshot.samplers[program.info.samplers[i].snapshot_index]));
+		}
+		chain.module    = runtime.module;
+		chain.images    = snapshot.images;
+		chain.samplers  = snapshot.samplers;
+		chain.tick      = m_context.GetCommandScheduler().CurrentTick();
+		chain.textures  = texture_cache.Epoch();
+		chain.transfers = buffer_cache.Transfers();
+		chain.breaks    = m_chain_breaks;
+		chain.valid     = true;
 	}
 	prepared.shader_data.reserve(program.bindings.ShaderDataDwords());
 	for (const auto reg: program.info.user_data_registers) {
@@ -876,7 +903,12 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		if (!images[i].image_id) continue;
 		auto& old_image = texture_cache.m_slot_images[images[i].image_id];
+		// Taken again from the draw before (PrepareBindings): the same image, its views already found.
+		if (prepared.continued && old_image.registered && !old_image.binding.needs_rebind) {
+			continue;
+		}
 		if (!old_image.registered || old_image.binding.needs_rebind) {
+			prepared.chain.valid = false;
 			old_image.binding = {};
 			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
 			BindImage(images[i].image_id,
