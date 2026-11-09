@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/renderDraw.h"
+#include "common/commandThreadProfile.h"
 #include "gpu_blit_shaders/gpu_mesh_indirect_spv.h"
 
 #include "common/assert.h"
@@ -459,6 +460,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
                                                  uint32_t color_count, RenderDepthInfo& depth,
                                                  vk::ImageAspectFlags& feedback_aspects,
                                                  std::span<PreparedBindings* const> stages) {
+	Common::CommandThreadProfile::Scope ctp_profile(Common::CommandThreadProfile::Cause::Targets);
 	EXIT_IF(colors == nullptr || color_count > RENDER_COLOR_ATTACHMENTS_MAX);
 	feedback_aspects = {};
 	auto&       cache = m_context.GetTextureCache();
@@ -677,6 +679,7 @@ struct PreparedVertexBuffers {
 
 static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               buffer,
                                                   const ShaderVertexInputInfo& vs_input_info) {
+	Common::CommandThreadProfile::Scope ctp_profile(Common::CommandThreadProfile::Cause::Buffers);
 	EXIT_IF(vs_input_info.buffers_num < 0 ||
 	        vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX);
 
@@ -903,6 +906,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 
 static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffer,
                                               const DrawIndexBufferSource& source) {
+	Common::CommandThreadProfile::Scope ctp_profile(Common::CommandThreadProfile::Cause::Buffers);
 	PreparedIndexBuffer prepared;
 	if (source.size == 0) {
 		return prepared;
@@ -1219,6 +1223,8 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	}
 	// The barrier the game asked for since the last one, if any: a draw that writes memory in a run the game
 	// did not synchronize runs unordered with it, as on the console.
+	Common::CommandThreadProfile::Scope ctp_record(Common::CommandThreadProfile::Cause::Record);
+	Common::CommandThreadProfile::Count(Common::CommandThreadProfile::Event::Draws);
 	buffer.PostGuestBarrier();
 	buffer.BeginRendering(rendering);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);

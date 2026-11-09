@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "common/commandThreadProfile.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -232,6 +233,8 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	if (barriers.empty()) {
 		return;
 	}
+	Common::CommandThreadProfile::Scope ctp_barrier(Common::CommandThreadProfile::Cause::Barriers);
+	Common::CommandThreadProfile::Count(Common::CommandThreadProfile::Event::Barriers);
 	m_scheduler.EndRendering();
 	vk::DependencyInfo dependency {};
 	dependency.imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size());

@@ -95,6 +95,7 @@ struct ConfigOptions {
 	bool                   trophy_enabled              = true;
 	uint32_t               trophy_duration_seconds     = 6;
 	bool                   perf_overlay_enabled            = false;
+	uint32_t               perf_log_seconds                = 0;
 	bool                   playgo_hack_enabled         = false;
 	bool                   skip_notice_screen          = false;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -164,6 +165,8 @@ bool SyncRawImageBuffersEnabled();
 bool TessellationEnabled();
 bool OcclusionQueriesEnabled();
 bool CoarseShadingEnabled();
+// Seconds between two command-thread reports in the log; 0: none (--perf-log).
+uint32_t PerfLogSeconds();
 bool TrophyEnabled();
 uint32_t GetTrophyDurationSeconds();
 bool PlayGoHackEnabled();

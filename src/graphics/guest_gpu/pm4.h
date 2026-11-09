@@ -899,6 +899,9 @@ constexpr uint32_t UC_NOP = 0xA2;
 
 constexpr uint32_t UC_NUM = 0x3FFF + 1;
 
+// The name of a type-3 opcode, as in packet dumps ("IT_SET_CONTEXT_REG").
+[[nodiscard]] const char* OpcodeName(uint32_t opcode);
+
 void DumpPm4PacketStream(Common::File* file, const uint32_t* cmd_buffer, uint32_t start_dw,
                          uint32_t num_dw);
 

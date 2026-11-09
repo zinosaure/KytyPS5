@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "common/commandThreadProfile.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -44,6 +45,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
                                               uint32_t rt_slot, bool ignore_target_mask,
                                               bool exact_format) {
 	KYTY_PROFILER_FUNCTION();
+	Common::CommandThreadProfile::Scope ctp_profile(Common::CommandThreadProfile::Cause::Targets);
 	const auto& hw = buffer.GetRegisters();
 
 	const auto& rt      = hw.GetRenderTarget(rt_slot);

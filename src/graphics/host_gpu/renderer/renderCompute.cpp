@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "common/commandThreadProfile.h"
 #include "common/common.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
@@ -440,6 +441,8 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		}
 	}
 
+	Common::CommandThreadProfile::Scope ctp_record(Common::CommandThreadProfile::Cause::Record);
+	Common::CommandThreadProfile::Count(Common::CommandThreadProfile::Event::Dispatches);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	constexpr uint32_t DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE = 1u << 3u;
 	const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
@@ -519,6 +522,8 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	const auto vk_buffer = buffer.Handle();
 	// The barrier the game asked for since the last one, if any (GuestSync): it makes the indirect arguments
 	// visible too, the game synchronizes before a dispatch whose arguments the GPU wrote.
+	Common::CommandThreadProfile::Scope ctp_record(Common::CommandThreadProfile::Cause::Record);
+	Common::CommandThreadProfile::Count(Common::CommandThreadProfile::Event::Dispatches);
 	m_context.GetGuestSync().PostDue(vk_buffer);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);

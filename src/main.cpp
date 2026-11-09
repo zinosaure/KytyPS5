@@ -86,6 +86,8 @@ static void PrintUsage() {
 	::printf(
 	    "  --trophy-duration <seconds>          Trophy toast duration, 5-10. Default: 6.\n");
 	::printf("  --perf-overlay                       Show the performance panel (F2 or Cmd+P).\n");
+	::printf("  --perf-log <seconds>                 Print where the GPU command thread spends each frame\n"
+	         "                                       to the log every <seconds>. Default: 0 (never).\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
 	::printf("  --skip-notice-screen                 Skip startup logos and notices in supported games.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -380,6 +382,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		} else if (arg == "--gpu") {
 			if (!ParseInt32(value, options.config.gpu_index)) {
 				::printf("invalid gpu index: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--perf-log") {
+			if (!ParseUint32(value, options.config.perf_log_seconds)) {
+				::printf("invalid perf log period: %s\n", value.c_str());
 				return false;
 			}
 		} else if (arg == "--vblank-frequency") {

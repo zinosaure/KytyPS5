@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "common/commandThreadProfile.h"
 
 #if defined(__clang__)
 #pragma clang diagnostic push
@@ -44,6 +45,16 @@ bool GraphicContext::CreateAllocator() {
 		info.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
 	}
 
+	// GameFlex: Vulkan device memory - driver buffer objects - counted for the performance overlay.
+	static const VmaDeviceMemoryCallbacks memory_callbacks {
+	    .pfnAllocate = [](VmaAllocator, uint32_t, VkDeviceMemory, VkDeviceSize, void*) {
+		    Common::CommandThreadProfile::Count(Common::CommandThreadProfile::Event::MemoryAllocations);
+	    },
+	    .pfnFree = [](VmaAllocator, uint32_t, VkDeviceMemory, VkDeviceSize, void*) {
+		    Common::CommandThreadProfile::Count(Common::CommandThreadProfile::Event::MemoryReleases);
+	    },
+	    .pUserData = nullptr};
+	info.pDeviceMemoryCallbacks = &memory_callbacks;
 	const auto result = static_cast<vk::Result>(vmaCreateAllocator(&info, &allocator));
 	if (result != vk::Result::eSuccess) {
 		LOGF("vmaCreateAllocator failed: %s\n", vk::to_string(result).c_str());

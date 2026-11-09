@@ -29,7 +29,7 @@ void Load(const ConfigOptions& cfg) {
 	EXIT_IF(cfg.keyboard_player > static_cast<uint32_t>(MAX_PLAYERS));
 
 	*g_config = cfg;
-	Common::DebugCounters::SetEnabled(cfg.perf_overlay_enabled);
+	Common::DebugCounters::SetEnabled(cfg.perf_overlay_enabled || cfg.perf_log_seconds != 0);
 }
 
 uint32_t GetScreenWidth() {
@@ -219,6 +219,10 @@ bool OcclusionQueriesEnabled() {
 
 bool CoarseShadingEnabled() {
 	return g_config->coarse_shading_enabled;
+}
+
+uint32_t PerfLogSeconds() {
+	return g_config->perf_log_seconds;
 }
 
 bool TrophyEnabled() {

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "common/commandThreadProfile.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -340,6 +341,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
+	Common::CommandThreadProfile::Scope ctp_buffers(Common::CommandThreadProfile::Cause::Buffers);
 	if (vaddr == 0) {
 		return NULL_BUFFER_ID;
 	}
@@ -516,6 +518,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
+	Common::CommandThreadProfile::Scope ctp_buffers(Common::CommandThreadProfile::Cause::Buffers);
 	EXIT_IF(!(GuestRange {vaddr, size}.Valid()));
 
 	if (IsUnified()) {
@@ -918,6 +921,7 @@ bool BufferCache::BindUnified(uint64_t vaddr, uint64_t size) {
 
 void BufferCache::BindUnifiedPieces(uint64_t begin, uint64_t end,
                                     const std::vector<std::tuple<uint64_t, uint64_t, uint64_t>>& pieces) {
+	Common::CommandThreadProfile::WaitReasonScope ctp_reason(Common::CommandThreadProfile::WaitReason::Rebind);
 	// The GPU may still read the old views: let it finish before they change. A range the game
 	// has just mapped has none, and the GPU has nothing there to finish.
 	auto bound = m_unified_views.upper_bound(begin);
@@ -979,8 +983,11 @@ void BufferCache::BindUnifiedPieces(uint64_t begin, uint64_t end,
 		EXIT_NOT_IMPLEMENTED(m_graphics.queue.bindSparse(1, &info, m_unified_bind_fence) !=
 		                     vk::Result::eSuccess);
 	}
-	EXIT_NOT_IMPLEMENTED(m_graphics.device.waitForFences(1, &m_unified_bind_fence, VK_TRUE, UINT64_MAX) !=
-	                     vk::Result::eSuccess);
+	{
+		Common::CommandThreadProfile::Scope ctp_wait(Common::CommandThreadProfile::WaitCause());
+		EXIT_NOT_IMPLEMENTED(m_graphics.device.waitForFences(1, &m_unified_bind_fence, VK_TRUE, UINT64_MAX) !=
+		                     vk::Result::eSuccess);
+	}
 	EXIT_NOT_IMPLEMENTED(m_graphics.device.resetFences(1, &m_unified_bind_fence) != vk::Result::eSuccess);
 
 	// The record of what is bound.
@@ -1047,6 +1054,7 @@ void BufferCache::RecordUnifiedGpuWrite(uint64_t vaddr, uint64_t size) {
 
 void BufferCache::FinishPendingGpuWrites(uint64_t vaddr, uint64_t size) {
 	if (HasPendingGpuWrites(vaddr, size)) {
+		Common::CommandThreadProfile::WaitReasonScope ctp_reason(Common::CommandThreadProfile::WaitReason::Read);
 		m_scheduler.Finish();
 		m_pending_gpu_writes.Clear();
 	}
@@ -1096,6 +1104,7 @@ void BufferCache::VerifySrtSpeculations() {
 }
 
 bool BufferCache::FinishPendingGpuWritesUnder(std::span<const uint64_t> addresses) {
+	Common::CommandThreadProfile::WaitReasonScope ctp_reason(Common::CommandThreadProfile::WaitReason::Srt);
 	if (m_pending_gpu_writes.Empty()) {
 		return false;
 	}

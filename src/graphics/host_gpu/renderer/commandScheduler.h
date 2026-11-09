@@ -2,12 +2,15 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_COMMANDSCHEDULER_H_
 
 #include "common/common.h"
+#include "common/commandThreadProfile.h"
 #include "common/uniqueFunction.h"
 #include "graphics/host_gpu/renderer/dynamicState.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <array>
 #include <condition_variable>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -26,7 +29,7 @@ public:
 
 	void           Begin(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders);
 	void           EndRendering() { m_command.EndRendering(); }
-	void           Flush();
+	void           Flush(Common::CommandThreadProfile::Close reason = Common::CommandThreadProfile::Close::Other);
 	void           Flush(SubmitInfo& submit);
 	// A draw or a dispatch was recorded: the work goes to the GPU when it would otherwise run dry.
 	void           Recorded();
@@ -41,6 +44,9 @@ public:
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
 	// the priority runner cannot join itself.
 	void                      Shutdown();
+	// GameFlex: this scheduler feeds the performance overlay (CommandThreadProfile): why buffers close, and
+	// how long the GPU takes over each one, from timestamps at its begin and end.
+	void                      EnableProfile();
 	void                      Wait(uint64_t tick);
 	void                      PopPendingOperations();
 	void                      DrainPriorityOperations();
@@ -91,6 +97,7 @@ private:
 	};
 
 	void BeginNext();
+	void HarvestTimestamps();
 	void PriorityOperationsThread(std::stop_token stop);
 	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
@@ -117,6 +124,18 @@ private:
 	std::jthread                 m_priority_thread;
 	uint64_t                     m_priority_active_tick = 0; // 0 while none runs
 	OperationState               m_operation_state      = OperationState::Open;
+	// GameFlex: the instrument (EnableProfile).
+	static constexpr uint32_t                 kTimestampSlots = 256;
+	bool                                      m_profiled      = false;
+	Common::CommandThreadProfile::Close       m_close_reason  = Common::CommandThreadProfile::Close::Other;
+	vk::QueryPool                             m_timestamps    = nullptr;
+	double                                    m_timestamp_ns  = 1.0;
+	uint64_t                                  m_timestamp_mask = ~uint64_t {0};
+	std::array<uint64_t, kTimestampSlots>     m_timestamp_ticks {};
+	std::array<bool, kTimestampSlots>         m_timestamp_starved {}; // The GPU was dry when it was submitted.
+	std::deque<uint64_t>                      m_timestamp_pending;
+	uint64_t                                  m_last_end_tick = 0;
+	uint64_t                                  m_last_end      = 0;
 };
 
 } // namespace Libs::Graphics

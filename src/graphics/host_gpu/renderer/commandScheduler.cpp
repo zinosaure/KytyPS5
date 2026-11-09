@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "common/commandThreadProfile.h"
 #include "common/gameflexWatchdog.h"
 
 #include "common/assert.h"
@@ -95,6 +96,70 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
+	if (m_timestamps != nullptr) {
+		m_graphics.device.destroyQueryPool(m_timestamps, nullptr);
+	}
+}
+
+void CommandScheduler::EnableProfile() {
+	m_profiled         = true;
+	const auto& limits = m_graphics.GetPhysicalDeviceProperties().limits;
+	if (!m_graphics.host_query_reset_enabled || limits.timestampComputeAndGraphics == VK_FALSE) {
+		return;
+	}
+	const vk::QueryPoolCreateInfo info {.queryType = vk::QueryType::eTimestamp, .queryCount = 2 * kTimestampSlots};
+	if (m_graphics.device.createQueryPool(&info, nullptr, &m_timestamps) != vk::Result::eSuccess) {
+		m_timestamps = nullptr;
+		return;
+	}
+	m_graphics.device.resetQueryPool(m_timestamps, 0, 2 * kTimestampSlots);
+	m_timestamp_ns     = static_cast<double>(limits.timestampPeriod);
+	const auto queues = m_graphics.physical_device.getQueueFamilyProperties();
+	if (m_graphics.queue_family < queues.size()) {
+		const auto bits = queues[m_graphics.queue_family].timestampValidBits;
+		m_timestamp_mask = bits >= 64 ? ~uint64_t {0} : (uint64_t {1} << bits) - 1;
+	}
+}
+
+// The GPU's begin and end of each buffer it has finished: its busy time, and the gap since the previous one.
+void CommandScheduler::HarvestTimestamps() {
+	uint64_t   busy    = 0;
+	uint64_t   gap     = 0;
+	uint64_t   queued  = 0;
+	uint64_t   buffers = 0;
+	const auto done    = m_master.KnownGpuTick();
+	while (!m_timestamp_pending.empty() && m_timestamp_pending.front() <= done) {
+		const auto tick = m_timestamp_pending.front();
+		m_timestamp_pending.pop_front();
+		const auto slot = static_cast<uint32_t>(tick % kTimestampSlots);
+		if (m_timestamp_ticks[slot] != tick) {
+			continue;
+		}
+		std::array<uint64_t, 4> data {};
+		const auto result = m_graphics.device.getQueryPoolResults(
+		    m_timestamps, 2 * slot, 2, sizeof(data), data.data(), 2 * sizeof(uint64_t),
+		    vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWithAvailability);
+		if ((result != vk::Result::eSuccess && result != vk::Result::eNotReady) || data[1] == 0 || data[3] == 0) {
+			continue;
+		}
+		const auto begin = data[0] & m_timestamp_mask;
+		const auto end   = data[2] & m_timestamp_mask;
+		if (end >= begin) {
+			busy += end - begin;
+			buffers++;
+		}
+		if (m_last_end_tick + 1 == tick && begin > m_last_end) {
+			(m_timestamp_starved[slot] ? gap : queued) += begin - m_last_end;
+		}
+		m_last_end_tick = tick;
+		m_last_end      = end;
+	}
+	if (buffers != 0) {
+		Common::CommandThreadProfile::AddGpuTimes(static_cast<uint64_t>(static_cast<double>(busy) * m_timestamp_ns),
+		                                          static_cast<uint64_t>(static_cast<double>(gap) * m_timestamp_ns),
+		                                          static_cast<uint64_t>(static_cast<double>(queued) * m_timestamp_ns),
+		                                          buffers);
+	}
 }
 
 void CommandScheduler::Shutdown() {
@@ -150,7 +215,8 @@ void CommandScheduler::Begin(HW::Context& registers, HW::UserConfig& user_config
 	}
 }
 
-void CommandScheduler::Flush() {
+void CommandScheduler::Flush(Common::CommandThreadProfile::Close reason) {
+	m_close_reason = reason;
 	SubmitInfo submit;
 	Flush(submit);
 }
@@ -179,7 +245,7 @@ void CommandScheduler::Recorded() {
 	// Buffers submitted and not finished, as the GPU says now. None: the GPU is dry, this one goes now.
 	const uint64_t queued = CurrentTick() - 1 - m_master.Progress();
 	if (queued == 0 || m_commands_recorded >= kFullCommands) {
-		Flush();
+		Flush(queued == 0 ? Common::CommandThreadProfile::Close::GpuIdle : Common::CommandThreadProfile::Close::Size);
 	}
 }
 
@@ -192,7 +258,7 @@ bool CommandScheduler::FlushAtBoundary() {
 	const uint64_t queued = CurrentTick() - 1 - m_master.Progress();
 	if (queued == 0 || (queued == 1 && m_commands_recorded >= kBoundaryCommands) ||
 	    m_commands_recorded >= kFullCommands) {
-		Flush();
+		Flush(m_commands_recorded >= kFullCommands ? Common::CommandThreadProfile::Close::Size : Common::CommandThreadProfile::Close::Boundary);
 		return true;
 	}
 	return false;
@@ -201,7 +267,7 @@ bool CommandScheduler::FlushAtBoundary() {
 void CommandScheduler::FlushBeforeIdle() {
 	// Before the first Begin, or after a reset, nothing can have been recorded.
 	if (Active() && !m_command.IsInvalid() && m_buffer_used) {
-		Flush();
+		Flush(Common::CommandThreadProfile::Close::BeforeIdle);
 	}
 }
 
@@ -213,6 +279,7 @@ void CommandScheduler::Flush(SubmitInfo& submit) {
 void CommandScheduler::Finish() {
 	CheckActive();
 	if (!m_command.IsInvalid()) {
+		m_close_reason = Common::CommandThreadProfile::Close::Wait;
 		Submit();
 	}
 	m_master.Wait(CurrentTick() - 1);
@@ -228,6 +295,7 @@ void CommandScheduler::Wait(uint64_t tick) {
 		// A stream-buffer wrap can wait while a draw is being prepared through a reference to
 		// Current(). The wrapper stays stable while its pooled Vulkan buffer is retired. Deferred
 		// resources are released only at the next GPU operation boundary.
+		m_close_reason            = Common::CommandThreadProfile::Close::Wait;
 		const auto submitted_tick = Submit();
 		EXIT_IF(submitted_tick != tick);
 		m_master.Wait(tick);
@@ -336,6 +404,7 @@ void CommandScheduler::DrainPriorityOperations() {
 
 void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
 	EXIT_IF(g_deferred_callback_scheduler == this);
+	Common::CommandThreadProfile::Scope ctp_wait(Common::CommandThreadProfile::Cause::WaitGpuPriority);
 	std::unique_lock lock(m_operation_mutex);
 	m_operation_available.wait(lock, [this, tick] {
 		const bool active_before_or_at =
@@ -372,14 +441,30 @@ CommandBuffer& CommandScheduler::Current() {
 }
 
 CommandBuffer& CommandScheduler::BeginCommand() {
+	Common::CommandThreadProfile::Scope ctp_submit(Common::CommandThreadProfile::Cause::Submit);
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
 	m_dynamic_state.Invalidate();
+	if (m_profiled && Common::DebugCounters::Enabled()) {
+		Common::CommandThreadProfile::Count(Common::CommandThreadProfile::Event::CommandBuffers);
+		if (m_timestamps != nullptr) {
+			HarvestTimestamps();
+			// This buffer's tick is the next one handed out; its slot was last used 256 buffers ago.
+			const auto tick = CurrentTick();
+			const auto slot = static_cast<uint32_t>(tick % kTimestampSlots);
+			if (m_timestamp_ticks[slot] == 0 || m_master.IsFree(m_timestamp_ticks[slot])) {
+				m_graphics.device.resetQueryPool(m_timestamps, 2 * slot, 2);
+				m_command.Handle().writeTimestamp2(vk::PipelineStageFlagBits2::eNone, m_timestamps, 2 * slot);
+				m_timestamp_ticks[slot] = tick;
+			}
+		}
+	}
 	return m_command;
 }
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
+	Common::CommandThreadProfile::Scope ctp_submit_scope(Common::CommandThreadProfile::Cause::Submit);
 	EXIT_IF(m_command.IsInvalid());
 
 	// This thread alone hands out ticks and submits: the order of the two is the same.
@@ -390,6 +475,13 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		m_command.Handle().writeBufferMarker2AMD(vk::PipelineStageFlagBits2::eAllCommands,
 		                                          m_progress->Handle(), 0, static_cast<uint32_t>(tick));
 	}
+	if (const auto slot = static_cast<uint32_t>(tick % kTimestampSlots);
+	    m_timestamps != nullptr && m_timestamp_ticks[slot] == tick) {
+		m_command.EndRendering();
+		m_command.Handle().writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, m_timestamps, 2 * slot + 1);
+		m_timestamp_pending.push_back(tick);
+		m_timestamp_starved[slot] = tick == m_master.Progress() + 1;
+	}
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;
 	auto&      graphics = m_graphics;
@@ -397,7 +489,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 	vk::Result result;
 	{
+		Common::CommandThreadProfile::Phase(Common::CommandThreadProfile::Cause::WaitQueueLock);
 		Common::LockGuard lock(graphics.queue_mutex);
+		Common::CommandThreadProfile::Phase(Common::CommandThreadProfile::Cause::Submit);
 		submit.AddSignal(m_master.Handle(), tick);
 
 		vk::TimelineSemaphoreSubmitInfo timeline_info {};
@@ -424,6 +518,11 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		EXIT("vkQueueSubmit failed: %s, tick=%" PRIu64 "\n", vk::to_string(result).c_str(), tick);
 	}
 
+	if (m_profiled) {
+		Common::CommandThreadProfile::CountClose(m_close_reason);
+		Common::CommandThreadProfile::Count(Common::CommandThreadProfile::Event::Submits);
+	}
+	m_close_reason      = Common::CommandThreadProfile::Close::Other;
 	m_command.m_buffer  = nullptr;
 	m_commands_recorded = 0;
 	m_buffer_used       = false;
