@@ -311,7 +311,14 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	     rc.depth_clear_enable || rc.stencil_clear_enable)) {
 		DepthFatal("unsupported depth-to-color copy state");
 	}
-	r.desc = MakeDepthTargetDesc(buffer, z);
+	auto&      cache        = m_context.GetTextureCache();
+	auto&      buffer_cache = m_context.GetBufferCache();
+	auto&      continued    = m_continued_depth;
+	const bool continues    = continued.valid &&
+	                       continued.tick == m_context.GetCommandScheduler().CurrentTick() &&
+	                       continued.breaks == m_chain_breaks && continued.textures == cache.Epoch() &&
+	                       continued.transfers == buffer_cache.Transfers() && continued.registers == z;
+	r.desc = continues ? continued.desc : MakeDepthTargetDesc(buffer, z);
 	r.depth_clear_enable      = rc.depth_clear_enable;
 	r.depth_clear_value       = hw.GetDepthClearValue();
 	r.depth_test_enable       = dc.z_enable;
@@ -348,9 +355,21 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 			r.stencil_back = r.stencil_front;
 		}
 	}
-	auto& cache = m_context.GetTextureCache();
+	if (continues) {
+		r.image_id = continued.image_id;
+		BindRenderTarget(r.image_id);
+		return;
+	}
 	r.image_id = cache.FindImage(r.desc);
 	BindRenderTarget(r.image_id);
+	continued = {z,
+	             true,
+	             m_context.GetCommandScheduler().CurrentTick(),
+	             cache.Epoch(),
+	             buffer_cache.Transfers(),
+	             m_chain_breaks,
+	             r.desc,
+	             r.image_id};
 }
 
 bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {

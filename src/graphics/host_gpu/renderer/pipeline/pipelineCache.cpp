@@ -291,17 +291,26 @@ ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::Srt
                                                  uint32_t push_data_cursor) {
 	EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
 	                                                    specialization));
-	for (auto& candidate: modules) {
+	const auto matches = [&](const ShaderModule& candidate) {
 		const auto& layout = candidate.info.bindings;
 		if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
 		        push_data_cursor, layout.ShaderDataDwords()) ||
 		    candidate.specialization != specialization) {
-			continue;
+			return false;
 		}
 		if constexpr (HasCalls) {
-			if (!std::ranges::equal(candidate.function_code, FunctionCode())) continue;
+			if (!std::ranges::equal(candidate.function_code, FunctionCode())) return false;
 		}
-		return &candidate;
+		return true;
+	};
+	if (last_module != nullptr && matches(*last_module)) {
+		return last_module;
+	}
+	for (auto& candidate: modules) {
+		if (&candidate != last_module && matches(candidate)) {
+			last_module = &candidate;
+			return &candidate;
+		}
 	}
 	return nullptr;
 }

@@ -36,6 +36,7 @@ public:
 	// caches, so memory is read and resources are reused after KnownGpuTick, which the kernel signals once the
 	// caches are written back. For the decisions of the scheduler, which asking the driver cost a system call.
 	void                   SetProgressWord(const uint32_t* word) noexcept { m_progress_word = word; }
+	[[nodiscard]] bool     HasProgressWord() const noexcept { return m_progress_word != nullptr; }
 	[[nodiscard]] uint64_t Progress();
 
 private:

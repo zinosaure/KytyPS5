@@ -231,6 +231,7 @@ void TextureCache::RegisterImage(ImageId id) {
 }
 
 void TextureCache::TouchGenerations(uint64_t address, uint64_t size) noexcept {
+	m_epoch++;
 	const uint64_t last = (address + size - 1) >> GenerationBlockBits;
 	for (uint64_t block = address >> GenerationBlockBits; block <= last; block++) {
 		m_block_generations[block & (GenerationBlocks - 1u)]++;
