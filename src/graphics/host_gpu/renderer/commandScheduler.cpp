@@ -308,12 +308,18 @@ void CommandScheduler::Wait(uint64_t tick) {
 void CommandScheduler::PopPendingOperations() {
 	// GameFlex: this runs at every draw, and asking the driver where the GPU is costs a system call
 	// (vkGetSemaphoreCounterValue, an ioctl): 9 % of the command thread in Kingdom Hearts III. Ask only
-	// when the oldest pending operation is not already known to be done, and at most once every 16
-	// calls; these operations wait for the GPU anyway, a few draws later changes nothing.
+	// when the oldest pending operation is not already known to be done, and when the word the GPU writes
+	// at the end of each command buffer (0064) says it is: with the GPU behind, as in Astro Bot's garden,
+	// asking once every 16 draws still cost 1.6 % of the thread for nothing. The semaphore decides. Without
+	// that word, once every 16 calls; these operations wait for the GPU anyway.
 	{
 		std::lock_guard lock(m_operation_mutex);
-		if (m_pending_operations.empty() ||
-		    (!m_master.IsFree(m_pending_operations.front().tick) && (++m_refresh_skips & 15u) != 0)) {
+		if (m_pending_operations.empty()) {
+			return;
+		}
+		const auto tick = m_pending_operations.front().tick;
+		if (!m_master.IsFree(tick) && (m_master.HasProgressWord() ? m_master.Progress() < tick
+		                                                          : (++m_refresh_skips & 15u) != 0)) {
 			return;
 		}
 	}
