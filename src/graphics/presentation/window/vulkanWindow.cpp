@@ -405,11 +405,12 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	                   vk::PhysicalDeviceShaderClockFeaturesKHR,
 	                   vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT,
 	                   vk::PhysicalDeviceConditionalRenderingFeaturesEXT,
-	                   vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR>
+	                   vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR,
+	                   vk::PhysicalDeviceFragmentShadingRateFeaturesKHR>
 	    supported;
 	auto& [supported2, supported12, supported13, robustness2, workgroup_layout, mesh,
 	       feedback_layout, feedback_dynamic, provoking_vertex, maintenance8, shader_clock,
-	       image_atomic_int64, conditional_rendering, barycentric] = supported;
+	       image_atomic_int64, conditional_rendering, barycentric, shading_rate] = supported;
 	graphics.memory_budget_ext_enabled = add(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 	graphics.buffer_marker_enabled     = add(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
 	add(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
@@ -445,6 +446,11 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	}
 	if (!add(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME)) {
 		supported.unlink<vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR>();
+	}
+	// Coarse shading takes the extension only when it is asked for: the dynamic state it adds to
+	// every graphics pipeline would otherwise cost something for nothing.
+	if (!Config::CoarseShadingEnabled() || !add(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME)) {
+		supported.unlink<vk::PhysicalDeviceFragmentShadingRateFeaturesKHR>();
 	}
 	if (Libs::LibKernel::Memory::UnifiedMemoryFd() >= 0 &&
 	    HasExtension(available_extensions, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME) &&
@@ -527,6 +533,10 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		    std::lround(graphics.physical_device_properties.limits.timestampPeriod * 1000.0f));
 	}
 	graphics.conditional_rendering_enabled = conditional_rendering.conditionalRendering;
+	graphics.coarse_shading_enabled =
+	    Config::CoarseShadingEnabled() && shading_rate.pipelineFragmentShadingRate;
+	LOGF("Vulkan coarse shading (2x2 in draws twice the window height): %s\n",
+	     graphics.coarse_shading_enabled ? "true" : "false");
 	LOGF("Vulkan maintenance8 support: %s\n",
 	     graphics.maintenance8_enabled ? "true" : "false");
 	LOGF("Vulkan depth feedback support: %s\n",
@@ -627,6 +637,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	    vk::PhysicalDeviceMeshShaderFeaturesEXT {.taskShader = VK_TRUE, .meshShader = VK_TRUE},
 	    feedback_layout, feedback_dynamic, provoking_vertex, image_atomic_int64, maintenance8,
 	    shader_clock, conditional_rendering,
+	    vk::PhysicalDeviceFragmentShadingRateFeaturesKHR {.pipelineFragmentShadingRate = VK_TRUE},
 	    // The renderer only uses the Vulkan 1.3 core dynamic states, but RADV (Mesa 26.3) creates
 	    // its PS epilog cache only when this EXT feature is enabled and crashes in vkCmdDraw when
 	    // a depth- or stencil-writing fragment shader needs an epilog.
@@ -661,6 +672,9 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	}
 	if (!graphics.conditional_rendering_enabled) {
 		create.unlink<vk::PhysicalDeviceConditionalRenderingFeaturesEXT>();
+	}
+	if (!graphics.coarse_shading_enabled) {
+		create.unlink<vk::PhysicalDeviceFragmentShadingRateFeaturesKHR>();
 	}
 	if (!extended_dynamic_state) {
 		create.unlink<vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>();

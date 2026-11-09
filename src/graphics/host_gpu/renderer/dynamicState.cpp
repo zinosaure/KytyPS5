@@ -2,9 +2,26 @@
 
 #include "graphics/host_gpu/graphicContext.h"
 
+#include <cmath>
+
 namespace Libs::Graphics {
 
 void DynamicState::Commit(const GraphicContext& graphics, vk::CommandBuffer cmdbuf) {
+	if (graphics.coarse_shading_enabled) {
+		// The window is the size the image is shown at: a draw at least twice as tall gives four
+		// shaded pixels for each one shown, so it shades one in four. Smaller draws stay exact.
+		const bool coarse = num_viewports != 0 && graphics.screen_height != 0 &&
+		                    std::abs(viewports[0].height) >= 2.0f * static_cast<float>(graphics.screen_height);
+		if (dirty_state.shading_rate || coarse != coarse_shading) {
+			dirty_state.shading_rate = false;
+			coarse_shading           = coarse;
+			const vk::Extent2D                         size(coarse ? 2 : 1, coarse ? 2 : 1);
+			const vk::FragmentShadingRateCombinerOpKHR combiners[2] = {
+			    vk::FragmentShadingRateCombinerOpKHR::eKeep,
+			    vk::FragmentShadingRateCombinerOpKHR::eKeep};
+			cmdbuf.setFragmentShadingRateKHR(&size, combiners);
+		}
+	}
 	if (dirty_state.viewports) {
 		dirty_state.viewports = false;
 		cmdbuf.setViewportWithCount(num_viewports, viewports.data());

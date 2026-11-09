@@ -341,6 +341,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	if (graphics.attachment_feedback_loop_enabled) {
 		dynamic_states.push_back(vk::DynamicState::eAttachmentFeedbackLoopEnableEXT);
 	}
+	if (graphics.coarse_shading_enabled) {
+		dynamic_states.push_back(vk::DynamicState::eFragmentShadingRateKHR);
+	}
 
 	vk::PipelineDynamicStateCreateInfo dynamic_state {};
 	dynamic_state.dynamicStateCount = static_cast<uint32_t>(dynamic_states.size());
