@@ -78,6 +78,8 @@ public:
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
+	// Advances at every fill and copy (DMA_DATA): memory the GPU writes outside shaders.
+	[[nodiscard]] uint64_t Transfers() const noexcept { return m_transfers; }
 	// Unified memory: the guest's memory is imported, and buffers over it are views of it,
 	// with nothing to upload, protect or download.
 	[[nodiscard]] bool IsUnified() const noexcept { return m_unified_memory != nullptr; }
@@ -241,6 +243,7 @@ private:
 	// The words and addresses whose prediction waits to be checked, with the GPU tick in their entry: the checks
 	// walk these, not every address ever seen (a ring of flags grows the maps for good).
 	std::vector<uint64_t>                             m_srt_verifications;
+	uint64_t                                          m_transfers = 0;
 	struct FlagSpeculation {
 		uint32_t confirmations = 0;
 		bool     waiting       = false; // suspended on a pending shader write, value not found yet

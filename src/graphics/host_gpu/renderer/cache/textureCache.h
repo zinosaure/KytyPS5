@@ -57,6 +57,8 @@ public:
 	// Grows whenever an image over a block of that memory is registered or freed: what FindImage returns for a
 	// description over it may change then, not before. A sum over 1 MiB blocks (hashed): equal sums, no change.
 	[[nodiscard]] uint64_t      RegionGeneration(uint64_t address, uint64_t size) const noexcept;
+	// Advances whenever an image is registered or unregistered anywhere (replacements and expansions included).
+	[[nodiscard]] uint64_t      Epoch() const noexcept { return m_epoch; }
 	// Whether a texture binding found before can still take this image as it is: registered, not handed to a
 	// depth image, not replaced or expanded since (FindTexture's conditions).
 	[[nodiscard]] bool          BindingUsable(ImageId id);
@@ -182,6 +184,7 @@ private:
 	std::vector<uint32_t>                             m_block_generations =
 	    std::vector<uint32_t>(GenerationBlocks);
 	void                                              TouchGenerations(uint64_t address, uint64_t size) noexcept;
+	uint64_t                                          m_epoch = 0;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;

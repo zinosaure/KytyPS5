@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -222,8 +223,28 @@ private:
 		uint64_t                generation;
 	};
 
+	// The color target the draw before found in a slot. Astro Bot's draws repeat their targets 98.7 % of the time,
+	// and finding a target, touching it and checking its metadata clears cost 6.5 % of the command thread at every
+	// draw. A draw takes it again as it is when nothing but register writes came between the two draws: the same
+	// command buffer, the same registers, no image registered or freed, no transfer, no dispatch or image operation
+	// (m_chain_breaks). The draw before touched it in this command buffer and checked its metadata.
+	struct ContinuedTarget {
+		HW::RenderTarget registers;
+		uint32_t         mask         = 0;
+		bool             exact_format = false;
+		bool             valid        = false;
+		uint64_t         tick         = 0;
+		uint64_t         textures     = 0; // TextureCache::Epoch
+		uint64_t         transfers    = 0; // BufferCache::Transfers
+		uint64_t         breaks       = 0; // m_chain_breaks
+		RenderColorInfo  info;
+	};
+
 	RenderContext&                        m_context;
 	std::unordered_map<TextureBindingKey, CachedTextureBinding, TextureBindingKeyHash> m_texture_bindings;
+	std::array<ContinuedTarget, RENDER_COLOR_ATTACHMENTS_MAX> m_continued_targets;
+	// Advances at every dispatch and at every draw spent on an image operation (metadata, copy, resolve).
+	uint64_t                                                  m_chain_breaks = 0;
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;

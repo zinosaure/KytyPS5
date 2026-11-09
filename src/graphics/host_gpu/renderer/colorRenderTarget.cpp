@@ -70,6 +70,17 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 
 		return;
 	}
+	auto&      texture_cache = m_context.GetTextureCache();
+	auto&      buffer_cache  = m_context.GetBufferCache();
+	auto&      continued     = m_continued_targets[rt_slot];
+	const auto tick          = m_context.GetCommandScheduler().CurrentTick();
+	if (continued.valid && continued.tick == tick && continued.breaks == m_chain_breaks &&
+	    continued.textures == texture_cache.Epoch() && continued.transfers == buffer_cache.Transfers() &&
+	    continued.mask == mask && continued.exact_format == exact_format && continued.registers == rt) {
+		r = continued.info;
+		BindRenderTarget(r.image_id);
+		return;
+	}
 	const auto samples = render_sample_count(rt.attrib.num_fragments);
 	// TODO(PPSA24156): Replace this 2x MSAA approximation with proper 4-coverage/2-fragment EQAA.
 	const bool approximate_eqaa = rt.attrib.num_samples == 2 && rt.attrib.num_fragments == 1;
@@ -265,12 +276,20 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	desc.view_info.base_layer  = view.base_layer;
 	desc.view_info.layer_count = view.layer_count;
 	desc.view_info.usage       = vk::ImageUsageFlagBits::eColorAttachment;
-	auto& texture_cache        = m_context.GetTextureCache();
 	r.guest_mip_level          = mip;
 	r.guest_array_layer        = view.base_layer;
 	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
 	r.export_mapping           = target_format.export_mapping;
 	BindRenderTarget(r.image_id);
+	continued = {rt,
+	             mask,
+	             exact_format,
+	             true,
+	             m_context.GetCommandScheduler().CurrentTick(),
+	             texture_cache.Epoch(),
+	             buffer_cache.Transfers(),
+	             m_chain_breaks,
+	             r};
 }
 
 } // namespace Libs::Graphics
