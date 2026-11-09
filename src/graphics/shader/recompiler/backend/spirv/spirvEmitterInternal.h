@@ -112,6 +112,9 @@ struct EmitterState {
 	uint32_t                                         lane_half               = 0;
 	std::array<BufferDefinition, 4>                  storage_buffers {};
 	std::vector<uint32_t>                           memory_byte_offsets;
+	// GameFlex: while a buffer read issued for every lane is emitted (EmitReadOrDefault), the guest lanes it reads
+	// for; the others address past every binding, where the device returns zero without touching memory.
+	uint32_t                                        read_lanes = 0;
 	std::vector<uint32_t>                           memory_byte_sizes;
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
@@ -619,6 +622,51 @@ template <typename Fn>
 uint32_t EmitValueOrZeroIfCondition(EmitterState& state, uint32_t condition, Fn&& fn) {
 	return EmitValueOrDefaultIfCondition(state, condition, TypeU32(state), ConstantU32(state, 0),
 	                                     std::forward<Fn>(fn));
+}
+
+// GameFlex: memory a read cannot fault on, whatever its index. Kyty requires robustBufferAccess and nullDescriptor,
+// so a storage buffer descriptor keeps any index in its binding or reads zero, and a missing buffer is a null
+// descriptor. Physical addresses, LDS, GDS and scratch are not robust; a coherent read keeps its place.
+[[nodiscard]] inline bool ReadCannotFault(IR::ResourceKind kind, bool coherent) {
+	return !coherent && (kind == IR::ResourceKind::Buffer || kind == IR::ResourceKind::ScalarBuffer);
+}
+
+// GameFlex: the read is issued whatever the guest's condition, which only picks the value. Branching around each
+// read made the device wait for it before the next one could start and reload its descriptor every time: issued
+// unconditionally, reads are grouped and widened, and the device waits once. fn must only read.
+// GameFlex: the guest lanes of a buffer read issued for every lane, for the time it is emitted.
+class ReadLanesScope {
+public:
+	ReadLanesScope(EmitterState& state, uint32_t lanes): m_state(state), m_previous(state.read_lanes) {
+		state.read_lanes = lanes;
+	}
+	~ReadLanesScope() { m_state.read_lanes = m_previous; }
+	ReadLanesScope(const ReadLanesScope&)            = delete;
+	ReadLanesScope& operator=(const ReadLanesScope&) = delete;
+
+private:
+	EmitterState& m_state;
+	uint32_t      m_previous;
+};
+
+template <typename Fn>
+uint32_t EmitReadOrDefault(EmitterState& state, uint32_t condition, uint32_t components,
+                           uint32_t default_value, Fn&& fn) {
+	const auto value = fn();
+	if (condition == ConstantBool(state, true)) return value;
+	if (components == 1u) return Select(state, TypeU32(state), condition, value, default_value);
+	// A pair is a structure, which SPIR-V 1.3 does not select: one component at a time.
+	std::vector<uint32_t> words {spv::OpCompositeConstruct, TypeU32Composite(state, components), 0u};
+	for (uint32_t component = 0; component < components; component++) {
+		const auto read     = state.builder.AllocateId();
+		const auto fallback = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), read, value, component);
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), fallback, default_value, component);
+		words.push_back(Select(state, TypeU32(state), condition, read, fallback));
+	}
+	words[2] = state.builder.AllocateId();
+	state.builder.AddFunction(words);
+	return words[2];
 }
 
 template <typename Fn>
