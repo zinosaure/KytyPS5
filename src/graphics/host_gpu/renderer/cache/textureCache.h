@@ -57,6 +57,9 @@ public:
 	// Grows whenever an image over a block of that memory is registered or freed: what FindImage returns for a
 	// description over it may change then, not before. A sum over 1 MiB blocks (hashed): equal sums, no change.
 	[[nodiscard]] uint64_t      RegionGeneration(uint64_t address, uint64_t size) const noexcept;
+	// Whether a texture binding found before can still take this image as it is: registered, not handed to a
+	// depth image, not replaced or expanded since (FindTexture's conditions).
+	[[nodiscard]] bool          BindingUsable(ImageId id);
 	// An image FindImage found before, bound again: what FindImage does once it holds the image.
 	void                        TouchFoundImage(ImageId id, const ImageDesc& desc,
 	                                            uint32_t metadata_base_layer);
