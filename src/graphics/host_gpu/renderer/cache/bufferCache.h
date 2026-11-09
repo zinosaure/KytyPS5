@@ -14,6 +14,7 @@
 
 #include <array>
 #include <map>
+#include <memory>
 #include <tuple>
 #include <unordered_map>
 #include <mutex>
@@ -112,8 +113,8 @@ public:
 	// GameFlex: a guest wait (WAIT_REG_MEM) for a value a shader recorded before will write. The GPU runs the
 	// stream in order: behind a barrier, everything recorded after the wait runs after that shader, which is all
 	// the wait asks, as long as the shader writes the value. An address is trusted once four waits there ended
-	// with the value; each trusted wait is checked when the writer's work is done, and a miss revokes the
-	// address for good. True: the wait may go on.
+	// with the value. At each trusted wait the GPU copies the value at that place in the stream, and the copy
+	// is checked once its work is done: a miss revokes the address for good. True: the wait may go on.
 	[[nodiscard]] bool TrustPendingGpuWrite(uint64_t vaddr, uint64_t size, uint32_t func, uint64_t ref, uint64_t mask);
 	// The guest wait at vaddr found its value in memory.
 	void GuestWaitPassed(uint64_t vaddr);
@@ -240,18 +241,26 @@ private:
 	// The words and addresses whose prediction waits to be checked, with the GPU tick in their entry: the checks
 	// walk these, not every address ever seen (a ring of flags grows the maps for good).
 	std::vector<uint64_t>                             m_srt_verifications;
-	std::vector<uint64_t>                             m_flag_verifications;
 	struct FlagSpeculation {
 		uint32_t confirmations = 0;
 		bool     waiting       = false; // suspended on a pending shader write, value not found yet
 		bool     trusted       = false;
 		bool     revoked       = false; // once wrong, never trusted again
-		uint32_t func          = 0;     // the last trusted wait's condition, checked at verify_tick
-		uint32_t size          = 0;
-		uint64_t ref           = 0;
-		uint64_t mask          = 0;
-		uint64_t verify_tick   = 0;     // the writer's work; 0 when nothing is to verify
 	};
+	// A trusted wait: the condition, and the slot of m_flag_captures the GPU copies the value to in the command
+	// buffer of `tick`, at the wait's place in the stream.
+	struct FlagCheck {
+		uint64_t address = 0;
+		uint64_t tick    = 0;
+		uint64_t ref     = 0;
+		uint64_t mask    = 0;
+		uint32_t func    = 0;
+		uint32_t size    = 0;
+		uint32_t slot    = 0;
+	};
+	std::vector<FlagCheck>                            m_flag_verifications;
+	std::unique_ptr<Buffer>                           m_flag_captures;
+	uint32_t                                          m_flag_capture_next = 0;
 	void VerifyFlagSpeculations();
 	std::unordered_map<uint64_t, FlagSpeculation>     m_flag_speculation;
 	// Ranges bound for writing that no TakeUnifiedGpuWrites has taken yet, and all of them.

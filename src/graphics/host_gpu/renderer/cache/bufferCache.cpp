@@ -1171,38 +1171,35 @@ bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t f
 // Astro Bot's graphics queue waits about nine times an image for a flag its compute work sets to 1, each time
 // submitting, then polling until the GPU wrote it: 35 ms an image, the GPU and the thread taking turns. The
 // compute work is recorded before, on the same Vulkan queue: the wait needs only a barrier, if the flag lands.
+// The check read the flag in memory once the writer's work was done, which may be long after: the game clears
+// its flags once it saw them, and Astro Bot's three busiest ones were revoked while the level loaded, each wait
+// then a 40 ms drain. The GPU copies the value where the wait is in the stream, which is what the wait saw.
 namespace {
 constexpr uint32_t kFlagConfirmations = 4;
+constexpr uint32_t kFlagCaptureSlots  = 1024; // trusted waits not checked yet, 8 bytes each
 } // namespace
 
 void BufferCache::VerifyFlagSpeculations() {
 	const auto done = m_scheduler.GetMasterSemaphore().KnownGpuTick();
-	std::erase_if(m_flag_verifications, [&](uint64_t address) {
-		auto& flag = m_flag_speculation[address];
-		if (flag.verify_tick == 0) {
-			return true;
-		}
-		if (flag.verify_tick > done) {
+	std::erase_if(m_flag_verifications, [&](const FlagCheck& check) {
+		if (check.tick > done) {
 			return false;
 		}
-		const auto verify_tick = flag.verify_tick;
-		flag.verify_tick       = 0;
-		// A shader recorded later may write it again: nothing to say then.
-		if (const auto* range = m_pending_gpu_writes.Find(address); range != nullptr && range->tick > verify_tick) {
+		const auto offset = uint64_t {check.slot} * sizeof(uint64_t);
+		m_flag_captures->Invalidate(offset, sizeof(uint64_t));
+		uint64_t seen = 0;
+		std::memcpy(&seen, m_flag_captures->Mapped().data() + offset, check.size);
+		if (TestWaitRegMemValue(seen, check.ref, check.mask, check.func)) {
 			return true;
 		}
-		uint64_t landed = 0;
-		if (!LibKernel::Memory::TryReadBacking(address, &landed, flag.size) ||
-		    TestWaitRegMemValue(landed, flag.ref, flag.mask, flag.func)) {
-			return true;
-		}
+		auto& flag   = m_flag_speculation[check.address];
 		flag.trusted = false;
 		flag.revoked = true;
 		static uint32_t misses = 0;
 		if (misses++ < 50) {
-			std::printf("Guest wait speculation: 0x%016" PRIx64 " holds 0x%" PRIx64 " once the shader's work is done, "
-			            "the wait wanted 0x%" PRIx64 "; this address waits again from now on\n",
-			            address, landed, flag.ref);
+			std::printf("Guest wait speculation: 0x%016" PRIx64 " held 0x%" PRIx64 " where the wait was, which "
+			            "wanted 0x%" PRIx64 "; this address waits again from now on\n",
+			            check.address, seen, check.ref);
 		}
 		return true;
 	});
@@ -1228,14 +1225,37 @@ bool BufferCache::TrustPendingGpuWrite(uint64_t vaddr, uint64_t size, uint32_t f
 		flag.waiting = true;
 		return false;
 	}
-	flag.func        = func;
-	flag.size        = static_cast<uint32_t>(size);
-	flag.ref         = ref;
-	flag.mask        = mask;
-	if (flag.verify_tick == 0) {
-		m_flag_verifications.push_back(vaddr);
+	// Checks end in the order they were recorded: with fewer than kFlagCaptureSlots waiting, the next slot is free.
+	const auto window = UnifiedWindow(vaddr, size);
+	if (!window || m_flag_verifications.size() >= kFlagCaptureSlots) {
+		return false;
 	}
-	flag.verify_tick = std::max(flag.verify_tick, range->tick);
+	if (!m_flag_captures) {
+		m_flag_captures = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		                                           vk::BufferUsageFlagBits::eTransferDst,
+		                                           kFlagCaptureSlots * sizeof(uint64_t));
+	}
+	const auto slot = m_flag_capture_next;
+	m_flag_capture_next = (m_flag_capture_next + 1) % kFlagCaptureSlots;
+	auto& source  = m_slot_buffers[window];
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto native = command.Handle();
+	// Everything recorded before is done and its writes land first, as the wait asks of the command processor.
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer, {}, 1,
+	                       &before, 0, nullptr, 0, nullptr);
+	const vk::BufferCopy copy {source.Offset(vaddr), uint64_t {slot} * sizeof(uint64_t), size};
+	native.copyBuffer(source.Handle(), m_flag_captures->Handle(), 1, &copy);
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 1, &after, 0,
+	                       nullptr, 0, nullptr);
+	m_flag_verifications.push_back({vaddr, m_scheduler.CurrentTick(), ref, mask, func, static_cast<uint32_t>(size),
+	                                slot});
 	return true;
 }
 
