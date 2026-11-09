@@ -68,6 +68,8 @@ static void PrintUsage() {
 	::printf("  --shader-cache                       Keep compiled shaders and pipelines between boots.\n");
 	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
 	::printf("  --occlusion-queries                  Count occlusion query samples on the GPU.\n");
+	::printf("  --coarse-shading                     Shade one pixel in four in draws at least twice as tall\n"
+	         "                                       as the window. Default: off.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
 	::printf("  --shader-log-folder <path>           Shader log output folder.\n");
 	::printf("  --command-buffer-dump                Enable command buffer dumps.\n");
@@ -197,6 +199,7 @@ static constexpr Flag FLAGS[] = {
     {"--shader-cache", &ConfigOptions::shader_cache_enabled},
     {"--tessellation", &ConfigOptions::tessellation_enabled},
     {"--occlusion-queries", &ConfigOptions::occlusion_queries_enabled},
+    {"--coarse-shading", &ConfigOptions::coarse_shading_enabled},
     {"--command-buffer-dump", &ConfigOptions::command_buffer_dump_enabled},
     {"--graphics-debug-dump", &ConfigOptions::graphics_debug_dump_enabled},
     {"--profile", &ConfigOptions::profiler_enabled},
@@ -220,6 +223,10 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 	// launchers that pass their settings as environment variables. The flag itself still works.
 	if (const char* occlusion = std::getenv("KYTY_OCCLUSION_QUERIES"); occlusion != nullptr) {
 		options.config.occlusion_queries_enabled = std::string_view(occlusion) != "0";
+	}
+	// KYTY_COARSE_SHADING=1 (0 to disable) sets --coarse-shading the same way.
+	if (const char* coarse = std::getenv("KYTY_COARSE_SHADING"); coarse != nullptr) {
+		options.config.coarse_shading_enabled = std::string_view(coarse) != "0";
 	}
 	// KYTY_SHADER_CACHE=1 (0 to disable) sets --shader-cache the same way.
 	if (const char* shader_cache = std::getenv("KYTY_SHADER_CACHE"); shader_cache != nullptr) {

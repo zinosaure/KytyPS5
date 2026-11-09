@@ -217,6 +217,10 @@ bool OcclusionQueriesEnabled() {
 	return g_config->occlusion_queries_enabled;
 }
 
+bool CoarseShadingEnabled() {
+	return g_config->coarse_shading_enabled;
+}
+
 bool TrophyEnabled() {
 	return g_config->trophy_enabled;
 }

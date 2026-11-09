@@ -35,6 +35,9 @@ struct GraphicContext {
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
 	bool                               attachment_feedback_loop_enabled      = false;
+	// GameFlex: one pixel in four is shaded in draws at least twice as tall as the window, where the
+	// presentation scales the image down anyway (VK_KHR_fragment_shading_rate, --coarse-shading).
+	bool                               coarse_shading_enabled                = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               fragment_shader_barycentric_enabled   = false;
 	bool                               maintenance8_enabled                  = false;

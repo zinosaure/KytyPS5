@@ -59,11 +59,13 @@ struct DynamicState {
 		bool color_write_enables   : 1;
 		bool line_width            : 1;
 		bool feedback_loop_aspects : 1;
+		bool shading_rate          : 1;
 	} dirty_state {};
 
 	std::array<vk::Viewport, 16> viewports {};
 	std::array<vk::Rect2D, 16>   scissors {};
 	uint32_t                   num_viewports {};
+	bool                       coarse_shading {};
 	uint32_t                   num_scissors {};
 
 	bool          depth_test_enabled {};
