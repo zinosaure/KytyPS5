@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "common/commandThreadProfile.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -729,6 +730,7 @@ void RenderExecutor::ResetBindings() {
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
+	Common::CommandThreadProfile::Scope ctp_profile(Common::CommandThreadProfile::Cause::Textures);
 	EXIT_IF(!runtime);
 	const auto& program  = runtime.module->info;
 	const auto& snapshot = *runtime.resources;
@@ -768,6 +770,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 
 void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	KYTY_PROFILER_FUNCTION();
+	Common::CommandThreadProfile::Scope ctp_profile(Common::CommandThreadProfile::Cause::Buffers);
 	auto& cache = m_context.GetBufferCache();
 	for (auto* stage: stages) {
 		auto&       prepared = *stage;
@@ -827,6 +830,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
+	Common::CommandThreadProfile::Scope ctp_profile(Common::CommandThreadProfile::Cause::Buffers);
 	const auto& program  = prepared.runtime->module->info;
 	const auto& snapshot = *prepared.runtime->resources;
 	const auto& layout   = program.bindings;
@@ -860,6 +864,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
+	Common::CommandThreadProfile::Scope ctp_profile(Common::CommandThreadProfile::Cause::Textures);
 	const auto& program       = prepared.runtime->module->info;
 	const auto& snapshot      = *prepared.runtime->resources;
 	auto&       images        = prepared.images;
@@ -938,6 +943,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     const PipelineCache::Pipeline&     pipeline,
                                     std::span<PreparedBindings* const> prepared_bindings) {
 	KYTY_PROFILER_FUNCTION();
+	Common::CommandThreadProfile::Scope ctp_profile(Common::CommandThreadProfile::Cause::Bindings);
 	auto                           vk_buffer              = buffer.Handle();
 	size_t                         image_descriptor_count = 0;
 	ShaderRecompiler::IR::PushData push_data;

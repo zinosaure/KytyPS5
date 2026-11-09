@@ -1,4 +1,5 @@
 #include "graphics/presentation/videoOut.h"
+#include "common/commandThreadProfile.h"
 #include "kernel/memory.h"
 
 #include "common/abi.h"
@@ -1096,6 +1097,7 @@ void FlipQueue::Complete(uint64_t request_id) {
 
 void FlipQueue::WaitForSubmitSlot(VideoOutConfig& cfg) {
 	Common::GameFlex::WaitNote gameflex_wait("video out: wait for room in the flip queue", &cfg);
+	Common::CommandThreadProfile::Scope ctp_profile(Common::CommandThreadProfile::Cause::WaitGpuFrame);
 	Common::LockGuard lock(m_mutex);
 	auto belongs_to_port = [&cfg](const auto& request) { return request.cfg == &cfg; };
 	while (std::count_if(m_requests.begin(), m_requests.end(), belongs_to_port) +
@@ -1110,6 +1112,7 @@ void FlipQueue::WaitForSubmitSlot(VideoOutConfig& cfg) {
 
 void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 	Common::GameFlex::WaitNote gameflex_wait("video out: wait for a buffer's flips", &cfg);
+	Common::CommandThreadProfile::Scope ctp_profile(Common::CommandThreadProfile::Cause::WaitGpuFrame);
 	Common::LockGuard lock(m_mutex);
 
 	auto has_request = [this, &cfg, index] {

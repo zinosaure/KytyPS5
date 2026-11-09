@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "common/commandThreadProfile.h"
 
 #include "common/assert.h"
 #include "common/gameflexWatchdog.h"
@@ -92,6 +93,7 @@ void GuestGpu::ProcessCommands() {
 			m_commands.pop_front();
 			EXIT_IF(m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 		}
+		Common::CommandThreadProfile::Scope ctp_foreign(Common::CommandThreadProfile::Cause::Foreign);
 		command();
 	}
 }
@@ -150,7 +152,9 @@ void GuestGpu::SuspendPoint() {
 	EXIT_IF(IsGpuThread() || CommandScheduler::InDeferredOperation());
 	// Do not hold a queue lock while waiting: asynchronous work may be needed to
 	// finish the preceding graphics frame. The first point returns immediately.
+	m_guest_at_suspend_point.store(true, std::memory_order_relaxed);
 	m_suspend_point_ready->acquire();
+	m_guest_at_suspend_point.store(false, std::memory_order_relaxed);
 	Submission submission;
 	submission.type = SubmissionType::SuspendPoint;
 	Enqueue(std::move(submission));
@@ -211,8 +215,8 @@ void CommandProcessor::BufferInit() {
 	GetScheduler().Begin(m_ctx, m_ucfg, m_sh_ctx);
 }
 
-void CommandProcessor::BufferFlush() {
-	GetScheduler().Flush();
+void CommandProcessor::BufferFlush(Common::CommandThreadProfile::Close reason) {
+	GetScheduler().Flush(reason);
 	// The occlusion counters reach a guest that polls them without waiting for a later fence.
 	m_renderer.GetOcclusionQueries().Publish();
 }
@@ -272,6 +276,10 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 			                               vk::AccessFlagBits2::eMemoryWrite);
 			return;
 		}
+		// What the wait is for, for the command thread's report: a write on its way to the GPU, or nothing there.
+		Common::CommandThreadProfile::NoteLabelWait(
+		    m_renderer.GetBufferCache().PendingGuestWrite(reinterpret_cast<uint64_t>(addr), sizeof(T), &pending) ||
+		    m_renderer.GetBufferCache().HasPendingGpuWrites(reinterpret_cast<uint64_t>(addr), sizeof(T)));
 		Common::GameFlex::NoteGpuWait("wait_reg_mem", reinterpret_cast<uint64_t>(addr), static_cast<uint64_t>(*addr),
 		                           static_cast<uint64_t>(ref), static_cast<uint64_t>(mask), func);
 		SuspendPm4();
@@ -287,6 +295,7 @@ void CommandProcessor::MemSemaphore(uint64_t* counter, bool signal, bool write) 
 	if (signal) {
 		*counter = write ? 1u : *counter + 1u;
 	} else if (*counter == 0) {
+		Common::CommandThreadProfile::NoteLabelWait(false);
 		Common::GameFlex::NoteGpuWait("mem_semaphore", reinterpret_cast<uint64_t>(counter), 0, 1, 0, 0);
 		SuspendPm4();
 	} else {
@@ -414,6 +423,7 @@ void GuestGpu::ThreadRun(void* data) {
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
 	g_gpu_state = gpu;
+	Common::CommandThreadProfile::SetCommandThread();
 
 	for (;;) {
 		Submission                   submission;
@@ -427,6 +437,9 @@ void GuestGpu::ThreadRun(void* data) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
 				Common::GameFlex::WaitNote gameflex_wait("gpu thread: no work");
+				Common::CommandThreadProfile::Scope ctp_idle(gpu->m_guest_at_suspend_point.load(std::memory_order_relaxed)
+				                                              ? Common::CommandThreadProfile::Cause::IdleSuspend
+				                                              : Common::CommandThreadProfile::Cause::Idle);
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
@@ -450,7 +463,11 @@ void GuestGpu::ThreadRun(void* data) {
 				if (selected_queue < 0) {
 					gpu->m_renderer.GetCommandScheduler().FlushBeforeIdle();
 					gpu->m_processing = false;
-					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					{
+						Common::CommandThreadProfile::Scope ctp_label(Common::CommandThreadProfile::LabelCause());
+						Common::CommandThreadProfile::Count(Common::CommandThreadProfile::Event::LabelPolls);
+						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					}
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
 							queue.front().blocked = false;
@@ -476,6 +493,7 @@ void GuestGpu::ThreadRun(void* data) {
 			{
 				Common::DebugCounters::ScopedTimer busy(
 				    Common::DebugCounters::Counter::GpuThreadBusyNs);
+				Common::CommandThreadProfile::Scope ctp_foreign(Common::CommandThreadProfile::Cause::Foreign);
 				command();
 			}
 
@@ -490,12 +508,14 @@ void GuestGpu::ThreadRun(void* data) {
 		const bool complete = [&] {
 			Common::DebugCounters::ScopedTimer busy(
 			    Common::DebugCounters::Counter::GpuThreadBusyNs);
+			Common::CommandThreadProfile::Scope ctp_pm4(Common::CommandThreadProfile::Cause::Pm4);
 			return gpu->Process(submission);
 		}();
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {
 			submission.blocked = true;
+			Common::CommandThreadProfile::Count(Common::CommandThreadProfile::Event::BlockedRetries);
 			gpu->m_queues[submission.queue_id].push_front(std::move(submission));
 			gpu->m_submission_count++;
 		} else {
@@ -527,17 +547,21 @@ bool GuestGpu::Process(Submission& submission) {
 				cp.BufferFlushAtBoundary();
 			}
 			break;
-		case SubmissionType::FlipPreparation:
+		case SubmissionType::FlipPreparation: {
+			Common::CommandThreadProfile::Scope ctp_upkeep(Common::CommandThreadProfile::Cause::Upkeep);
 			cp.PrepareCpuFlip(submission.flip_request_id);
 			break;
-		case SubmissionType::SuspendPoint:
+		}
+		case SubmissionType::SuspendPoint: {
+			Common::CommandThreadProfile::Scope ctp_upkeep(Common::CommandThreadProfile::Cause::Upkeep);
 			// Age caches at the frame boundary, not once per command list.
 			m_renderer.RunGarbageCollector();
 			m_renderer.GetCommandScheduler().DeferPriorityOperation(
 			    [ready = m_suspend_point_ready] { ready->release(); });
-			cp.BufferFlush();
+			cp.BufferFlush(Common::CommandThreadProfile::Close::Frame);
 			cp.Reset();
 			break;
+		}
 	}
 
 	return complete;
@@ -575,6 +599,33 @@ void CommandProcessor::SuspendPm4() {
 	EXIT_IF(g_current_execution == nullptr);
 	g_current_execution->m_suspended = true;
 }
+
+namespace {
+// GameFlex: the command thread's cause for each PM4 opcode (CommandThreadProfile).
+constexpr std::array<Common::CommandThreadProfile::Cause, 256> MakePacketCauses() {
+	using Common::CommandThreadProfile::Cause;
+	std::array<Cause, 256> causes {};
+	causes.fill(Cause::Pm4);
+	for (const auto op: {Pm4::IT_SET_BASE, Pm4::IT_CLEAR_STATE, Pm4::IT_INDEX_BUFFER_SIZE, Pm4::IT_INDEX_BASE,
+	                     Pm4::IT_INDEX_TYPE, Pm4::IT_NUM_INSTANCES, Pm4::IT_CONTEXT_CONTROL,
+	                     Pm4::IT_SET_SH_REG_INDIRECT, Pm4::IT_SET_UCONFIG_REG_INDIRECT, Pm4::IT_SET_CONFIG_REG,
+	                     Pm4::IT_SET_CONTEXT_REG, Pm4::IT_SET_SH_REG, Pm4::IT_SET_QUEUE_REG, Pm4::IT_SET_UCONFIG_REG,
+	                     Pm4::IT_SET_UCONFIG_REG_INDEX, Pm4::IT_SET_CONTEXT_REG_INDIRECT}) {
+		causes[op] = Cause::Registers;
+	}
+	for (const auto op: {Pm4::IT_DISPATCH_DIRECT, Pm4::IT_DISPATCH_INDIRECT, Pm4::IT_DRAW_INDIRECT,
+	                     Pm4::IT_DRAW_INDEX_INDIRECT, Pm4::IT_DRAW_INDEX_2, Pm4::IT_DRAW_INDIRECT_MULTI,
+	                     Pm4::IT_DRAW_INDEX_AUTO, Pm4::IT_DRAW_INDEX_OFFSET_2, Pm4::IT_DRAW_INDEX_INDIRECT_MULTI,
+	                     Pm4::IT_DISPATCH_DRAW_PREAMBLE, Pm4::IT_DISPATCH_DRAW}) {
+		causes[op] = Cause::Draw;
+	}
+	for (const auto op: {Pm4::IT_COPY_DATA, Pm4::IT_CP_DMA, Pm4::IT_DMA_DATA}) {
+		causes[op] = Cause::Transfers;
+	}
+	return causes;
+}
+constexpr auto g_packet_causes = MakePacketCauses();
+} // namespace
 
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	const bool debug_dump = graphics_debug_dump_enabled();
@@ -633,6 +684,8 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			EXIT("unknown op\n\t%05" PRIx32 ":\n\tcmd_id = %08" PRIx32 "\n", offset, packet_header);
 		}
 
+		Common::CommandThreadProfile::CountPacket(opcode);
+		Common::CommandThreadProfile::Phase(g_packet_causes[opcode]);
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		EXIT_IF(packet_dw > remaining_dw);
@@ -939,7 +992,8 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 }
 
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
-	BufferFlush();
+	Common::CommandThreadProfile::Scope ctp_upkeep(Common::CommandThreadProfile::Cause::Upkeep);
+	BufferFlush(Common::CommandThreadProfile::Close::Frame);
 
 	m_renderer.GetVideoOut().WaitFlipDone(static_cast<int>(video_out_handle),
 	                                      static_cast<int>(display_buffer_index));
@@ -1124,6 +1178,8 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 }
 
 void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_arg) {
+	Common::CommandThreadProfile::Scope           ctp_upkeep(Common::CommandThreadProfile::Cause::Upkeep);
+	Common::CommandThreadProfile::WaitReasonScope ctp_frame(Common::CommandThreadProfile::WaitReason::Frame);
 	if (graphics_debug_dump_enabled()) {
 		LOGF("CommandProcessor::Flip()\n");
 	}
@@ -1133,15 +1189,16 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 	auto  request = Sync::PrepareVideoOutFlip(command, handle, index, flip_mode, flip_arg);
 	GetScheduler().DeferPriorityOperation(
 	    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); });
-	GetScheduler().Flush();
+	GetScheduler().Flush(Common::CommandThreadProfile::Close::Frame);
 }
 
 void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
+	Common::CommandThreadProfile::WaitReasonScope ctp_frame(Common::CommandThreadProfile::WaitReason::Frame);
 	auto& command = CurrentBuffer();
 	m_renderer.GetVideoOut().PrepareFlip(request_id, command);
 	GetScheduler().DeferPriorityOperation(
 	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });
-	GetScheduler().Flush();
+	GetScheduler().Flush(Common::CommandThreadProfile::Close::Frame);
 }
 
 bool GuestGpu::IsGpuThread() noexcept {

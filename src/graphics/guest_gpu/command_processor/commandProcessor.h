@@ -2,6 +2,7 @@
 #define GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_COMMAND_PROCESSOR_H
 
 #include "common/assert.h"
+#include "common/commandThreadProfile.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pssr.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -63,7 +64,7 @@ public:
 	void ApplyContextStateOperation(ContextStateOperation operation);
 
 	void            BufferInit();
-	void            BufferFlush();
+	void            BufferFlush(Common::CommandThreadProfile::Close reason = Common::CommandThreadProfile::Close::Other);
 	void            BufferFlushAtBoundary();
 	GuestSync&      GetGuestSync() const { return m_renderer.GetGuestSync(); }
 	void            BufferWait();

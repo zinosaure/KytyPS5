@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "common/commandThreadProfile.h"
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
@@ -719,6 +720,7 @@ void PipelineCache::Save() {
 }
 
 void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state) {
+	Common::CommandThreadProfile::Scope ctp_profile(Common::CommandThreadProfile::Cause::Programs);
 	m_defer_translation = m_compile_aside && state.deferrable;
 	// Every way out ends the deferral: a dropped draw must not defer the next compute shader.
 	struct DeferralEnd {
@@ -1013,6 +1015,7 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 
 const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                      ShaderComputeInputInfo&      input_info) {
+	Common::CommandThreadProfile::Scope ctp_profile(Common::CommandThreadProfile::Cause::Programs);
 	m_defer_translation           = false;
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, input_info);
@@ -1024,6 +1027,7 @@ const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo
 
 PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,
                                                             const DrawRenderState& state) {
+	Common::CommandThreadProfile::Scope ctp_profile(Common::CommandThreadProfile::Cause::Programs);
 	const auto* colors        = state.color_info;
 	const auto& depth         = state.depth_info;
 	const auto  vertex_info   = state.VertexStages();
@@ -1236,6 +1240,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 }
 
 PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info) {
+	Common::CommandThreadProfile::Scope ctp_profile(Common::CommandThreadProfile::Cause::Programs);
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Compute)", profiler::colors::RedA100);
 
 	const auto& module = *input_info.stage.module;

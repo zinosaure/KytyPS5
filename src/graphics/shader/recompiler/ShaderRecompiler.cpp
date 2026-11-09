@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "common/commandThreadProfile.h"
 #include "graphics/shader/recompiler/Tessellation.h"
 
 #include "common/assert.h"
@@ -610,6 +611,7 @@ const char* StageName(ShaderType stage) {
 }
 
 ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOptions& options) {
+	Common::CommandThreadProfile::Scope ctp_profile(Common::CommandThreadProfile::Cause::Compile);
 	EXIT_IF(code.empty());
 	ShaderSource source;
 	if (!options.back_code.empty()) {
@@ -759,11 +761,13 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 }
 
 TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOptions& options) {
+	Common::CommandThreadProfile::Scope ctp_profile(Common::CommandThreadProfile::Cause::Compile);
 	auto source = PrepareShaderSource(code, options);
 	return TranslateProgram(source.decoded, options);
 }
 
 TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileOptions& options) {
+	Common::CommandThreadProfile::Scope ctp_profile(Common::CommandThreadProfile::Cause::Compile);
 	EXIT_IF(decoded.instructions.empty());
 	if (decoded.has_swap_pc) {
 		for (const auto& inst: decoded.instructions) {

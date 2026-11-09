@@ -1,8 +1,10 @@
 #include "graphics/presentation/performanceOverlay.h"
 
+#include "common/commandThreadProfile.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/hostStats.h"
+#include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "imgui.h"
 #include "kernel/memory.h"
@@ -136,6 +138,10 @@ struct Snapshot {
 	std::optional<uint64_t>             device_memory;
 	uint64_t                            device_budget = 0;
 	std::array<GraphicContext::HeapUsage, VK_MAX_MEMORY_HEAPS> heaps {};
+	// GameFlex: where the command thread spends each frame (CommandThreadProfile).
+	Common::CommandThreadProfile::Totals                       profile_totals;
+	uint64_t                                                   profile_flips = 0;
+	Common::CommandThreadProfile::Report                       profile;
 	uint32_t                                                   heap_count = 0;
 	std::array<float, FRAME_HISTORY>                           history {};
 	size_t                                                     history_count = 0;
@@ -148,6 +154,8 @@ FrameWindow           g_frames;
 std::atomic<uint64_t> g_generation {0};
 std::atomic<bool>     g_details {false};
 std::atomic<uint64_t> g_revision {0};
+// GameFlex: the guest's flips, counted for the command-thread report whether the panel is shown or not.
+std::atomic<uint64_t> g_profile_flips {0};
 
 std::mutex                  g_host_mutex;
 Common::HostStats           g_host_stats;
@@ -163,7 +171,8 @@ void SetOverlayEnabled(bool enabled) {
 			g_frames = {};
 			g_generation.fetch_add(1, std::memory_order_release);
 		}
-		Common::DebugCounters::SetEnabled(enabled);
+		// --perf-log keeps counting while the panel is hidden.
+		Common::DebugCounters::SetEnabled(enabled || Config::PerfLogSeconds() != 0);
 	}
 	g_sampler_wait.notify_all();
 }
@@ -376,9 +385,8 @@ void GpuActivityRows(const Snapshot& shown) {
 	const auto draws = Rate(shown, Counter::Draws);
 	Row("Draw calls", Fmt("%.0f/frame  %.0f/s", draws / std::max(shown.fps, 1.0), draws));
 	// Includes present pacing waits, so a high value alone is not a stall.
-	Row("CPU waiting on GPU",
-	    Fmt("%.0f ms/s  (%.0f waits/s)", Rate(shown, Counter::GpuWaitNs) / 1e6,
-	        Rate(shown, Counter::GpuWaits)));
+	// The command thread's own waits (CommandThreadProfile); other threads wait by design (present, completions).
+	Row("Command thread waits", Fmt("%.0f ms/frame", shown.profile.wait_ms_per_frame));
 	Row("DCC/CMASK readbacks",
 	    Fmt("%.0f ms/s  (%.0f/s)", Rate(shown, Counter::ColorMetadataReadbackNs) / 1e6,
 	        Rate(shown, Counter::ColorMetadataReadbacks)));
@@ -477,6 +485,16 @@ void Refresh(Snapshot& shown, const GraphicContext& graphics, Clock::time_point 
 	if (seconds <= 0.0) {
 		shown.frame_count = 0;
 	}
+	{
+		const auto totals = Common::CommandThreadProfile::Read();
+		const auto flips  = g_profile_flips.load(std::memory_order_relaxed);
+		if (seconds > 0.0) {
+			shown.profile = Common::CommandThreadProfile::MakeReport(shown.profile_totals, totals,
+			                                                         flips - shown.profile_flips);
+		}
+		shown.profile_totals = totals;
+		shown.profile_flips  = flips;
+	}
 	shown.shader_compile_peak_ns  = Common::DebugCounters::Get(Peak::ShaderCompileNs);
 	shown.pipeline_create_peak_ns = Common::DebugCounters::Get(Peak::PipelineCreateNs);
 	shown.sample_time             = now;
@@ -531,6 +549,97 @@ void DrawCompact(const Snapshot& shown) {
 		    Bytes(*host.system_memory_used) + " / " + Bytes(*host.system_memory_total));
 	}
 	ImGui::EndTable();
+}
+
+// GameFlex: the command thread's frame, cause by cause (exclusive times: they add up to the frame).
+void DrawCommandThread(const Snapshot& shown) {
+	using namespace Common::CommandThreadProfile;
+	const auto& report = shown.profile;
+	if (report.frames <= 0.0 || !BeginSection("Command thread (ms/frame)")) {
+		return;
+	}
+	std::array<size_t, CAUSE_COUNT> order {};
+	for (size_t i = 0; i < CAUSE_COUNT; i++) {
+		order[i] = i;
+	}
+	std::sort(order.begin(), order.end(),
+	          [&](size_t a, size_t b) { return report.ms_per_frame[a] > report.ms_per_frame[b]; });
+	double total = 0.0;
+	for (const double ms: report.ms_per_frame) {
+		total += ms;
+	}
+	for (size_t i = 0; i < 10 && report.ms_per_frame[order[i]] >= 0.05; i++) {
+		Row(Name(static_cast<Cause>(order[i])), Fmt("%.1f", report.ms_per_frame[order[i]]));
+	}
+	Row("Total", Fmt("%.1f", total));
+	if (report.gpu_buffers_per_frame > 0.0) {
+		Row("GPU busy / idle", Fmt("%.1f / %.1f ms", report.gpu_busy_ms_per_frame,
+		                           report.gpu_gap_ms_per_frame + report.gpu_queued_gap_ms_per_frame));
+	}
+	const auto& e = report.per_frame;
+	Row("Packets / draws", Fmt("%.0f / %.0f", e[static_cast<size_t>(Event::Packets)],
+	                           e[static_cast<size_t>(Event::Draws)] + e[static_cast<size_t>(Event::Dispatches)]));
+	Row("Barriers", Fmt("%.0f", e[static_cast<size_t>(Event::Barriers)]));
+	Row("Buffers / waits", Fmt("%.0f / %.0f", e[static_cast<size_t>(Event::Submits)],
+	                           e[static_cast<size_t>(Event::GpuWaits)]));
+	Row("Label polls", Fmt("%.0f", e[static_cast<size_t>(Event::LabelPolls)]));
+	ImGui::EndTable();
+}
+
+// GameFlex: the same report in the log, every --perf-log seconds, for benches.
+std::string ProfileLines(const Common::CommandThreadProfile::Report& report) {
+	using namespace Common::CommandThreadProfile;
+	std::string text;
+	char        line[256];
+	std::snprintf(line, sizeof(line), "[perf] %.2f frames/s over %.0f s; command thread, ms per frame:",
+	              report.seconds > 0.0 ? report.frames / report.seconds : 0.0, report.seconds);
+	text += line;
+	double total = 0.0;
+	for (size_t i = 0; i < CAUSE_COUNT; i++) {
+		total += report.ms_per_frame[i];
+		if (report.ms_per_frame[i] >= 0.005) {
+			std::snprintf(line, sizeof(line), " %s %.2f;", Name(static_cast<Cause>(i)), report.ms_per_frame[i]);
+			text += line;
+		}
+	}
+	std::snprintf(line, sizeof(line), " total %.2f\n[perf] GPU per frame: busy %.2f ms, idle %.2f ms waiting for the CPU and %.2f ms with work queued, %.1f buffers measured\n[perf] per frame:",
+	              total, report.gpu_busy_ms_per_frame, report.gpu_gap_ms_per_frame, report.gpu_queued_gap_ms_per_frame,
+	              report.gpu_buffers_per_frame);
+	text += line;
+	for (size_t i = 0; i < EVENT_COUNT; i++) {
+		std::snprintf(line, sizeof(line), " %s %.1f;", Name(static_cast<Event>(i)), report.per_frame[i]);
+		text += line;
+	}
+	text += "\n[perf] buffers closed per frame:";
+	for (size_t i = 0; i < CLOSE_COUNT; i++) {
+		std::snprintf(line, sizeof(line), " %s %.1f;", Name(static_cast<Close>(i)), report.closes_per_frame[i]);
+		text += line;
+	}
+	text += "\n[perf] packets per frame:";
+	for (const auto& [opcode, count]: report.packets_per_frame) {
+		if (count > 0.0) {
+			std::snprintf(line, sizeof(line), " %s %.0f;", Pm4::OpcodeName(opcode), count);
+			text += line;
+		}
+	}
+	text += "\n";
+	return text;
+}
+
+void ProfileLogThread(uint32_t period_seconds) {
+	auto totals = Common::CommandThreadProfile::Read();
+	auto flips  = g_profile_flips.load(std::memory_order_relaxed);
+	for (;;) {
+		std::this_thread::sleep_for(std::chrono::seconds(period_seconds));
+		const auto next_totals = Common::CommandThreadProfile::Read();
+		const auto next_flips  = g_profile_flips.load(std::memory_order_relaxed);
+		const auto text        = ProfileLines(
+            Common::CommandThreadProfile::MakeReport(totals, next_totals, next_flips - flips));
+		std::fputs(text.c_str(), stdout);
+		std::fflush(stdout);
+		totals = next_totals;
+		flips  = next_flips;
+	}
 }
 
 void DrawFramesAndCpu(const Snapshot& shown, vk::Extent2D extent) {
@@ -746,6 +855,11 @@ void DrawMemoryAndIo(const Snapshot& shown) {
 } // namespace
 
 void PerformanceOverlayRecordFlip(uint32_t guest_width, uint32_t guest_height) noexcept {
+	g_profile_flips.fetch_add(1, std::memory_order_relaxed);
+	if (const auto period = Config::PerfLogSeconds(); period != 0) {
+		static std::once_flag log_once;
+		std::call_once(log_once, [period] { std::thread(ProfileLogThread, period).detach(); });
+	}
 	if (!Common::DebugCounters::Enabled()) {
 		return;
 	}
@@ -869,6 +983,7 @@ float DrawPerformanceOverlay(const GraphicContext& graphics, vk::Extent2D extent
 				ImGui::TableNextRow();
 				ImGui::TableNextColumn();
 				DrawFramesAndCpu(shown, extent);
+				DrawCommandThread(shown);
 				ImGui::TableNextColumn();
 				DrawGpu(shown, graphics);
 				ImGui::TableNextColumn();

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/guestSync.h"
+#include "common/commandThreadProfile.h"
 
 #include <algorithm>
 
@@ -29,6 +30,8 @@ bool GuestSync::TransferOverlaps(vk::Buffer buffer, uint64_t offset, uint64_t si
 
 void GuestSync::Post(vk::CommandBuffer command) {
 	if (static_cast<bool>(m_stages)) {
+		Common::CommandThreadProfile::Scope ctp_barrier(Common::CommandThreadProfile::Cause::Barriers);
+		Common::CommandThreadProfile::Count(Common::CommandThreadProfile::Event::Barriers);
 		vk::MemoryBarrier2 barrier {};
 		barrier.srcStageMask  = m_stages;
 		barrier.srcAccessMask = m_access;
@@ -73,6 +76,8 @@ void GuestSync::BeforeTransfer(vk::CommandBuffer command, vk::Buffer buffer, uin
 	if (!TransferOverlaps(buffer, offset, size)) {
 		return;
 	}
+	Common::CommandThreadProfile::Scope ctp_profile(Common::CommandThreadProfile::Cause::Barriers);
+	Common::CommandThreadProfile::Count(Common::CommandThreadProfile::Event::Barriers);
 	vk::MemoryBarrier2 barrier {};
 	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllTransfer;
 	barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;

@@ -85,6 +85,8 @@ private:
 	// Completion callbacks can outlive GuestGpu during renderer shutdown.
 	std::shared_ptr<std::binary_semaphore> m_suspend_point_ready =
 	    std::make_shared<std::binary_semaphore>(1);
+	// GameFlex: a game thread waits at its suspend point for the previous frame (CommandThreadProfile).
+	std::atomic<bool> m_guest_at_suspend_point {false};
 
 	std::unique_ptr<CommandProcessor>                                m_gfx_cp;
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;
