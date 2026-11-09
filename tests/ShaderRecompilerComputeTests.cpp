@@ -2100,7 +2100,12 @@ u32 EncodeD16AsD32(uint16_t value) {
 
 class VulkanHarness {
 public:
-  VulkanHarness() { Init(); }
+  // byte_granular_robustness false: robust storage accesses may be aligned to 4 bytes, as on RADV - enough for cases
+  // that only read and write whole dwords in bounds (the V_MOVREL cases).
+  explicit VulkanHarness(bool byte_granular_robustness = true)
+      : m_byte_granular_robustness(byte_granular_robustness) {
+    Init();
+  }
   ~VulkanHarness() { Destroy(); }
   // Host float min/max is used on AMD GPUs, as in Kyty.
   [[nodiscard]] bool SupportsNativeFloatMinMax() const {
@@ -19390,7 +19395,8 @@ public:
       DrawRenderState state{.depth_info = depth, .color_info = {color}, .color_count = 1,
                             .topology = topology, .ps_active = true,
                             .vertex_info = {vertex}, .ps_input_info = pixel};
-      return context.GetPipelineCache().GetGraphicsPipeline(scheduler.Current(), state);
+      // GetGraphicsPipeline returns a pointer since the pipelines compile aside.
+      return *context.GetPipelineCache().GetGraphicsPipeline(scheduler.Current(), state);
     };
     auto &filled = pipeline(true, 2, 2);
     const auto draw = [&](const PipelineCache::Pipeline &selected,
@@ -22473,6 +22479,7 @@ public:
 
 private:
   bool m_rasterization_supported = true;
+  bool m_byte_granular_robustness = true;
   u32   m_skipped_cases          = 0;
 
   RenderContext &Renderer() {
@@ -22686,7 +22693,8 @@ private:
     Require("VulkanHarness", "dispatch",
             available_robustness2.robustBufferAccess2 == true &&
                 available_pipeline_robustness.pipelineRobustness == true &&
-                robustness2_properties.robustStorageBufferAccessSizeAlignment == 1u,
+                robustness2_properties.robustStorageBufferAccessSizeAlignment <=
+                    (m_byte_granular_robustness ? 1u : 4u),
             "byte-granular per-pipeline robustBufferAccess2 is not supported");
     Require("VulkanHarness", "dispatch",
             available_features.shaderStorageImageWriteWithoutFormat == true,
@@ -30265,6 +30273,57 @@ TestCase Vop1MoveRelDestination() {
   test.compute_info.thread_ids_num = 1;
   test.has_compute_info = true;
   return test;
+}
+
+// V_MOVRELS_B32 over 192 registers, v10 up to v201: the local array of 0085 in three parts, read in the second and
+// the third.
+TestCase Vop1MoveRelSourceAcrossArrays() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 10, 0x10101010u);
+  AppendVMovLiteral(&code, 80, 0x80808080u);
+  AppendVMovLiteral(&code, 150, 0x15015015u);
+  AppendSMovLiteral(&code, 124, 70);
+  code.push_back(EncodeVop1(0x43, 200, Vgpr(10))); // v200 = v[10 + 70]
+  AppendSMovLiteral(&code, 124, 140);
+  code.push_back(EncodeVop1(0x43, 201, Vgpr(10))); // v201 = v[10 + 140]
+  AppendStoreVgpr(&code, 200, 0);
+  AppendStoreVgpr(&code, 201, 1);
+  AppendEnd(&code);
+
+  return {"Vop1MoveRelSourceAcrossArrays",
+          code,
+          {},
+          {0x80808080u, 0x15015015u},
+          {O::V_MOV_B32, O::S_MOV_B32, O::V_MOVRELS_B32, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
+}
+
+// V_MOVRELD_B32 into the third part of the local array of 0085; the registers of the other two keep their values.
+TestCase Vop1MoveRelDestinationAcrossArrays() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 1, 0x12345678u);
+  AppendVMovLiteral(&code, 10, 0x10101010u);
+  AppendVMovLiteral(&code, 80, 0x80808080u);
+  AppendVMovLiteral(&code, 150, 0x15015015u);
+  AppendVMovLiteral(&code, 200, 0x20020020u);
+  AppendSMovLiteral(&code, 124, 140);
+  code.push_back(EncodeVop1(0x42, 10, Vgpr(1))); // v[10 + 140] = v1
+  AppendStoreVgpr(&code, 10, 0);
+  AppendStoreVgpr(&code, 80, 1);
+  AppendStoreVgpr(&code, 150, 2);
+  AppendStoreVgpr(&code, 200, 3);
+  AppendEnd(&code);
+
+  return {"Vop1MoveRelDestinationAcrossArrays",
+          code,
+          {},
+          {0x10101010u, 0x80808080u, 0x12345678u, 0x20020020u},
+          {O::V_MOV_B32, O::S_MOV_B32, O::V_MOVRELD_B32, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase CubeIdCapturedNegationAndOutputScale() {
@@ -47582,6 +47641,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop3LdexpSourceModifier);
   AddCase(Vop1MoveRelSource);
   AddCase(Vop1MoveRelDestination);
+  AddCase(Vop1MoveRelSourceAcrossArrays);
+  AddCase(Vop1MoveRelDestinationAcrossArrays);
   AddCase(VectorFloatSpecialOps);
   AddCase(CubeIdCapturedNegationAndOutputScale);
   AddCase(MadMixF16LiteralHalfSourceUsesOpsel);
@@ -54061,6 +54122,20 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  // V_MOVRELS/V_MOVRELD through a local array (0085): compiled and validated without the GPU, or run on it.
+  if (argc == 2 && (std::strcmp(argv[1], "--movrel-compile-only") == 0 || std::strcmp(argv[1], "--movrel-only") == 0)) {
+    const bool compile_only = std::strcmp(argv[1], "--movrel-compile-only") == 0;
+    std::optional<VulkanHarness> vulkan;
+    if (!compile_only) {
+      vulkan.emplace(false);
+    }
+    for (auto test: {Vop1MoveRelSource(), Vop1MoveRelDestination(), Vop1MoveRelSourceAcrossArrays(),
+                     Vop1MoveRelDestinationAcrossArrays()}) {
+      test.compile_only = compile_only;
+      RunCase(compile_only ? nullptr : &*vulkan, test);
+    }
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--mul-hi24-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorMulHi24(32));
