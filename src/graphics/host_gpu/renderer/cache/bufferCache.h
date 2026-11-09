@@ -223,6 +223,7 @@ private:
 		uint64_t value = 0;
 	};
 	std::map<uint64_t, PendingGuestWriteEntry> m_pending_guest_writes;
+	uint64_t                                   m_pending_guest_writes_expired = 0; // the GPU tick of the last expiry
 	// A window of guest addresses starts at every GiB and covers two: any range up to 1 GiB fits
 	// one (the device's buffers stay under 4 GiB).
 	static constexpr uint32_t UnifiedWindowBits = 30;

@@ -1036,8 +1036,11 @@ bool BufferCache::PendingGuestWrite(uint64_t vaddr, uint64_t size, uint64_t* val
 	if (m_pending_guest_writes.empty()) {
 		return false;
 	}
-	const auto done = m_scheduler.GetMasterSemaphore().KnownGpuTick();
-	std::erase_if(m_pending_guest_writes, [done](const auto& entry) { return entry.second.tick <= done; });
+	// Labels written since the last expiry carry later ticks: the same tick has nothing to expire.
+	if (const auto done = m_scheduler.GetMasterSemaphore().KnownGpuTick(); done != m_pending_guest_writes_expired) {
+		m_pending_guest_writes_expired = done;
+		std::erase_if(m_pending_guest_writes, [done](const auto& entry) { return entry.second.tick <= done; });
+	}
 	const auto found = m_pending_guest_writes.find(vaddr);
 	if (found == m_pending_guest_writes.end() || found->second.size != size) {
 		return false;

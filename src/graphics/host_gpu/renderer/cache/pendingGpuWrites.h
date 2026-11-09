@@ -34,6 +34,8 @@ private:
 	[[nodiscard]] std::vector<Range>::const_iterator FirstEndingAfter(uint64_t address) const noexcept;
 
 	std::vector<Range> m_ranges;
+	// The GPU tick of the last expiry: ranges added since carry later ticks, so the same tick finds nothing.
+	uint64_t           m_expired_tick = 0;
 };
 
 } // namespace Libs::Graphics
