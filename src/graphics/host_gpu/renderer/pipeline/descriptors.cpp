@@ -504,12 +504,15 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		return {.layout = vk::ImageLayout::eGeneral};
 	}
 	// Found before, for this descriptor and this shader resource, with nothing registered or freed over that
-	// memory since: the same image. Heap descriptors depend on what is mapped: they are resolved every time.
+	// memory since and the image still usable as it is (a replacement or an expansion elsewhere leaves the
+	// region's generation alone): the same image. Heap descriptors depend on what is mapped: they are resolved
+	// every time.
 	const TextureBindingKey key {value.dwords, &resource};
 	if (!resource.heap) {
 		if (const auto found = m_texture_bindings.find(key); found != m_texture_bindings.end()) {
 			const auto& data = found->second.desc.info.data;
-			if (found->second.generation == texture_cache.RegionGeneration(data.address, data.size)) {
+			if (found->second.generation == texture_cache.RegionGeneration(data.address, data.size) &&
+			    texture_cache.BindingUsable(found->second.image_id)) {
 				const auto& cached = found->second;
 				texture_cache.TouchFoundImage(cached.found_id, cached.desc, cached.metadata_base_layer);
 				return {cached.image_id, nullptr, cached.desc};

@@ -70,6 +70,7 @@ enum class Event : uint8_t {
 	LabelPolls,     // Wake-ups while every queue waits for a label.
 	LabelWaitsGpu,  // Guest waits suspended on a value a pending GPU write will set.
 	LabelWaitsCpu,  // Guest waits suspended on a value nothing pending on the GPU will set.
+	TrustedWaits,   // Guest waits passed behind a barrier: a shader recorded before writes the value.
 	GpuWaits,       // Waits of this thread for the GPU.
 	MemoryAllocations, // Vulkan device memory allocated (driver buffer objects), any thread.
 	MemoryReleases,
@@ -350,7 +351,7 @@ struct Report {
 [[nodiscard]] constexpr const char* Name(Event event) noexcept {
 	constexpr const char* NAMES[EVENT_COUNT] = {
 	    "packets", "draws",       "dispatches", "barriers",    "command buffers", "submits",
-	    "retries", "label polls", "label waits GPU", "label waits CPU", "GPU waits", "allocations", "releases"};
+	    "retries", "label polls", "label waits GPU", "label waits CPU", "trusted waits", "GPU waits", "allocations", "releases"};
 	return NAMES[static_cast<size_t>(event)];
 }
 

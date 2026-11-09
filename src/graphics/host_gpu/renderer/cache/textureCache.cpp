@@ -1265,6 +1265,12 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	return association;
 }
 
+bool TextureCache::BindingUsable(ImageId id) {
+	std::scoped_lock lock {m_lock};
+	const auto&      image = m_slot_images[id];
+	return image.registered && !image.depth_id && !image.binding.needs_rebind;
+}
+
 void TextureCache::TouchFoundImage(ImageId id, const ImageDesc& desc, uint32_t metadata_base_layer) {
 	{
 		std::scoped_lock lock {m_lock};

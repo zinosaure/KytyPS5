@@ -262,13 +262,17 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 		EXIT("unsupported wait_reg_mem operation: 0x%08" PRIx32 "\n", wait_op);
 	}
 
-	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
+	auto& buffers = m_renderer.GetBufferCache();
+	if (TestWaitRegMemValue(*addr, ref, mask, func)) {
+		buffers.GuestWaitPassed(reinterpret_cast<uint64_t>(addr));
+		return;
+	}
+	{
 		// Unified memory: a label the GPU writes in work recorded before. Its barriers already
 		// hold everything recorded after it until the work before it is done, which is what the
 		// wait asks: go on recording. A wait on another value, the CPU or another queue suspends.
 		uint64_t pending = 0;
-		if (m_renderer.GetBufferCache().PendingGuestWrite(reinterpret_cast<uint64_t>(addr),
-		                                                  sizeof(T), &pending) &&
+		if (buffers.PendingGuestWrite(reinterpret_cast<uint64_t>(addr), sizeof(T), &pending) &&
 		    TestWaitRegMemValue(static_cast<T>(pending), ref, mask, func)) {
 			// The label lands once everything before it is done: the CP waits for all of it, and so does the
 			// barrier the next command posts (GuestSync).
@@ -276,10 +280,17 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 			                               vk::AccessFlagBits2::eMemoryWrite);
 			return;
 		}
+		// A value a shader recorded before writes: the same barrier, once the address is trusted (BufferCache).
+		if (buffers.TrustPendingGpuWrite(reinterpret_cast<uint64_t>(addr), sizeof(T), func, ref, mask)) {
+			m_renderer.GetGuestSync().Wait(vk::PipelineStageFlagBits2::eAllCommands,
+			                               vk::AccessFlagBits2::eMemoryWrite);
+			Common::CommandThreadProfile::Count(Common::CommandThreadProfile::Event::TrustedWaits);
+			return;
+		}
 		// What the wait is for, for the command thread's report: a write on its way to the GPU, or nothing there.
 		Common::CommandThreadProfile::NoteLabelWait(
-		    m_renderer.GetBufferCache().PendingGuestWrite(reinterpret_cast<uint64_t>(addr), sizeof(T), &pending) ||
-		    m_renderer.GetBufferCache().HasPendingGpuWrites(reinterpret_cast<uint64_t>(addr), sizeof(T)));
+		    buffers.PendingGuestWrite(reinterpret_cast<uint64_t>(addr), sizeof(T), &pending) ||
+		    buffers.HasPendingGpuWrites(reinterpret_cast<uint64_t>(addr), sizeof(T)));
 		Common::GameFlex::NoteGpuWait("wait_reg_mem", reinterpret_cast<uint64_t>(addr), static_cast<uint64_t>(*addr),
 		                           static_cast<uint64_t>(ref), static_cast<uint64_t>(mask), func);
 		SuspendPm4();

@@ -35,6 +35,11 @@ void PendingGpuWrites::Add(uint64_t address, uint64_t size, uint64_t tick) {
 }
 
 void PendingGpuWrites::Expire(uint64_t done_tick) {
+	// Asked at every resource-table read and guest wait, mostly with the same tick: a scan only when it moved.
+	if (done_tick == m_expired_tick) {
+		return;
+	}
+	m_expired_tick = done_tick;
 	std::erase_if(m_ranges, [done_tick](const Range& range) { return range.tick <= done_tick; });
 }
 

@@ -1036,8 +1036,11 @@ bool BufferCache::PendingGuestWrite(uint64_t vaddr, uint64_t size, uint64_t* val
 	if (m_pending_guest_writes.empty()) {
 		return false;
 	}
-	const auto done = m_scheduler.GetMasterSemaphore().KnownGpuTick();
-	std::erase_if(m_pending_guest_writes, [done](const auto& entry) { return entry.second.tick <= done; });
+	// Labels written since the last expiry carry later ticks: the same tick has nothing to expire.
+	if (const auto done = m_scheduler.GetMasterSemaphore().KnownGpuTick(); done != m_pending_guest_writes_expired) {
+		m_pending_guest_writes_expired = done;
+		std::erase_if(m_pending_guest_writes, [done](const auto& entry) { return entry.second.tick <= done; });
+	}
 	const auto found = m_pending_guest_writes.find(vaddr);
 	if (found == m_pending_guest_writes.end() || found->second.size != size) {
 		return false;
@@ -1073,34 +1076,45 @@ bool BufferCache::HasPendingGpuWrites(uint64_t vaddr, uint64_t size) {
 // wait for it (Finish), which leaves the GPU dry while the thread records what follows. Games keep small counters
 // there that a compute pass rewrites every frame to the same value (Astro Bot: two 32-byte counters, 40 waits an
 // image, unchanged 5 196 times out of 5 218): once a word came out of eight waits unchanged, the read takes the
-// value in memory without waiting, and the GPU's value is checked once its work is done. A difference revokes the
-// word for good and says so on the console.
+// value in memory without waiting, and the GPU's value is checked once its work is done. A difference withdraws
+// the trust and says so on the console. A word that changes once, when a level loads, and then holds still
+// (Astro Bot's light counter: 4 then 6 for good) earned it back nowhere and cost two full drains an image,
+// 33 ms, once the thread stopped waiting for labels (0072): the trust comes back after twice as many unchanged
+// waits as the time before, and only the fifth difference revokes the word for good.
 namespace {
 constexpr uint32_t kSpeculationConfirmations = 8;
+constexpr uint32_t kSpeculationMisses        = 5; // differences before the word is revoked for good
 constexpr uint64_t kSpeculationRangeBytes    = 256; // a counter, not a table the GPU fills
 } // namespace
 
 void BufferCache::VerifySrtSpeculations() {
 	const auto done = m_scheduler.GetMasterSemaphore().KnownGpuTick();
-	for (auto& [address, speculation]: m_srt_speculation) {
-		if (speculation.verify_tick == 0 || speculation.verify_tick > done) {
-			continue;
+	std::erase_if(m_srt_verifications, [&](uint64_t address) {
+		auto& speculation = m_srt_speculation[address];
+		if (speculation.verify_tick == 0) {
+			return true;
+		}
+		if (speculation.verify_tick > done) {
+			return false;
 		}
 		speculation.verify_tick = 0;
 		uint32_t landed = 0;
 		if (!LibKernel::Memory::TryReadBacking(address, &landed, sizeof(landed)) ||
 		    landed == speculation.used) {
-			continue;
+			return true;
 		}
-		speculation.trusted = false;
-		speculation.revoked = true;
+		speculation.trusted       = false;
+		speculation.confirmations = 0;
+		speculation.revoked       = ++speculation.misses >= kSpeculationMisses;
 		static uint32_t misses = 0;
 		if (misses++ < 50) {
 			std::printf("SRT speculation: the GPU wrote 0x%08x at 0x%016" PRIx64 " after 0x%08x was used; "
-			            "this word waits again from now on\n",
-			            landed, address, speculation.used);
+			            "this word waits again%s\n",
+			            landed, address, speculation.used,
+			            speculation.revoked ? " from now on" : " until it holds still for longer");
 		}
-	}
+		return true;
+	});
 }
 
 bool BufferCache::FinishPendingGpuWritesUnder(std::span<const uint64_t> addresses) {
@@ -1109,7 +1123,7 @@ bool BufferCache::FinishPendingGpuWritesUnder(std::span<const uint64_t> addresse
 		return false;
 	}
 	m_pending_gpu_writes.Expire(m_scheduler.GetMasterSemaphore().KnownGpuTick());
-	if (!m_srt_speculation.empty()) {
+	if (!m_srt_verifications.empty()) {
 		VerifySrtSpeculations();
 	}
 	if (m_pending_gpu_writes.Empty()) {
@@ -1126,6 +1140,7 @@ bool BufferCache::FinishPendingGpuWritesUnder(std::span<const uint64_t> addresse
 			if (LibKernel::Memory::TryReadBacking(address, &used, sizeof(used))) {
 				if (speculation.verify_tick == 0) {
 					speculation.used = used;
+					m_srt_verifications.push_back(address);
 				}
 				speculation.verify_tick = std::max(speculation.verify_tick, range->tick);
 				continue;
@@ -1141,13 +1156,122 @@ bool BufferCache::FinishPendingGpuWritesUnder(std::span<const uint64_t> addresse
 			LibKernel::Memory::TryReadBacking(address, &after, sizeof(after));
 			if (after != before) {
 				speculation.confirmations = 0;
-			} else if (++speculation.confirmations >= kSpeculationConfirmations) {
+			} else if (++speculation.confirmations >= kSpeculationConfirmations << speculation.misses) {
 				speculation.trusted = true;
 			}
 		}
 		return true;
 	}
 	return false;
+}
+
+// The command processor's own comparison (graphicsRun.cpp).
+bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func);
+
+// Astro Bot's graphics queue waits about nine times an image for a flag its compute work sets to 1, each time
+// submitting, then polling until the GPU wrote it: 35 ms an image, the GPU and the thread taking turns. The
+// compute work is recorded before, on the same Vulkan queue: the wait needs only a barrier, if the flag lands.
+// The check read the flag in memory once the writer's work was done, which may be long after: the game clears
+// its flags once it saw them, and Astro Bot's three busiest ones were revoked while the level loaded, each wait
+// then a 40 ms drain. The GPU copies the value where the wait is in the stream, which is what the wait saw.
+namespace {
+constexpr uint32_t kFlagConfirmations = 4;
+constexpr uint32_t kFlagCaptureSlots  = 1024; // trusted waits not checked yet, 8 bytes each
+} // namespace
+
+void BufferCache::VerifyFlagSpeculations() {
+	const auto done = m_scheduler.GetMasterSemaphore().KnownGpuTick();
+	std::erase_if(m_flag_verifications, [&](const FlagCheck& check) {
+		if (check.tick > done) {
+			return false;
+		}
+		const auto offset = uint64_t {check.slot} * sizeof(uint64_t);
+		m_flag_captures->Invalidate(offset, sizeof(uint64_t));
+		uint64_t seen = 0;
+		std::memcpy(&seen, m_flag_captures->Mapped().data() + offset, check.size);
+		if (TestWaitRegMemValue(seen, check.ref, check.mask, check.func)) {
+			return true;
+		}
+		auto& flag   = m_flag_speculation[check.address];
+		flag.trusted = false;
+		flag.revoked = true;
+		static uint32_t misses = 0;
+		if (misses++ < 50) {
+			std::printf("Guest wait speculation: 0x%016" PRIx64 " held 0x%" PRIx64 " where the wait was, which "
+			            "wanted 0x%" PRIx64 "; this address waits again from now on\n",
+			            check.address, seen, check.ref);
+		}
+		return true;
+	});
+}
+
+bool BufferCache::TrustPendingGpuWrite(uint64_t vaddr, uint64_t size, uint32_t func, uint64_t ref, uint64_t mask) {
+	if (m_pending_gpu_writes.Empty()) {
+		return false;
+	}
+	m_pending_gpu_writes.Expire(m_scheduler.GetMasterSemaphore().KnownGpuTick());
+	if (!m_flag_verifications.empty()) {
+		VerifyFlagSpeculations();
+	}
+	const auto* range = m_pending_gpu_writes.Find(vaddr);
+	if (range == nullptr) {
+		return false;
+	}
+	auto& flag = m_flag_speculation[vaddr];
+	if (flag.revoked) {
+		return false;
+	}
+	if (!flag.trusted) {
+		flag.waiting = true;
+		return false;
+	}
+	// Checks end in the order they were recorded: with fewer than kFlagCaptureSlots waiting, the next slot is free.
+	const auto window = UnifiedWindow(vaddr, size);
+	if (!window || m_flag_verifications.size() >= kFlagCaptureSlots) {
+		return false;
+	}
+	if (!m_flag_captures) {
+		m_flag_captures = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		                                           vk::BufferUsageFlagBits::eTransferDst,
+		                                           kFlagCaptureSlots * sizeof(uint64_t));
+	}
+	const auto slot = m_flag_capture_next;
+	m_flag_capture_next = (m_flag_capture_next + 1) % kFlagCaptureSlots;
+	auto& source  = m_slot_buffers[window];
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto native = command.Handle();
+	// Everything recorded before is done and its writes land first, as the wait asks of the command processor.
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer, {}, 1,
+	                       &before, 0, nullptr, 0, nullptr);
+	const vk::BufferCopy copy {source.Offset(vaddr), uint64_t {slot} * sizeof(uint64_t), size};
+	native.copyBuffer(source.Handle(), m_flag_captures->Handle(), 1, &copy);
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 1, &after, 0,
+	                       nullptr, 0, nullptr);
+	m_flag_verifications.push_back({vaddr, m_scheduler.CurrentTick(), ref, mask, func, static_cast<uint32_t>(size),
+	                                slot});
+	return true;
+}
+
+void BufferCache::GuestWaitPassed(uint64_t vaddr) {
+	if (m_flag_speculation.empty()) {
+		return;
+	}
+	const auto found = m_flag_speculation.find(vaddr);
+	if (found == m_flag_speculation.end() || !found->second.waiting) {
+		return;
+	}
+	auto& flag   = found->second;
+	flag.waiting = false;
+	if (!flag.revoked && ++flag.confirmations >= kFlagConfirmations) {
+		flag.trusted = true;
+	}
 }
 
 bool BufferCache::TakeUnifiedGpuWrites(uint64_t vaddr, uint64_t size) {
