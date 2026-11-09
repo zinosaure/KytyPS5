@@ -98,11 +98,13 @@ public:
 	// As FinishPendingGpuWrites, for the 4-byte reads of the SRT walker; true when it waited.
 	bool FinishPendingGpuWritesUnder(std::span<const uint64_t> addresses);
 	// A word of a table of resources inside a range the GPU may still write, read without waiting once its value
-	// came out of eight waits unchanged; the GPU's value is compared afterwards, a difference revokes it for good.
+	// came out of eight waits unchanged; the GPU's value is compared afterwards. A difference withdraws the trust,
+	// which comes back after twice as many unchanged waits each time; the fifth revokes the word for good.
 	struct SrtSpeculation {
 		uint32_t confirmations = 0; // consecutive waits that changed nothing
 		bool     trusted       = false;
-		bool     revoked       = false; // once wrong, never trusted again
+		bool     revoked       = false; // wrong five times: never trusted again
+		uint32_t misses        = 0;     // differences seen so far
 		uint32_t used          = 0;     // the value read without waiting
 		uint64_t verify_tick   = 0;     // the GPU work it skipped waiting for; 0 when nothing is to verify
 	};

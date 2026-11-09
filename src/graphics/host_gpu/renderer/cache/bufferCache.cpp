@@ -1076,10 +1076,14 @@ bool BufferCache::HasPendingGpuWrites(uint64_t vaddr, uint64_t size) {
 // wait for it (Finish), which leaves the GPU dry while the thread records what follows. Games keep small counters
 // there that a compute pass rewrites every frame to the same value (Astro Bot: two 32-byte counters, 40 waits an
 // image, unchanged 5 196 times out of 5 218): once a word came out of eight waits unchanged, the read takes the
-// value in memory without waiting, and the GPU's value is checked once its work is done. A difference revokes the
-// word for good and says so on the console.
+// value in memory without waiting, and the GPU's value is checked once its work is done. A difference withdraws
+// the trust and says so on the console. A word that changes once, when a level loads, and then holds still
+// (Astro Bot's light counter: 4 then 6 for good) earned it back nowhere and cost two full drains an image,
+// 33 ms, once the thread stopped waiting for labels (0072): the trust comes back after twice as many unchanged
+// waits as the time before, and only the fifth difference revokes the word for good.
 namespace {
 constexpr uint32_t kSpeculationConfirmations = 8;
+constexpr uint32_t kSpeculationMisses        = 5; // differences before the word is revoked for good
 constexpr uint64_t kSpeculationRangeBytes    = 256; // a counter, not a table the GPU fills
 } // namespace
 
@@ -1095,13 +1099,15 @@ void BufferCache::VerifySrtSpeculations() {
 		    landed == speculation.used) {
 			continue;
 		}
-		speculation.trusted = false;
-		speculation.revoked = true;
+		speculation.trusted       = false;
+		speculation.confirmations = 0;
+		speculation.revoked       = ++speculation.misses >= kSpeculationMisses;
 		static uint32_t misses = 0;
 		if (misses++ < 50) {
 			std::printf("SRT speculation: the GPU wrote 0x%08x at 0x%016" PRIx64 " after 0x%08x was used; "
-			            "this word waits again from now on\n",
-			            landed, address, speculation.used);
+			            "this word waits again%s\n",
+			            landed, address, speculation.used,
+			            speculation.revoked ? " from now on" : " until it holds still for longer");
 		}
 	}
 }
@@ -1144,7 +1150,7 @@ bool BufferCache::FinishPendingGpuWritesUnder(std::span<const uint64_t> addresse
 			LibKernel::Memory::TryReadBacking(address, &after, sizeof(after));
 			if (after != before) {
 				speculation.confirmations = 0;
-			} else if (++speculation.confirmations >= kSpeculationConfirmations) {
+			} else if (++speculation.confirmations >= kSpeculationConfirmations << speculation.misses) {
 				speculation.trusted = true;
 			}
 		}
