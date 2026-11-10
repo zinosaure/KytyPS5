@@ -63,7 +63,10 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	depth.imageLayout = depth_stencil.image_layout;
 	depth.loadOp =
 	    depth_stencil.depth_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad;
-	depth.storeOp                       = vk::AttachmentStoreOp::eStore;
+	// A read-only aspect stores nothing: binding it stays a read, which needs no barrier after another read.
+	const auto writable = DepthAttachmentWritableAspects(depth_stencil.image_layout);
+	depth.storeOp = (writable & vk::ImageAspectFlagBits::eDepth) ? vk::AttachmentStoreOp::eStore
+	                                                              : vk::AttachmentStoreOp::eNone;
 	depth.clearValue.depthStencil.depth = std::bit_cast<float>(depth_stencil.clear_value[0]);
 
 	vk::RenderingAttachmentInfo stencil {};
@@ -71,7 +74,8 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	stencil.imageLayout = depth_stencil.image_layout;
 	stencil.loadOp =
 	    depth_stencil.stencil_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad;
-	stencil.storeOp                         = vk::AttachmentStoreOp::eStore;
+	stencil.storeOp = (writable & vk::ImageAspectFlagBits::eStencil) ? vk::AttachmentStoreOp::eStore
+	                                                                  : vk::AttachmentStoreOp::eNone;
 	stencil.clearValue.depthStencil.stencil = depth_stencil.clear_value[1];
 
 	vk::RenderingInfo rendering {};

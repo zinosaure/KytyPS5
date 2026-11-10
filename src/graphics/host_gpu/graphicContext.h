@@ -149,6 +149,9 @@ struct VulkanImageState {
 	vk::PipelineStageFlags2 pl_stage    = vk::PipelineStageFlagBits2::eAllCommands;
 	vk::AccessFlags2        access_mask = vk::AccessFlagBits2::eNone;
 	vk::ImageLayout         layout      = vk::ImageLayout::eUndefined;
+	// GameFlex: the stages in which any read sees the last write, without a barrier: set by a barrier into a
+	// read-only access, which makes the write visible to every read there. None after a barrier into a write.
+	vk::PipelineStageFlags2 read_stages {};
 };
 
 struct VulkanImage {
