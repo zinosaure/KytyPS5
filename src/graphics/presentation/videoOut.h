@@ -38,6 +38,8 @@ public:
 	void CompleteFlip(uint64_t request_id);
 	void WaitForSubmitSlot(int handle);
 	void WaitFlipDone(int handle, int index);
+	// GameFlex: whether a flip of the buffer is pending, which WaitFlipDone would wait for (CommandThreadProfile).
+	[[nodiscard]] bool HasPendingFlip(int handle, int index);
 
 	[[nodiscard]] Impl& State() noexcept;
 

@@ -35,7 +35,9 @@ enum class Cause : uint8_t {
 	Record,    // Vulkan recording of a draw or dispatch: pipeline, state, the call itself.
 	Compile,   // Shaders translated, pipelines created.
 	Transfers, // DMA copies and fills.
-	Submit,    // Command buffers begun, ended and submitted.
+	SubmitBegin, // Command buffers taken from the pool and begun, the GPU timestamps of finished ones read.
+	SubmitEnd,   // Command buffers ended: the progress marker, the barrier the game still owes (GuestSync).
+	SubmitQueue, // vkQueueSubmit itself, under the queue lock.
 	Upkeep,    // Frame boundaries: suspend points, flips, cache aging.
 	Foreign,   // Work other threads hand to this one.
 	// Waits.
@@ -86,13 +88,61 @@ enum class Close : uint8_t {
 	Boundary,   // The end of a guest command list.
 	BeforeIdle, // The thread was about to sleep or poll.
 	Wait,       // The CPU needed the GPU to finish (readback, Finish).
-	Frame,      // A suspend point or a flip.
+	// The frame's fixed points.
+	SuspendPoint, // The game's suspend point (sceAgcSuspendPoint).
+	Flip,         // A flip in the graphics command stream.
+	CpuFlip,      // A flip the game submitted from the CPU.
+	WaitFlipDone, // The stream waits until a flip is done.
 	Other,
 	Count
 };
 
 constexpr size_t CLOSE_COUNT  = static_cast<size_t>(Close::Count);
 constexpr size_t PACKET_KINDS = 256; // PM4 type-3 opcodes.
+
+// GameFlex: who asks Image::Transit for a layout and an access. A call that records no barrier is booked under its
+// caller's cause (targets, bindings), so its own cost shows nowhere.
+enum class TransitCaller : uint8_t {
+	Targets,  // Render targets and depth.
+	Bindings, // The images a draw or a dispatch binds.
+	Heap,     // The resident image heap returning an image to the read state.
+	Other,    // Copies, uploads, blits, resolves, presentation.
+	Count
+};
+
+constexpr size_t TRANSIT_CALLER_COUNT = static_cast<size_t>(TransitCaller::Count);
+// Image::Transit calls by whether they record a barrier, by path (the whole image at once, or subresource by
+// subresource) and by caller.
+constexpr size_t TRANSIT_KINDS = 2 * 2 * TRANSIT_CALLER_COUNT;
+
+[[nodiscard]] constexpr size_t TransitIndex(bool barrier, bool per_subresource, TransitCaller caller) noexcept {
+	return (static_cast<size_t>(barrier) * 2 + static_cast<size_t>(per_subresource)) * TRANSIT_CALLER_COUNT +
+	       static_cast<size_t>(caller);
+}
+
+// Steps too frequent and too short for the cause clock: every call counted, about one in 16 timed.
+enum class Timed : uint8_t {
+	TransitFull,         // An Image::Transit of the whole image that records no barrier.
+	TransitSubresources, // An Image::Transit subresource by subresource that records no barrier.
+	DrawState,           // A draw's DrawRenderState built (value-initialized).
+	Count
+};
+
+constexpr size_t TIMED_COUNT = static_cast<size_t>(Timed::Count);
+
+// Where the last writer of the words the CPU waits for stands when the wait starts.
+enum class Writer : uint8_t {
+	Open,      // The command buffer being recorded: the wait submits it.
+	Submitted, // Submitted, not executed yet.
+	Executed,  // Executed, as the progress word says; the GPU has not signalled it done yet.
+	Count
+};
+
+constexpr size_t WRITER_COUNT = static_cast<size_t>(Writer::Count);
+// Waits for words the GPU writes, by the cause their time is booked under: WaitGpuSrt (a resource table), WaitGpuRead
+// (any other read), or another one when an outer reason wins (a remap, a flip: WaitReasonScope).
+constexpr size_t WORD_WAIT_CAUSES = 3;
+constexpr size_t WORD_WAIT_COUNT  = WORD_WAIT_CAUSES * WRITER_COUNT;
 
 namespace Detail {
 inline std::atomic<uint64_t> g_ticks[CAUSE_COUNT] {};
@@ -104,6 +154,36 @@ inline std::atomic<uint64_t> g_gpu_busy_ns {0};
 inline std::atomic<uint64_t> g_gpu_gap_ns {0};      // The GPU ran dry: the buffer after the gap came late.
 inline std::atomic<uint64_t> g_gpu_queued_gap_ns {0}; // The buffer after the gap was already waiting.
 inline std::atomic<uint64_t> g_gpu_buffers {0};
+// GameFlex (0088): what the P4 pieces are decided on.
+inline std::atomic<uint64_t> g_empty_closes[CLOSE_COUNT] {}; // Buffers submitted with nothing recorded in them.
+inline std::atomic<uint64_t> g_empty_operation_closes[CLOSE_COUNT] {}; // Of those, the ones an operation waits for.
+inline std::atomic<uint64_t> g_timestamp_ticks {0};          // The GPU timestamps, inside submit begin and end.
+inline std::atomic<uint64_t> g_transits[TRANSIT_KINDS] {};
+inline std::atomic<uint64_t> g_timed_calls[TIMED_COUNT] {};
+inline std::atomic<uint64_t> g_timed_samples[TIMED_COUNT] {}; // The calls timed.
+inline std::atomic<uint64_t> g_timed_ticks[TIMED_COUNT] {};   // Their time, the two clock reads included.
+inline std::atomic<uint64_t> g_clock_pairs {0};               // Back-to-back pairs of clock reads (CalibrateClock).
+inline std::atomic<uint64_t> g_clock_pair_ticks {0};          // Their time.
+inline std::atomic<uint64_t> g_word_waits[WORD_WAIT_COUNT] {};
+inline std::atomic<uint64_t> g_word_wait_ticks[WORD_WAIT_COUNT] {};     // The wait itself: its cause's share.
+inline std::atomic<uint64_t> g_word_finish_ticks[WORD_WAIT_COUNT] {};   // The whole Finish: submit, begin, operations.
+inline std::atomic<uint64_t> g_word_wait_ahead[WORD_WAIT_COUNT] {};     // Buffers the GPU executes up to the writer.
+inline std::atomic<uint64_t> g_word_wait_behind[WORD_WAIT_COUNT] {};    // Buffers after it, the open one included.
+inline std::atomic<uint64_t> g_word_wait_open_used[WORD_WAIT_COUNT] {}; // Waits with work in the open buffer.
+// The stream's waits for a flip done (WaitFlipDone): without, then with a flip of that buffer pending before the
+// flush that precedes them.
+inline std::atomic<uint64_t> g_flip_waits[2] {};
+inline std::atomic<uint64_t> g_flip_wait_ticks[2] {}; // Their share of WaitGpuFrame.
+// The game's suspend points: taken by this thread, released once the GPU has done everything before them.
+inline std::atomic<uint64_t> g_suspend_taken {0};
+inline std::atomic<uint64_t> g_suspend_taken_ns {0};      // From the game's call.
+inline std::atomic<uint64_t> g_suspend_taken_buffers {0}; // Buffers submitted and not executed, when taken.
+inline std::atomic<uint64_t> g_suspend_released {0};
+inline std::atomic<uint64_t> g_suspend_released_ns {0}; // From being taken.
+inline std::atomic<uint64_t> g_suspend_released_buffers {0};
+
+constexpr uint32_t CLOCK_PAIRS             = 1024; // When the thread starts.
+constexpr uint32_t CLOCK_PAIRS_RECALIBRATE = 64;   // At each suspend point.
 
 struct ThreadState {
 	bool     command_thread = false;
@@ -112,6 +192,7 @@ struct ThreadState {
 	WaitReason reason         = WaitReason::Other;
 	bool       label_gpu      = true; // What the last suspended guest wait waits for.
 	uint64_t   since          = 0;
+	uint32_t   sample         = 1; // The pseudo-random sequence that picks the calls timed (TimedStart).
 };
 inline thread_local ThreadState t_state;
 
@@ -121,6 +202,24 @@ inline thread_local ThreadState t_state;
 #else
 	return SteadyNs();
 #endif
+}
+
+// GameFlex: the clock for steps of a few nanoseconds. rdtsc alone runs ahead of or behind the step's own instructions,
+// which then vanish in its latency: the fences keep the step between the two reads.
+[[nodiscard]] inline uint64_t OrderedTicks() noexcept {
+#if defined(_M_X64) || defined(__x86_64__)
+	_mm_lfence();
+	const auto ticks = __rdtsc();
+	_mm_lfence();
+	return ticks;
+#else
+	return SteadyNs();
+#endif
+}
+
+// One writer, this thread: a plain add, readers see a recent value.
+inline void AddOwned(std::atomic<uint64_t>& counter, uint64_t value) noexcept {
+	counter.store(counter.load(std::memory_order_relaxed) + value, std::memory_order_relaxed);
 }
 
 inline void Switch(Cause next) noexcept {
@@ -133,14 +232,45 @@ inline void Switch(Cause next) noexcept {
 		const auto now = Ticks();
 		// The first transition after the overlay turns on only starts the clock.
 		if (state.counting) {
-			// One writer, this thread: a plain add, readers see a recent value.
-			auto& ticks = g_ticks[static_cast<size_t>(state.current)];
-			ticks.store(ticks.load(std::memory_order_relaxed) + (now - state.since), std::memory_order_relaxed);
+			AddOwned(g_ticks[static_cast<size_t>(state.current)], now - state.since);
 		}
 		state.since = now;
 	}
 	state.counting = counting;
 	state.current  = next;
+}
+
+// A call of a frequent step counted, with its time when it was one of those timed (start != 0).
+inline void AddTimed(Timed step, uint64_t start, uint64_t end) noexcept {
+	const auto index = static_cast<size_t>(step);
+	AddOwned(g_timed_calls[index], 1);
+	if (start != 0) {
+		AddOwned(g_timed_ticks[index], end - start);
+		AddOwned(g_timed_samples[index], 1);
+	}
+}
+
+// The clock at the end of a step timed from `start`, or 0 when it was not timed.
+[[nodiscard]] inline uint64_t TimedStop(uint64_t start) noexcept {
+	if (start == 0) {
+		return 0;
+	}
+	std::atomic_signal_fence(std::memory_order_seq_cst);
+	return OrderedTicks();
+}
+
+// GameFlex: what the timed steps' own two clock reads cost, taken out of their times in the report. The TSC runs at a
+// fixed rate while lfence and rdtsc take a fixed number of core cycles: the cost follows the core's clock, so it is
+// measured again while the game runs and the report takes the pairs of its own window.
+inline void CalibrateClock(uint32_t pairs) noexcept {
+	uint64_t ticks = 0;
+	for (uint32_t i = 0; i < pairs; i++) {
+		const auto start = OrderedTicks();
+		std::atomic_signal_fence(std::memory_order_seq_cst);
+		ticks += OrderedTicks() - start;
+	}
+	AddOwned(g_clock_pair_ticks, ticks);
+	AddOwned(g_clock_pairs, pairs);
 }
 } // namespace Detail
 
@@ -148,10 +278,17 @@ inline void Switch(Cause next) noexcept {
 inline void SetCommandThread() noexcept {
 	Detail::t_state.command_thread = true;
 	Detail::t_state.current        = Cause::Other;
+	// GameFlex: the clock reads' cost for a report whose window holds no suspend point (RecalibrateClock).
+	Detail::CalibrateClock(Detail::CLOCK_PAIRS);
 }
 
 [[nodiscard]] inline bool OnCommandThread() noexcept {
 	return Detail::t_state.command_thread;
+}
+
+// The command thread counts now: for callers that gather what they count at some cost.
+[[nodiscard]] inline bool Counting() noexcept {
+	return Detail::t_state.command_thread && DebugCounters::Enabled();
 }
 
 // The cause for the scope's lifetime; the outer cause resumes when it ends.
@@ -227,10 +364,159 @@ inline void NoteLabelWait(bool gpu) noexcept {
 	return Detail::t_state.label_gpu ? Cause::WaitLabelGpu : Cause::WaitLabelCpu;
 }
 
-inline void CountClose(Close reason) noexcept {
+// A command buffer submitted, and why; `empty` when nothing was recorded in it, `operations` when a deferred
+// operation waits for it all the same (an empty buffer can stay open only when none does).
+inline void CountClose(Close reason, bool empty, bool operations) noexcept {
 	if (DebugCounters::Enabled()) {
 		Detail::g_closes[static_cast<size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+		if (empty) {
+			Detail::g_empty_closes[static_cast<size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+			if (operations) {
+				Detail::g_empty_operation_closes[static_cast<size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+			}
+		}
 	}
+}
+
+// GameFlex: the clock, for the instrument's own steps timed each time (they are few).
+[[nodiscard]] inline uint64_t Clock() noexcept {
+	return Detail::Ticks();
+}
+
+// GameFlex: the time this thread booked under `cause` so far. Around a call, the difference is the call's share of
+// the cause: a wait's own time, without the work around it. One writer, this thread: on the command thread only.
+[[nodiscard]] inline uint64_t CauseTicks(Cause cause) noexcept {
+	return Detail::g_ticks[static_cast<size_t>(cause)].load(std::memory_order_relaxed);
+}
+
+// The instrument's own GPU timestamps (CommandScheduler), inside submit begin and end: their cost apart.
+inline void AddTimestampTicks(uint64_t start) noexcept {
+	Detail::g_timestamp_ticks.fetch_add(Detail::Ticks() - start, std::memory_order_relaxed);
+}
+
+// The clock at the start of a call of a frequent step on the command thread when this call is one of those timed,
+// else 0. Two clock reads cost about what such a step does, so about one call in 16 is timed, picked at random: a
+// fixed stride would time the same call of every draw. The others are only counted.
+[[nodiscard]] inline uint64_t TimedStart() noexcept {
+	auto& state = Detail::t_state;
+	if (!state.command_thread || !DebugCounters::Enabled()) {
+		return 0;
+	}
+	state.sample = state.sample * 1664525u + 1013904223u;
+	if ((state.sample >> 28u) != 0) {
+		return 0;
+	}
+	const auto start = Detail::OrderedTicks();
+	// The step's own memory accesses stay between the two clock reads.
+	std::atomic_signal_fence(std::memory_order_seq_cst);
+	return start;
+}
+
+// The end of a call of a frequent step that TimedStart began.
+inline void TimedEnd(Timed step, uint64_t start) noexcept {
+	const auto end = Detail::TimedStop(start);
+	if (Counting()) {
+		Detail::AddTimed(step, start, end);
+	}
+}
+
+// GameFlex: the clock reads' cost measured again on the command thread, at the clock the core runs at in the game
+// (CalibrateClock). A few microseconds, at each suspend point.
+inline void RecalibrateClock() noexcept {
+	if (Counting()) {
+		Detail::CalibrateClock(Detail::CLOCK_PAIRS_RECALIBRATE);
+	}
+}
+
+// An Image::Transit call that TimedStart began: whether it recorded a barrier, its path and its caller, and the time
+// of one that recorded none.
+inline void CountTransit(TransitCaller caller, bool per_subresource, bool barrier, uint64_t start) noexcept {
+	const auto end = Detail::TimedStop(start);
+	if (!Counting()) {
+		return;
+	}
+	Detail::AddOwned(Detail::g_transits[TransitIndex(barrier, per_subresource, caller)], 1);
+	if (!barrier) {
+		Detail::AddTimed(per_subresource ? Timed::TransitSubresources : Timed::TransitFull, start, end);
+	}
+}
+
+// A wait of the command thread for words the GPU writes, from StartWordWait to EndWordWait.
+struct WordWait {
+	size_t   index       = WORD_WAIT_COUNT; // WORD_WAIT_COUNT: not counted.
+	Cause    cause       = Cause::Other;    // The cause its time is booked under.
+	uint64_t cause_ticks = 0;               // That cause's time when it started.
+	uint64_t start       = 0;
+};
+
+// Only while Counting(), under the WaitReasonScope of the wait. `writer_tick` is the buffer that writes the words
+// last, `current_tick` the open buffer, `done_tick` the last one the GPU executed, read before `current_tick`;
+// `open_used` says whether anything was recorded in the open buffer. The wait (Finish) submits the open buffer and
+// waits for every buffer up to it: those up to the writer, which a wait for the writer alone would need, and those
+// after it, the open one included.
+[[nodiscard]] inline WordWait StartWordWait(uint64_t writer_tick, uint64_t current_tick, uint64_t done_tick,
+                                            bool open_used) noexcept {
+	const auto cause  = WaitCause();
+	const auto group  = static_cast<size_t>(cause == Cause::WaitGpuSrt ? 0 : cause == Cause::WaitGpuRead ? 1 : 2);
+	done_tick         = std::min(done_tick, current_tick - 1);
+	const auto writer = writer_tick >= current_tick ? Writer::Open
+	                    : writer_tick > done_tick   ? Writer::Submitted
+	                                                : Writer::Executed;
+	const auto index  = group * WRITER_COUNT + static_cast<size_t>(writer);
+	uint64_t   ahead  = current_tick - done_tick;
+	uint64_t   behind = 0;
+	if (writer != Writer::Open) {
+		const auto reached = std::max(writer_tick, done_tick);
+		ahead              = reached - done_tick;
+		behind             = current_tick - reached;
+	}
+	Detail::AddOwned(Detail::g_word_waits[index], 1);
+	Detail::AddOwned(Detail::g_word_wait_ahead[index], ahead);
+	Detail::AddOwned(Detail::g_word_wait_behind[index], behind);
+	if (open_used) {
+		Detail::AddOwned(Detail::g_word_wait_open_used[index], 1);
+	}
+	return {index, cause, CauseTicks(cause), Detail::Ticks()};
+}
+
+// The wait's time is what its cause gained meanwhile: the semaphore wait alone. The whole Finish (the open buffer
+// submitted, the next one begun, the deferred operations run) is counted apart.
+inline void EndWordWait(const WordWait& wait) noexcept {
+	if (wait.index < WORD_WAIT_COUNT) {
+		Detail::AddOwned(Detail::g_word_finish_ticks[wait.index], Detail::Ticks() - wait.start);
+		Detail::AddOwned(Detail::g_word_wait_ticks[wait.index], CauseTicks(wait.cause) - wait.cause_ticks);
+	}
+}
+
+// GameFlex: the stream waited for a flip done (WaitFlipDone), on the command thread: `pending` when a flip of that
+// buffer was pending before the flush that precedes the wait (without one, the flush gave the GPU nothing the wait
+// needs), `ticks` the wait's share of WaitGpuFrame.
+inline void NoteFlipWait(bool pending, uint64_t ticks) noexcept {
+	Detail::AddOwned(Detail::g_flip_waits[pending ? 1 : 0], 1);
+	Detail::AddOwned(Detail::g_flip_wait_ticks[pending ? 1 : 0], ticks);
+}
+
+// The game's suspend points cross threads (the game's, this one, the one that releases them): their clock is in
+// nanoseconds, and 0 while nothing counts.
+[[nodiscard]] inline uint64_t SuspendClock() noexcept {
+	return DebugCounters::Enabled() ? SteadyNs() : 0;
+}
+
+// The command thread took at `taken_ns` a suspend point the game called at `called_ns`, `queued` buffers submitted
+// and not executed.
+inline void NoteSuspendPointTaken(uint64_t called_ns, uint64_t taken_ns, uint64_t queued) noexcept {
+	Detail::g_suspend_taken.fetch_add(1, std::memory_order_relaxed);
+	Detail::g_suspend_taken_ns.fetch_add(called_ns != 0 && taken_ns > called_ns ? taken_ns - called_ns : 0,
+	                                     std::memory_order_relaxed);
+	Detail::g_suspend_taken_buffers.fetch_add(queued, std::memory_order_relaxed);
+}
+
+// The point taken at `taken_ns` is released: the GPU executed everything before it, `queued` buffers still on it.
+inline void NoteSuspendPointReleased(uint64_t taken_ns, uint64_t queued) noexcept {
+	const auto now = SteadyNs();
+	Detail::g_suspend_released.fetch_add(1, std::memory_order_relaxed);
+	Detail::g_suspend_released_ns.fetch_add(now > taken_ns ? now - taken_ns : 0, std::memory_order_relaxed);
+	Detail::g_suspend_released_buffers.fetch_add(queued, std::memory_order_relaxed);
 }
 
 inline void CountPacket(uint32_t opcode) noexcept {
@@ -251,7 +537,40 @@ struct Totals {
 	uint64_t                           gpu_buffers = 0;
 	uint64_t                           clock_ticks = 0; // Ticks() when read.
 	uint64_t                           clock_ns    = 0; // SteadyNs() when read: ticks per ns.
+	// GameFlex (0088).
+	std::array<uint64_t, CLOSE_COUNT>     empty_closes {};
+	std::array<uint64_t, CLOSE_COUNT>     empty_operation_closes {};
+	uint64_t                              timestamp_ticks = 0;
+	std::array<uint64_t, TRANSIT_KINDS>   transits {};
+	std::array<uint64_t, TIMED_COUNT>     timed_calls {};
+	std::array<uint64_t, TIMED_COUNT>     timed_samples {};
+	std::array<uint64_t, TIMED_COUNT>     timed_ticks {};
+	uint64_t                              clock_pairs      = 0;
+	uint64_t                              clock_pair_ticks = 0;
+	std::array<uint64_t, WORD_WAIT_COUNT> word_waits {};
+	std::array<uint64_t, WORD_WAIT_COUNT> word_wait_ticks {};
+	std::array<uint64_t, WORD_WAIT_COUNT> word_finish_ticks {};
+	std::array<uint64_t, WORD_WAIT_COUNT> word_wait_ahead {};
+	std::array<uint64_t, WORD_WAIT_COUNT> word_wait_behind {};
+	std::array<uint64_t, WORD_WAIT_COUNT> word_wait_open_used {};
+	std::array<uint64_t, 2>               flip_waits {};
+	std::array<uint64_t, 2>               flip_wait_ticks {};
+	uint64_t                              suspend_taken            = 0;
+	uint64_t                              suspend_taken_ns         = 0;
+	uint64_t                              suspend_taken_buffers    = 0;
+	uint64_t                              suspend_released         = 0;
+	uint64_t                              suspend_released_ns      = 0;
+	uint64_t                              suspend_released_buffers = 0;
 };
+
+namespace Detail {
+template <size_t N>
+void LoadAll(const std::atomic<uint64_t> (&counters)[N], std::array<uint64_t, N>& values) noexcept {
+	for (size_t i = 0; i < N; i++) {
+		values[i] = counters[i].load(std::memory_order_relaxed);
+	}
+}
+} // namespace Detail
 
 [[nodiscard]] inline Totals Read() noexcept {
 	Totals totals;
@@ -271,6 +590,29 @@ struct Totals {
 	totals.gpu_gap_ns  = Detail::g_gpu_gap_ns.load(std::memory_order_relaxed);
 	totals.gpu_queued_gap_ns = Detail::g_gpu_queued_gap_ns.load(std::memory_order_relaxed);
 	totals.gpu_buffers = Detail::g_gpu_buffers.load(std::memory_order_relaxed);
+	Detail::LoadAll(Detail::g_empty_closes, totals.empty_closes);
+	Detail::LoadAll(Detail::g_empty_operation_closes, totals.empty_operation_closes);
+	totals.timestamp_ticks = Detail::g_timestamp_ticks.load(std::memory_order_relaxed);
+	Detail::LoadAll(Detail::g_transits, totals.transits);
+	Detail::LoadAll(Detail::g_timed_calls, totals.timed_calls);
+	Detail::LoadAll(Detail::g_timed_samples, totals.timed_samples);
+	Detail::LoadAll(Detail::g_timed_ticks, totals.timed_ticks);
+	totals.clock_pairs      = Detail::g_clock_pairs.load(std::memory_order_relaxed);
+	totals.clock_pair_ticks = Detail::g_clock_pair_ticks.load(std::memory_order_relaxed);
+	Detail::LoadAll(Detail::g_word_waits, totals.word_waits);
+	Detail::LoadAll(Detail::g_word_wait_ticks, totals.word_wait_ticks);
+	Detail::LoadAll(Detail::g_word_finish_ticks, totals.word_finish_ticks);
+	Detail::LoadAll(Detail::g_word_wait_ahead, totals.word_wait_ahead);
+	Detail::LoadAll(Detail::g_word_wait_behind, totals.word_wait_behind);
+	Detail::LoadAll(Detail::g_word_wait_open_used, totals.word_wait_open_used);
+	Detail::LoadAll(Detail::g_flip_waits, totals.flip_waits);
+	Detail::LoadAll(Detail::g_flip_wait_ticks, totals.flip_wait_ticks);
+	totals.suspend_taken            = Detail::g_suspend_taken.load(std::memory_order_relaxed);
+	totals.suspend_taken_ns         = Detail::g_suspend_taken_ns.load(std::memory_order_relaxed);
+	totals.suspend_taken_buffers    = Detail::g_suspend_taken_buffers.load(std::memory_order_relaxed);
+	totals.suspend_released         = Detail::g_suspend_released.load(std::memory_order_relaxed);
+	totals.suspend_released_ns      = Detail::g_suspend_released_ns.load(std::memory_order_relaxed);
+	totals.suspend_released_buffers = Detail::g_suspend_released_buffers.load(std::memory_order_relaxed);
 	totals.clock_ticks = Detail::Ticks();
 	totals.clock_ns    = SteadyNs();
 	return totals;
@@ -289,6 +631,31 @@ struct Report {
 	double                                     gpu_queued_gap_ms_per_frame = 0.0;
 	double                                     wait_ms_per_frame = 0.0; // Every wait cause together.
 	double                                     gpu_buffers_per_frame = 0.0;
+	// GameFlex (0088).
+	std::array<double, CLOSE_COUNT>   empty_closes_per_frame {};
+	std::array<double, CLOSE_COUNT>   empty_operation_closes_per_frame {};
+	double                            timestamp_ms_per_frame = 0.0;
+	std::array<double, TRANSIT_KINDS> transits_per_frame {};
+	double                            clock_pair_ticks = 0.0; // Two clock reads, the window's own calibrations.
+	std::array<double, TIMED_COUNT>   timed_per_frame {};
+	std::array<double, TIMED_COUNT>   timed_samples_per_frame {};
+	std::array<double, TIMED_COUNT>   timed_ticks_per_call {}; // Raw, the clock reads included.
+	std::array<double, TIMED_COUNT>   timed_ns_per_call {};    // The clock reads' own cost taken out, at least 0.
+	std::array<double, TIMED_COUNT>   timed_ms_per_frame {};   // Every call at the timed calls' mean.
+	std::array<double, WORD_WAIT_COUNT> word_waits_per_frame {};
+	std::array<double, WORD_WAIT_COUNT> word_wait_ms_per_frame {};
+	std::array<double, WORD_WAIT_COUNT> word_finish_ms_per_frame {};
+	std::array<double, WORD_WAIT_COUNT> word_wait_ahead {};  // Buffers, per wait.
+	std::array<double, WORD_WAIT_COUNT> word_wait_behind {}; // Buffers, per wait.
+	std::array<double, WORD_WAIT_COUNT> word_wait_open_used_per_frame {};
+	std::array<double, 2>               flip_waits_per_frame {};
+	std::array<double, 2>               flip_wait_ms_per_frame {};
+	double suspend_taken_per_frame    = 0.0;
+	double suspend_taken_ms           = 0.0; // Per point, from the game's call.
+	double suspend_taken_buffers      = 0.0; // Per point.
+	double suspend_released_per_frame = 0.0;
+	double suspend_released_ms        = 0.0; // Per point, from being taken.
+	double suspend_released_buffers   = 0.0; // Per point.
 };
 
 [[nodiscard]] inline Report MakeReport(const Totals& before, const Totals& after,
@@ -333,6 +700,60 @@ struct Report {
 		report.wait_ms_per_frame += report.ms_per_frame[i];
 	}
 	report.gpu_buffers_per_frame = static_cast<double>(after.gpu_buffers - before.gpu_buffers) * per_frame;
+	// GameFlex (0088).
+	const auto delta = [](uint64_t from, uint64_t to) { return static_cast<double>(to - from); };
+	const auto mean  = [](double sum, double count) { return count > 0.0 ? sum / count : 0.0; };
+	for (size_t i = 0; i < CLOSE_COUNT; i++) {
+		report.empty_closes_per_frame[i] = delta(before.empty_closes[i], after.empty_closes[i]) * per_frame;
+		report.empty_operation_closes_per_frame[i] =
+		    delta(before.empty_operation_closes[i], after.empty_operation_closes[i]) * per_frame;
+	}
+	report.timestamp_ms_per_frame = delta(before.timestamp_ticks, after.timestamp_ticks) * ms_per_tick * per_frame;
+	for (size_t i = 0; i < TRANSIT_KINDS; i++) {
+		report.transits_per_frame[i] = delta(before.transits[i], after.transits[i]) * per_frame;
+	}
+	// The window's own calibrations, or every one so far when it took none (no suspend point in it).
+	const auto pairs = delta(before.clock_pairs, after.clock_pairs);
+	report.clock_pair_ticks =
+	    pairs > 0.0 ? delta(before.clock_pair_ticks, after.clock_pair_ticks) / pairs
+	                : mean(static_cast<double>(after.clock_pair_ticks), static_cast<double>(after.clock_pairs));
+	for (size_t i = 0; i < TIMED_COUNT; i++) {
+		const auto calls   = delta(before.timed_calls[i], after.timed_calls[i]);
+		const auto samples = delta(before.timed_samples[i], after.timed_samples[i]);
+		const auto ticks   = mean(delta(before.timed_ticks[i], after.timed_ticks[i]), samples);
+		report.timed_per_frame[i]         = calls * per_frame;
+		report.timed_samples_per_frame[i] = samples * per_frame;
+		report.timed_ticks_per_call[i]    = ticks;
+		report.timed_ns_per_call[i] =
+		    samples > 0.0 ? std::max(0.0, ticks - report.clock_pair_ticks) * ms_per_tick * 1e6 : 0.0;
+		report.timed_ms_per_frame[i] = report.timed_ns_per_call[i] / 1e6 * report.timed_per_frame[i];
+	}
+	for (size_t i = 0; i < WORD_WAIT_COUNT; i++) {
+		const auto waits               = delta(before.word_waits[i], after.word_waits[i]);
+		report.word_waits_per_frame[i] = waits * per_frame;
+		report.word_wait_ms_per_frame[i] =
+		    delta(before.word_wait_ticks[i], after.word_wait_ticks[i]) * ms_per_tick * per_frame;
+		report.word_finish_ms_per_frame[i] =
+		    delta(before.word_finish_ticks[i], after.word_finish_ticks[i]) * ms_per_tick * per_frame;
+		report.word_wait_ahead[i]  = mean(delta(before.word_wait_ahead[i], after.word_wait_ahead[i]), waits);
+		report.word_wait_behind[i] = mean(delta(before.word_wait_behind[i], after.word_wait_behind[i]), waits);
+		report.word_wait_open_used_per_frame[i] =
+		    delta(before.word_wait_open_used[i], after.word_wait_open_used[i]) * per_frame;
+	}
+	for (size_t i = 0; i < 2; i++) {
+		report.flip_waits_per_frame[i] = delta(before.flip_waits[i], after.flip_waits[i]) * per_frame;
+		report.flip_wait_ms_per_frame[i] =
+		    delta(before.flip_wait_ticks[i], after.flip_wait_ticks[i]) * ms_per_tick * per_frame;
+	}
+	const auto taken                  = delta(before.suspend_taken, after.suspend_taken);
+	const auto released               = delta(before.suspend_released, after.suspend_released);
+	report.suspend_taken_per_frame    = taken * per_frame;
+	report.suspend_taken_ms           = mean(delta(before.suspend_taken_ns, after.suspend_taken_ns), taken) / 1e6;
+	report.suspend_taken_buffers      = mean(delta(before.suspend_taken_buffers, after.suspend_taken_buffers), taken);
+	report.suspend_released_per_frame = released * per_frame;
+	report.suspend_released_ms = mean(delta(before.suspend_released_ns, after.suspend_released_ns), released) / 1e6;
+	report.suspend_released_buffers =
+	    mean(delta(before.suspend_released_buffers, after.suspend_released_buffers), released);
 	return report;
 }
 
@@ -341,7 +762,7 @@ struct Report {
 	    "pm4",           "registers",         "draw",          "programs",
 	    "resources",     "textures",          "buffers",       "targets",
 	    "bindings",      "barriers",          "record",        "compile",
-	    "transfers",     "submit",            "upkeep",        "foreign",
+	    "transfers",     "submit begin",      "submit end",    "submit queue", "upkeep", "foreign",
 	    "wait GPU read", "wait GPU SRT",      "wait GPU remap", "wait GPU frame",
 	    "wait priority", "wait GPU other",    "wait queue lock", "wait label GPU", "wait label CPU",
 	    "idle (suspend)", "idle",             "other"};
@@ -356,9 +777,30 @@ struct Report {
 }
 
 [[nodiscard]] constexpr const char* Name(Close close) noexcept {
-	constexpr const char* NAMES[CLOSE_COUNT] = {"GPU idle", "size",  "boundary", "before idle",
-	                                            "wait",     "frame", "other"};
+	constexpr const char* NAMES[CLOSE_COUNT] = {"GPU idle", "size", "boundary", "before idle", "wait",
+	                                            "suspend point", "flip", "CPU flip", "wait flip done", "other"};
 	return NAMES[static_cast<size_t>(close)];
+}
+
+[[nodiscard]] constexpr const char* Name(TransitCaller caller) noexcept {
+	constexpr const char* NAMES[TRANSIT_CALLER_COUNT] = {"targets", "bindings", "heap", "other"};
+	return NAMES[static_cast<size_t>(caller)];
+}
+
+[[nodiscard]] constexpr const char* Name(Timed step) noexcept {
+	constexpr const char* NAMES[TIMED_COUNT] = {"transit, whole image", "transit, per subresource", "draw state"};
+	return NAMES[static_cast<size_t>(step)];
+}
+
+[[nodiscard]] constexpr const char* Name(Writer writer) noexcept {
+	constexpr const char* NAMES[WRITER_COUNT] = {"open", "submitted", "executed"};
+	return NAMES[static_cast<size_t>(writer)];
+}
+
+// The cause a group of word waits is booked under (WORD_WAIT_CAUSES).
+[[nodiscard]] constexpr const char* WordWaitCauseName(size_t group) noexcept {
+	constexpr const char* NAMES[WORD_WAIT_CAUSES] = {"SRT", "read", "another cause"};
+	return NAMES[group];
 }
 
 } // namespace Common::CommandThreadProfile

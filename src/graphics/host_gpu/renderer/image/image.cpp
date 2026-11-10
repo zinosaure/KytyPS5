@@ -157,7 +157,7 @@ constexpr vk::AccessFlags2 WriteAccesses =
 Image::Barriers Image::GetBarriers(vk::ImageLayout                      destination_layout,
                                    vk::AccessFlags2                     destination_access,
                                    vk::PipelineStageFlags2              destination_stage,
-                                   std::optional<ImageSubresourceRange> range) {
+                                   std::optional<ImageSubresourceRange> range, bool* per_subresource) {
 	auto& state              = backing.state;
 	auto& subresource_states = backing.subresource_states;
 	if (range && info.IsVolume()) {
@@ -169,6 +169,9 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 	    range && (range->base_level != 0 || range->level_count != info.resources.levels ||
 	              range->base_layer != 0 || range->layer_count != info.resources.layers);
 	const bool has_subresource_states = !subresource_states.empty();
+	if (per_subresource != nullptr) {
+		*per_subresource = partial || has_subresource_states;
+	}
 
 	Barriers barriers;
 	if (partial || has_subresource_states) {
@@ -259,7 +262,10 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 }
 
 void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
-                    std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer) {
+                    std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer,
+                    Common::CommandThreadProfile::TransitCaller caller) {
+	// GameFlex: a call that records no barrier is counted and sampled, its cost booked under the caller's cause.
+	const auto ctp_start       = Common::CommandThreadProfile::TimedStart();
 	const auto transfer_access =
 	    vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
 	vk::PipelineStageFlags2 destination_stage {};
@@ -271,8 +277,10 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 		destination_stage |=
 		    vk::PipelineStageFlagBits2::eAllGraphics | vk::PipelineStageFlagBits2::eComputeShader;
 	}
+	bool       per_subresource = false;
 	const auto barriers =
-	    GetBarriers(destination_layout, destination_access, destination_stage, range);
+	    GetBarriers(destination_layout, destination_access, destination_stage, range, &per_subresource);
+	Common::CommandThreadProfile::CountTransit(caller, per_subresource, !barriers.empty(), ctp_start);
 	if (barriers.empty()) {
 		return;
 	}

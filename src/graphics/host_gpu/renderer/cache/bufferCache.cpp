@@ -56,6 +56,18 @@ std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandSched
 	return {buffer, 0};
 }
 
+// GameFlex: a wait for words the GPU writes, as the command thread's profile sees it: whether their last writer is
+// the open buffer or one already submitted, how many buffers stand before and after it, and whether the open buffer
+// has work in it (CommandThreadProfile). Under the wait's WaitReasonScope, which books its time.
+Common::CommandThreadProfile::WordWait WordWaitAt(CommandScheduler& scheduler, uint64_t writer_tick) {
+	if (!Common::CommandThreadProfile::Counting()) {
+		return {};
+	}
+	const auto done = scheduler.GetMasterSemaphore().Progress();
+	return Common::CommandThreadProfile::StartWordWait(writer_tick, scheduler.CurrentTick(), done,
+	                                                   scheduler.BufferUsed());
+}
+
 } // namespace
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source,
@@ -1060,7 +1072,9 @@ void BufferCache::RecordUnifiedGpuWrite(uint64_t vaddr, uint64_t size) {
 void BufferCache::FinishPendingGpuWrites(uint64_t vaddr, uint64_t size) {
 	if (HasPendingGpuWrites(vaddr, size)) {
 		Common::CommandThreadProfile::WaitReasonScope ctp_reason(Common::CommandThreadProfile::WaitReason::Read);
+		const auto ctp_wait = WordWaitAt(m_scheduler, m_pending_gpu_writes.LatestTick(vaddr, size));
 		m_scheduler.Finish();
+		Common::CommandThreadProfile::EndWordWait(ctp_wait);
 		m_pending_gpu_writes.Clear();
 	}
 }
@@ -1151,7 +1165,21 @@ bool BufferCache::FinishPendingGpuWritesUnder(std::span<const uint64_t> addresse
 		uint32_t before = 0;
 		LibKernel::Memory::TryReadBacking(address, &before, sizeof(before));
 		const auto range_size = range->end - range->start;
+		// GameFlex: this Finish settles every word of the table the GPU may still write, not this one alone: a wait
+		// for their writers alone would wait for the latest of those not trusted (CommandThreadProfile).
+		auto ctp_writer = range->tick;
+		if (Common::CommandThreadProfile::Counting()) {
+			for (const auto other: addresses) {
+				const auto* other_range = m_pending_gpu_writes.Find(other);
+				const auto  trust       = m_srt_speculation.find(other);
+				if (other_range != nullptr && (trust == m_srt_speculation.end() || !trust->second.trusted)) {
+					ctp_writer = std::max(ctp_writer, other_range->tick);
+				}
+			}
+		}
+		const auto ctp_wait = WordWaitAt(m_scheduler, ctp_writer);
 		m_scheduler.Finish();
+		Common::CommandThreadProfile::EndWordWait(ctp_wait);
 		m_pending_gpu_writes.Clear();
 		if (!speculation.revoked && range_size <= kSpeculationRangeBytes) {
 			uint32_t after = 0;

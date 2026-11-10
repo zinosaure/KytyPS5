@@ -104,4 +104,12 @@ uint64_t PendingGpuWrites::Bytes(uint64_t address, uint64_t size) const noexcept
 	return bytes;
 }
 
+uint64_t PendingGpuWrites::LatestTick(uint64_t address, uint64_t size) const noexcept {
+	uint64_t tick = 0;
+	for (auto it = FirstEndingAfter(address); it != m_ranges.end() && it->start < address + size; ++it) {
+		tick = std::max(tick, it->tick);
+	}
+	return tick;
+}
+
 } // namespace Libs::Graphics

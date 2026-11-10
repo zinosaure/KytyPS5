@@ -60,6 +60,8 @@ private:
 		Pm4Execution              execution;
 		bool                      blocked         = false;
 		uint64_t                  flip_request_id = 0;
+		// GameFlex: when the game called its suspend point (CommandThreadProfile::SuspendClock).
+		uint64_t                  called_ns = 0;
 	};
 
 	void              Enqueue(Submission submission);

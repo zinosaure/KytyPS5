@@ -583,7 +583,7 @@ void ImageHeap::Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point,
 			image->Transit(image->ReadLayout(), vk::AccessFlagBits2::eShaderRead,
 			               ImageSubresourceRange {view_info.base_level, view_info.level_count,
 			                                      view_info.base_layer, view_info.layer_count},
-			               buffer.Handle());
+			               buffer.Handle(), Common::CommandThreadProfile::TransitCaller::Heap);
 			return true;
 		});
 	}

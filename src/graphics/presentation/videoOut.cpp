@@ -223,9 +223,13 @@ public:
 	void WaitForSubmitSlot(VideoOutConfig& cfg);
 	bool Flip();
 	void Wait(VideoOutConfig& cfg, int index);
+	// GameFlex: whether a flip of the buffer is pending, which Wait would wait for (CommandThreadProfile).
+	[[nodiscard]] bool HasRequest(VideoOutConfig& cfg, int index);
 
 private:
 	enum class RequestState { Reserved, Ready, Presenting };
+
+	[[nodiscard]] bool HasRequestLocked(VideoOutConfig& cfg, int index) const;
 
 	struct Request {
 		uint64_t                    id;
@@ -1113,15 +1117,20 @@ void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 	Common::GameFlex::WaitNote gameflex_wait("video out: wait for a buffer's flips", &cfg);
 	Common::CommandThreadProfile::Scope ctp_profile(Common::CommandThreadProfile::Cause::WaitGpuFrame);
 	Common::LockGuard lock(m_mutex);
-
-	auto has_request = [this, &cfg, index] {
-		auto matches = [&cfg, index](const auto& r) { return r.cfg == &cfg && r.index == index; };
-		return std::any_of(m_requests.begin(), m_requests.end(), matches) ||
-		       std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
-	};
-	while (has_request()) {
+	while (HasRequestLocked(cfg, index)) {
 		m_done_cond_var.Wait(&m_mutex);
 	}
+}
+
+bool FlipQueue::HasRequest(VideoOutConfig& cfg, int index) {
+	Common::LockGuard lock(m_mutex);
+	return HasRequestLocked(cfg, index);
+}
+
+bool FlipQueue::HasRequestLocked(VideoOutConfig& cfg, int index) const {
+	auto matches = [&cfg, index](const auto& r) { return r.cfg == &cfg && r.index == index; };
+	return std::any_of(m_requests.begin(), m_requests.end(), matches) ||
+	       std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
 }
 
 bool FlipQueue::Flip() {
@@ -1595,6 +1604,12 @@ void VideoOutDriver::WaitFlipDone(int handle, int index) {
 
 	EXIT_NOT_IMPLEMENTED(!IsValidBufferIndex(index));
 	m_impl->GetFlipQueue().Wait(*ctx, index);
+}
+
+bool VideoOutDriver::HasPendingFlip(int handle, int index) {
+	auto* ctx = m_impl->Get(handle);
+	// GameFlex: a wrong handle is WaitFlipDone's to report, right after.
+	return ctx != nullptr && m_impl->GetFlipQueue().HasRequest(*ctx, index);
 }
 
 KYTY_SYSV_ABI int VideoOutGetFlipStatus(int handle, VideoOutFlipStatus* status) {
