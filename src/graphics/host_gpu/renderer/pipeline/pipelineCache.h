@@ -14,6 +14,8 @@
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 
+#include <atomic>
+#include <future>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -189,6 +191,7 @@ public:
 	void WarmUp(const std::filesystem::path& path);
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
+	// Waits for a save in flight, then saves what is left (shutdown).
 	void Save();
 
 	struct Pipeline {
@@ -262,7 +265,11 @@ private:
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
 	std::chrono::steady_clock::time_point m_next_driver_cache_save;
-	bool                          m_driver_cache_dirty = false;
+	// GameFlex: set by the command thread when a pipeline enters the driver's cache, cleared by the save that
+	// reads it. The periodic save runs on its own thread (m_driver_cache_saving), one at a time: reading a
+	// 40 MB cache and writing it stalled the command thread for a few hundred milliseconds every five minutes.
+	std::atomic_bool              m_driver_cache_dirty = false;
+	std::future<void>             m_driver_cache_saving;
 	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_graphics_pipelines;
 	std::unordered_map<uint64_t, Pipeline>                                     m_compute_pipelines;
 	std::unordered_map<uint64_t, ShaderTessellationInputInfo>                  m_tess_layouts;
@@ -302,6 +309,7 @@ private:
 	void CollectBuiltPipelines();
 	void InitializeDriverCache();
 	void CheckpointDriverCache();
+	void SaveDriverCache();
 
 	// pipelineSerialization.cpp
 	bool LoadRecord(std::span<const uint8_t>& records);
