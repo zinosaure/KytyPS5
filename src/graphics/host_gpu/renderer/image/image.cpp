@@ -122,6 +122,38 @@ vk::ImageAspectFlags Image::FullAspectMask(vk::Format format) noexcept {
 	}
 }
 
+namespace {
+
+// GameFlex: every access that writes. A read after a read, in the same layout, needs no barrier.
+constexpr vk::AccessFlags2 WriteAccesses =
+    vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderStorageWrite |
+    vk::AccessFlagBits2::eColorAttachmentWrite | vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+    vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eHostWrite |
+    vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eAccelerationStructureWriteKHR;
+
+[[nodiscard]] bool ReadsOnly(vk::AccessFlags2 access) {
+	return !(access & WriteAccesses);
+}
+
+// A read in a layout the image is already in, in stages a barrier has made every read safe in.
+[[nodiscard]] bool ReadNeedsNoBarrier(const VulkanImageState& state, vk::ImageLayout layout,
+                                      vk::AccessFlags2 access, vk::PipelineStageFlags2 stage) {
+	return state.layout == layout && ReadsOnly(access) && state.read_stages &&
+	       !(stage & ~state.read_stages);
+}
+
+// A barrier into a read makes the write visible to every read, so that another read later needs none.
+[[nodiscard]] vk::AccessFlags2 BarrierDestinationAccess(vk::AccessFlags2 access) {
+	return ReadsOnly(access) ? access | vk::AccessFlagBits2::eMemoryRead : access;
+}
+
+[[nodiscard]] VulkanImageState StateAfterBarrier(vk::PipelineStageFlags2 stage, vk::AccessFlags2 access,
+                                                 vk::ImageLayout layout) {
+	return {stage, access, layout, ReadsOnly(access) ? stage : vk::PipelineStageFlags2 {}};
+}
+
+} // namespace
+
 Image::Barriers Image::GetBarriers(vk::ImageLayout                      destination_layout,
                                    vk::AccessFlags2                     destination_access,
                                    vk::PipelineStageFlags2              destination_stage,
@@ -157,11 +189,16 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 				// Two writes in a row take no barrier: the game orders them when it needs to (GuestSync).
 				if (subresource_state.layout != destination_layout ||
 				    subresource_state.access_mask != destination_access) {
+					if (ReadNeedsNoBarrier(subresource_state, destination_layout, destination_access,
+					                       destination_stage)) {
+						subresource_state.access_mask |= destination_access;
+						continue;
+					}
 					vk::ImageMemoryBarrier2 barrier {};
 					barrier.srcStageMask                    = subresource_state.pl_stage;
 					barrier.srcAccessMask                   = subresource_state.access_mask;
 					barrier.dstStageMask                    = destination_stage;
-					barrier.dstAccessMask                   = destination_access;
+					barrier.dstAccessMask                   = BarrierDestinationAccess(destination_access);
 					barrier.oldLayout                       = subresource_state.layout;
 					barrier.newLayout                       = destination_layout;
 					barrier.srcQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
@@ -173,7 +210,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 					barrier.subresourceRange.baseArrayLayer = layer;
 					barrier.subresourceRange.layerCount     = 1;
 					barriers.push_back(barrier);
-					subresource_state = {destination_stage, destination_access, destination_layout};
+					subresource_state = StateAfterBarrier(destination_stage, destination_access, destination_layout);
 				}
 			}
 		}
@@ -185,12 +222,16 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		if (state.layout == destination_layout && state.access_mask == destination_access) {
 			return {};
 		}
+		if (ReadNeedsNoBarrier(state, destination_layout, destination_access, destination_stage)) {
+			state.access_mask |= destination_access;
+			return {};
+		}
 
 		vk::ImageMemoryBarrier2 barrier {};
 		barrier.srcStageMask                    = state.pl_stage;
 		barrier.srcAccessMask                   = state.access_mask;
 		barrier.dstStageMask                    = destination_stage;
-		barrier.dstAccessMask                   = destination_access;
+		barrier.dstAccessMask                   = BarrierDestinationAccess(destination_access);
 		barrier.oldLayout                       = state.layout;
 		barrier.newLayout                       = destination_layout;
 		barrier.srcQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
@@ -204,14 +245,16 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		barriers.push_back(barrier);
 	}
 
-	// Resident heaps sample their images in the read state; only leaving it invalidates them.
+	// Resident heaps sample their images in the read state; only leaving it invalidates them. Reads
+	// gather in that state (ReadNeedsNoBarrier), so the shader read is one of its accesses.
 	if (std::ranges::any_of(barriers, [&](const vk::ImageMemoryBarrier2& barrier) {
 		    return barrier.oldLayout == ReadLayout() &&
-		           barrier.srcAccessMask == vk::AccessFlagBits2::eShaderRead;
+		           ReadsOnly(barrier.srcAccessMask) &&
+		           static_cast<bool>(barrier.srcAccessMask & vk::AccessFlagBits2::eShaderRead);
 	    })) {
 		HeapChanged();
 	}
-	state = {destination_stage, destination_access, destination_layout};
+	state = StateAfterBarrier(destination_stage, destination_access, destination_layout);
 	return barriers;
 }
 

@@ -538,9 +538,12 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			             ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
 			             : vk::ImageLayout::eGeneral;
 		}
-		// The attachment store writes even when guest depth/stencil tests do not.
+		// The attachment stores (writes) the aspects its layout lets it write; a read-only one stores
+		// nothing (CommandBuffer::BeginRendering), so binding it is a read.
 		const auto access = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
-		                    vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+		                    (DepthAttachmentWritableAspects(layout)
+		                         ? vk::AccessFlagBits2::eDepthStencilAttachmentWrite
+		                         : vk::AccessFlags2 {});
 		image.binding.attachment_layout = layout;
 		image.binding.attachment_access = access;
 		const auto& view                = depth.desc.view_info;

@@ -61,6 +61,25 @@ inline vk::ImageAspectFlags DepthReadableAspects(vk::ImageLayout layout) {
 	}
 }
 
+// GameFlex: the aspects an attachment in this layout can write. A read-only aspect stores nothing (store op
+// none), so binding it is a read.
+inline vk::ImageAspectFlags DepthAttachmentWritableAspects(vk::ImageLayout layout) {
+	switch (layout) {
+		case vk::ImageLayout::eDepthAttachmentOptimal:
+		case vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal:
+			return vk::ImageAspectFlagBits::eDepth;
+		case vk::ImageLayout::eStencilAttachmentOptimal:
+		case vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal:
+			return vk::ImageAspectFlagBits::eStencil;
+		case vk::ImageLayout::eDepthStencilAttachmentOptimal:
+		case vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT:
+		case vk::ImageLayout::eGeneral:
+			return vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+		default:
+			return {};
+	}
+}
+
 inline vk::ImageLayout depth_attachment_layout(const RenderDepthInfo& depth) {
 	const auto available     = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
 	const auto writes        = depth.AttachmentWriteAspects();
