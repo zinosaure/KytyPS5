@@ -1272,7 +1272,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		m_context.GetGuestSync().Wrote(GuestSync::Stages2(shader_write_stages),
 		                               vk::AccessFlagBits2::eShaderWrite);
 	}
-	m_context.GetCommandScheduler().Recorded();
+	m_context.GetCommandScheduler().Recorded(pipeline.pipeline, mesh_task);
 }
 
 // Vulkan offsets for a prepared draw, or nullopt when its indirect records need the CPU:

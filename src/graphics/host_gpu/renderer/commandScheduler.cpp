@@ -11,9 +11,60 @@
 #include <cstring>
 #include <optional>
 
+#if defined(__linux__)
+#include <sys/resource.h>
+#include <time.h>
+#endif
+
 namespace Libs::Graphics {
 
 static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
+
+namespace {
+// GameFlex (0094): this thread's CPU time and context switches over a vkQueueSubmit (Linux; zeros elsewhere). Start
+// reads the switches first and Stop the CPU time first: the call's CPU time holds neither getrusage.
+class UsageProbe final {
+public:
+	void Start() noexcept {
+		ReadSwitches(m_voluntary, m_involuntary);
+		m_cpu_ns = CpuNs();
+	}
+	void Stop(Common::CommandThreadProfile::SubmitSample& sample) const noexcept {
+		const auto cpu_ns      = CpuNs();
+		auto       voluntary   = m_voluntary;
+		auto       involuntary = m_involuntary;
+		ReadSwitches(voluntary, involuntary);
+		sample.cpu_ns      = cpu_ns > m_cpu_ns ? cpu_ns - m_cpu_ns : 0;
+		sample.voluntary   = voluntary - m_voluntary;
+		sample.involuntary = involuntary - m_involuntary;
+	}
+
+private:
+	static uint64_t CpuNs() noexcept {
+#if defined(__linux__)
+		timespec time {};
+		if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &time) == 0) {
+			return static_cast<uint64_t>(time.tv_sec) * 1'000'000'000u + static_cast<uint64_t>(time.tv_nsec);
+		}
+#endif
+		return 0;
+	}
+	// Left as they are when the call fails.
+	static void ReadSwitches([[maybe_unused]] uint64_t& voluntary, [[maybe_unused]] uint64_t& involuntary) noexcept {
+#if defined(__linux__)
+		rusage usage {};
+		if (getrusage(RUSAGE_THREAD, &usage) == 0) {
+			voluntary   = std::max(voluntary, static_cast<uint64_t>(usage.ru_nvcsw));
+			involuntary = std::max(involuntary, static_cast<uint64_t>(usage.ru_nivcsw));
+		}
+#endif
+	}
+
+	uint64_t m_cpu_ns      = 0;
+	uint64_t m_voluntary   = 0;
+	uint64_t m_involuntary = 0;
+};
+} // namespace
 
 CommandScheduler::CommandPool::CommandPool(GraphicContext& graphics, MasterSemaphore& master)
     : m_graphics(graphics), m_master(master) {
@@ -34,6 +85,7 @@ size_t CommandScheduler::CommandPool::Grow() {
 	const auto first = m_ticks.size();
 	m_ticks.resize(first + GrowStep);
 	m_buffers.resize(first + GrowStep);
+	m_task_bound.resize(first + GrowStep, false);
 
 	vk::CommandBufferAllocateInfo allocate {};
 	allocate.commandPool        = m_pool;
@@ -70,8 +122,18 @@ vk::CommandBuffer CommandScheduler::CommandPool::Commit() {
 		m_ticks[*found] = m_master.CurrentTick();
 	}
 
-	m_hint = (*found + 1) % m_ticks.size();
+	m_hint      = (*found + 1) % m_ticks.size();
+	m_committed = *found;
 	return m_buffers[*found];
+}
+
+bool CommandScheduler::CommandPool::Mark(size_t slot) noexcept {
+	if (m_task_bound[slot]) {
+		return false;
+	}
+	m_task_bound[slot] = true;
+	m_marked++;
+	return true;
 }
 
 bool CommandScheduler::InDeferredOperation() noexcept {
@@ -103,6 +165,7 @@ CommandScheduler::~CommandScheduler() {
 
 void CommandScheduler::EnableProfile() {
 	m_profiled         = true;
+	m_ctp_pipelines.resize(kCtpPipelineSlots);
 	const auto& limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	if (!m_graphics.host_query_reset_enabled || limits.timestampComputeAndGraphics == VK_FALSE) {
 		return;
@@ -118,7 +181,47 @@ void CommandScheduler::EnableProfile() {
 	if (m_graphics.queue_family < queues.size()) {
 		const auto bits = queues[m_graphics.queue_family].timestampValidBits;
 		m_timestamp_mask = bits >= 64 ? ~uint64_t {0} : (uint64_t {1} << bits) - 1;
+		m_timestamp_shift = bits >= 64 || bits == 0 ? 0 : 64 - bits;
 	}
+	// GameFlex (0094): where a buffer starts on the GPU against the CPU's clock, when the device can relate the two.
+	if (!m_graphics.calibrated_timestamps_enabled ||
+	    VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceCalibrateableTimeDomainsKHR == nullptr ||
+	    VULKAN_HPP_DEFAULT_DISPATCHER.vkGetCalibratedTimestampsKHR == nullptr) {
+		return;
+	}
+	uint32_t count = 0;
+	if (m_graphics.physical_device.getCalibrateableTimeDomainsKHR(&count, nullptr) != vk::Result::eSuccess) {
+		return;
+	}
+	std::vector<vk::TimeDomainKHR> domains(count);
+	if (m_graphics.physical_device.getCalibrateableTimeDomainsKHR(&count, domains.data()) != vk::Result::eSuccess) {
+		return;
+	}
+	domains.resize(count);
+	const auto has = [&domains](vk::TimeDomainKHR domain) {
+		return std::find(domains.begin(), domains.end(), domain) != domains.end();
+	};
+	m_calibrated = has(vk::TimeDomainKHR::eDevice) && has(vk::TimeDomainKHR::eClockMonotonic);
+	if (m_calibrated) {
+		Calibrate();
+	}
+}
+
+// GameFlex (0094): a GPU timestamp and CLOCK_MONOTONIC (std::chrono::steady_clock, SteadyNs) at one instant.
+void CommandScheduler::Calibrate() {
+	const std::array<vk::CalibratedTimestampInfoKHR, 2> infos {
+	    vk::CalibratedTimestampInfoKHR {.timeDomain = vk::TimeDomainKHR::eDevice},
+	    vk::CalibratedTimestampInfoKHR {.timeDomain = vk::TimeDomainKHR::eClockMonotonic}};
+	std::array<uint64_t, 2> values {};
+	uint64_t                deviation = 0;
+	if (m_graphics.device.getCalibratedTimestampsKHR(static_cast<uint32_t>(infos.size()), infos.data(),
+	                                                 values.data(), &deviation) != vk::Result::eSuccess) {
+		m_calibrated = false;
+		return;
+	}
+	m_calibration_gpu = values[0] & m_timestamp_mask;
+	m_calibration_ns  = values[1];
+	Common::CommandThreadProfile::NoteCalibration(deviation);
 }
 
 // The GPU's begin and end of each buffer it has finished: its busy time, and the gap since the previous one.
@@ -128,6 +231,15 @@ void CommandScheduler::HarvestTimestamps() {
 	uint64_t   queued  = 0;
 	uint64_t   buffers = 0;
 	const auto done    = m_master.KnownGpuTick();
+	// GameFlex (0094): the same by kind and by where the GPU stood, and the start delay after the call's return.
+	using Common::CommandThreadProfile::GpuGap;
+	Common::CommandThreadProfile::GpuCells cells;
+	const auto ns = [this](uint64_t ticks) {
+		return static_cast<uint64_t>(static_cast<double>(ticks) * m_timestamp_ns);
+	};
+	if (m_calibrated && Common::SteadyNs() - m_calibration_ns >= kCalibrationNs) {
+		Calibrate();
+	}
 	while (!m_timestamp_pending.empty() && m_timestamp_pending.front() <= done) {
 		const auto tick = m_timestamp_pending.front();
 		m_timestamp_pending.pop_front();
@@ -144,12 +256,29 @@ void CommandScheduler::HarvestTimestamps() {
 		}
 		const auto begin = data[0] & m_timestamp_mask;
 		const auto end   = data[2] & m_timestamp_mask;
+		const auto kind  = static_cast<size_t>(m_timestamp_kind[slot]);
+		const auto cell  = Common::CommandThreadProfile::GapCell(m_timestamp_gap[slot], m_timestamp_kind[slot]);
 		if (end >= begin) {
 			busy += end - begin;
 			buffers++;
+			cells.busy_ns[kind] += ns(end - begin);
+			cells.buffers[kind]++;
 		}
-		if (m_last_end_tick + 1 == tick && begin > m_last_end) {
-			(m_timestamp_starved[slot] ? gap : queued) += begin - m_last_end;
+		if (m_last_end_tick + 1 == tick) {
+			cells.gap_buffers[cell]++;
+			if (begin > m_last_end) {
+				(m_timestamp_gap[slot] == GpuGap::DryBefore ? gap : queued) += begin - m_last_end;
+				cells.gap_ns[cell] += ns(begin - m_last_end);
+			}
+		}
+		if (m_calibrated && m_timestamp_return_ns[slot] != 0) {
+			// The GPU's ticks since the calibration, signed over the valid bits, then on the CPU's clock.
+			const auto since = static_cast<int64_t>(((begin - m_calibration_gpu) & m_timestamp_mask) << m_timestamp_shift) >>
+			                   m_timestamp_shift;
+			const auto start = static_cast<int64_t>(m_calibration_ns) +
+			                   static_cast<int64_t>(static_cast<double>(since) * m_timestamp_ns);
+			cells.delay_ns[cell] += static_cast<uint64_t>(start - static_cast<int64_t>(m_timestamp_return_ns[slot]));
+			cells.delays[cell]++;
 		}
 		m_last_end_tick = tick;
 		m_last_end      = end;
@@ -159,6 +288,7 @@ void CommandScheduler::HarvestTimestamps() {
 		                                          static_cast<uint64_t>(static_cast<double>(gap) * m_timestamp_ns),
 		                                          static_cast<uint64_t>(static_cast<double>(queued) * m_timestamp_ns),
 		                                          buffers);
+		Common::CommandThreadProfile::AddGpuCells(cells);
 	}
 }
 
@@ -234,9 +364,31 @@ constexpr uint32_t kBoundaryCommands = 256;  // enough to submit at a list bound
 constexpr uint32_t kFullCommands     = 2048; // a full buffer
 } // namespace
 
-void CommandScheduler::Recorded() {
+void CommandScheduler::Recorded(vk::Pipeline pipeline, bool task) {
 	if (m_command.IsInvalid()) {
 		return;
+	}
+	// GameFlex (0094): RADV gives a buffer that binds a task stage an ACE stream its resets keep, and submits that
+	// VkCommandBuffer as a gang from then on: its slot stays marked (CommandThreadProfile::SubmitKind).
+	if (task) {
+		m_buffer_task = true;
+		m_command_pool.Mark(m_buffer_slot);
+		Common::CommandThreadProfile::NoteTaskBind(m_command_pool.MarkedCount(), m_command_pool.Size());
+	}
+	if (m_profiled && m_ctp_begun && m_ctp_distinct < kCtpPipelineLimit) {
+		const auto handle = reinterpret_cast<uint64_t>(static_cast<VkPipeline>(pipeline));
+		for (auto index = static_cast<uint32_t>(((handle >> 4u) * 0x9e3779b97f4a7c15ull) >> 32u) & (kCtpPipelineSlots - 1);;
+		     index = (index + 1) & (kCtpPipelineSlots - 1)) {
+			auto& entry = m_ctp_pipelines[index];
+			if (entry.generation != m_ctp_generation) {
+				entry = {handle, m_ctp_generation};
+				m_ctp_distinct++;
+				break;
+			}
+			if (entry.handle == handle) {
+				break;
+			}
+		}
 	}
 	m_commands_recorded++;
 	if (m_commands_recorded % kCheckCommands != 0) {
@@ -475,10 +627,21 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	Common::CommandThreadProfile::Scope ctp_submit(Common::CommandThreadProfile::Cause::SubmitBegin);
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
+	m_buffer_slot      = m_command_pool.Committed();
+	m_buffer_marked    = m_command_pool.Marked(m_buffer_slot);
+	m_buffer_task      = false;
 	m_command.Begin();
 	m_dynamic_state.Invalidate();
 	if (m_profiled && Common::DebugCounters::Enabled()) {
 		Common::CommandThreadProfile::Count(Common::CommandThreadProfile::Event::CommandBuffers);
+		// GameFlex (0094): the buffer's share of the counters starts here.
+		if (Common::CommandThreadProfile::Counting()) {
+			using Common::CommandThreadProfile::Event;
+			using Common::CommandThreadProfile::EventTotal;
+			m_ctp_events = {EventTotal(Event::Draws), EventTotal(Event::Dispatches), EventTotal(Event::Packets)};
+			m_ctp_begun  = true;
+			Common::CommandThreadProfile::NotePoolBuffers(m_command_pool.Size());
+		}
 		if (m_timestamps != nullptr) {
 			const auto ctp_timestamps = Common::CommandThreadProfile::Clock();
 			HarvestTimestamps();
@@ -502,19 +665,39 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 	// This thread alone hands out ticks and submits: the order of the two is the same.
 	const auto tick = m_master.NextTick();
+	// GameFlex (0094): the submission instrument of P4.5 (CommandThreadProfile), while counting, on the command
+	// thread. Where the GPU stands as this buffer closes comes from the progress word, without a system call; without
+	// the word, only for a buffer timestamped, as 0088 did.
+	using Common::CommandThreadProfile::GpuGap;
+	using Common::CommandThreadProfile::SubmitKind;
+	const bool                                ctp_counting = m_profiled && Common::CommandThreadProfile::Counting();
+	Common::CommandThreadProfile::SubmitSample ctp_sample;
+	ctp_sample.kind   = m_buffer_task ? SubmitKind::Task : m_buffer_marked ? SubmitKind::Marked : SubmitKind::Ordinary;
+	ctp_sample.reason = m_close_reason;
+	std::optional<uint64_t> ctp_progress;
+	if (ctp_counting && m_master.HasProgressWord()) {
+		ctp_progress = m_master.Progress();
+	}
 	if (m_progress != nullptr) {
 		// Where the GPU is, for the CPU to read: this buffer's tick, written once all its work is done.
 		m_command.EndRendering();
 		m_command.Handle().writeBufferMarker2AMD(vk::PipelineStageFlagBits2::eAllCommands,
 		                                          m_progress->Handle(), 0, static_cast<uint32_t>(tick));
 	}
-	if (const auto slot = static_cast<uint32_t>(tick % kTimestampSlots);
-	    m_timestamps != nullptr && m_timestamp_ticks[slot] == tick) {
+	const auto slot  = static_cast<uint32_t>(tick % kTimestampSlots);
+	const bool timed = m_timestamps != nullptr && m_timestamp_ticks[slot] == tick;
+	if (timed) {
 		const auto ctp_timestamps = Common::CommandThreadProfile::Clock();
 		m_command.EndRendering();
 		m_command.Handle().writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, m_timestamps, 2 * slot + 1);
 		m_timestamp_pending.push_back(tick);
-		m_timestamp_starved[slot] = tick == m_master.Progress() + 1;
+		if (!ctp_progress) {
+			ctp_progress = m_master.Progress();
+		}
+		// Dry before the call; whether it ran dry during the call is known at its return.
+		m_timestamp_gap[slot]       = tick == *ctp_progress + 1 ? GpuGap::DryBefore : GpuGap::Queued;
+		m_timestamp_kind[slot]      = ctp_sample.kind;
+		m_timestamp_return_ns[slot] = 0;
 		Common::CommandThreadProfile::AddTimestampTicks(ctp_timestamps);
 	}
 	m_command.End();
@@ -545,7 +728,24 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
-		result = graphics.queue.submit(1, &submit_info, nullptr);
+		if (!ctp_counting) {
+			result = graphics.queue.submit(1, &submit_info, nullptr);
+		} else {
+			// GameFlex (0094): the call alone, the thread's CPU time and switches in it, and the GPU at its return.
+			UsageProbe ctp_usage;
+			ctp_usage.Start();
+			const auto ctp_call = Common::CommandThreadProfile::Clock();
+			result              = graphics.queue.submit(1, &submit_info, nullptr);
+			ctp_sample.call_ticks = Common::CommandThreadProfile::Clock() - ctp_call;
+			if (timed && m_calibrated) {
+				m_timestamp_return_ns[slot] = Common::SteadyNs();
+			}
+			if (timed && m_master.HasProgressWord() && m_timestamp_gap[slot] == GpuGap::Queued &&
+			    m_master.Progress() + 1 >= tick) {
+				m_timestamp_gap[slot] = GpuGap::DryDuring;
+			}
+			ctp_usage.Stop(ctp_sample);
+		}
 	}
 	Common::CommandThreadProfile::Phase(Common::CommandThreadProfile::Cause::SubmitEnd);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
@@ -567,6 +767,27 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		}
 		Common::CommandThreadProfile::CountClose(m_close_reason, !m_buffer_used, operations);
 		Common::CommandThreadProfile::Count(Common::CommandThreadProfile::Event::Submits);
+	}
+	// GameFlex (0094): the buffers on the GPU as it closed, and what it held; not for a buffer begun before counting.
+	if (ctp_counting && m_ctp_begun) {
+		using Common::CommandThreadProfile::Event;
+		using Common::CommandThreadProfile::EventTotal;
+		if (ctp_progress) {
+			ctp_sample.depth = *ctp_progress + 1 >= tick ? 0 : tick - 1 - *ctp_progress;
+		}
+		ctp_sample.draws      = EventTotal(Event::Draws) - m_ctp_events[0];
+		ctp_sample.dispatches = EventTotal(Event::Dispatches) - m_ctp_events[1];
+		ctp_sample.packets    = EventTotal(Event::Packets) - m_ctp_events[2];
+		ctp_sample.pipelines  = m_ctp_distinct;
+		Common::CommandThreadProfile::NoteSubmit(ctp_sample);
+	}
+	if (m_ctp_begun) {
+		m_ctp_begun    = false;
+		m_ctp_distinct = 0;
+		// The set empties; 0 is the generation of a slot never used.
+		if (++m_ctp_generation == 0) {
+			m_ctp_generation = 1;
+		}
 	}
 	m_close_reason      = Common::CommandThreadProfile::Close::Other;
 	m_close_operations.reset();

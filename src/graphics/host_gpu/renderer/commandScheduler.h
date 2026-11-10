@@ -32,8 +32,10 @@ public:
 	void           EndRendering() { m_command.EndRendering(); }
 	void           Flush(Common::CommandThreadProfile::Close reason = Common::CommandThreadProfile::Close::Other);
 	void           Flush(SubmitInfo& submit);
-	// A draw or a dispatch was recorded: the work goes to the GPU when it would otherwise run dry.
-	void           Recorded();
+	// A draw or a dispatch was recorded: the work goes to the GPU when it would otherwise run dry. GameFlex (0094):
+	// `pipeline` is the one it bound, `task` whether that pipeline has a task stage (a mesh_task draw), which RADV
+	// remembers in the VkCommandBuffer for good (CommandThreadProfile::SubmitKind).
+	void           Recorded(vk::Pipeline pipeline, bool task);
 	// The end of one of the game's command lists: submits unless the GPU has two buffers queued and this one is
 	// not full yet. True when it submitted.
 	bool           FlushAtBoundary();
@@ -85,6 +87,13 @@ private:
 		KYTY_CLASS_NO_COPY(CommandPool);
 
 		vk::CommandBuffer Commit();
+		// GameFlex (0094): the slot of the buffer Commit handed out last; whether a slot's buffer ever bound a
+		// mesh_task pipeline (Mark: true when it had not); the pool's size and its marked buffers.
+		[[nodiscard]] size_t Committed() const noexcept { return m_committed; }
+		[[nodiscard]] bool   Marked(size_t slot) const noexcept { return m_task_bound[slot]; }
+		bool                 Mark(size_t slot) noexcept;
+		[[nodiscard]] size_t Size() const noexcept { return m_buffers.size(); }
+		[[nodiscard]] size_t MarkedCount() const noexcept { return m_marked; }
 
 	private:
 		static constexpr size_t GrowStep = 4;
@@ -97,6 +106,9 @@ private:
 		std::vector<vk::CommandBuffer> m_buffers;
 		std::vector<uint64_t>          m_ticks;
 		size_t                         m_hint = 0;
+		std::vector<bool>              m_task_bound;
+		size_t                         m_marked    = 0;
+		size_t                         m_committed = 0;
 	};
 
 	enum class OperationState { Open, Draining, Closed };
@@ -108,6 +120,7 @@ private:
 
 	void BeginNext();
 	void HarvestTimestamps();
+	void Calibrate();
 	void PriorityOperationsThread(std::stop_token stop);
 	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
@@ -127,6 +140,11 @@ private:
 	// the buffer to whoever records: a label, a transfer, a draw).
 	uint32_t m_commands_recorded = 0;
 	bool     m_buffer_used       = false;
+	// GameFlex (0094): the open buffer's slot in the pool, whether it bound a mesh_task pipeline, and whether its
+	// VkCommandBuffer had in an earlier recording (CommandThreadProfile::SubmitKind).
+	size_t m_buffer_slot   = 0;
+	bool   m_buffer_task   = false;
+	bool   m_buffer_marked = false;
 	// GameFlex: the tick of the last operation queued, under m_operation_mutex, and what NoteCloseOperations found
 	// for the next close (CommandThreadProfile).
 	uint64_t            m_operation_tick = 0;
@@ -146,10 +164,34 @@ private:
 	double                                    m_timestamp_ns  = 1.0;
 	uint64_t                                  m_timestamp_mask = ~uint64_t {0};
 	std::array<uint64_t, kTimestampSlots>     m_timestamp_ticks {};
-	std::array<bool, kTimestampSlots>         m_timestamp_starved {}; // The GPU was dry when it was submitted.
+	// GameFlex (0094): where the GPU stood around the buffer's vkQueueSubmit (0088: dry before it or not), the
+	// buffer's kind, and the CPU's clock when the call returned (0: not taken).
+	std::array<Common::CommandThreadProfile::GpuGap, kTimestampSlots>     m_timestamp_gap {};
+	std::array<Common::CommandThreadProfile::SubmitKind, kTimestampSlots> m_timestamp_kind {};
+	std::array<uint64_t, kTimestampSlots>                                 m_timestamp_return_ns {};
 	std::deque<uint64_t>                      m_timestamp_pending;
 	uint64_t                                  m_last_end_tick = 0;
 	uint64_t                                  m_last_end      = 0;
+	uint32_t                                  m_timestamp_shift = 0; // 64 minus the valid bits, to sign a difference.
+	// GameFlex (0094): the event counters when the open buffer began (draws, dispatches, packets), and the distinct
+	// pipelines its draws and dispatches bound, in a set emptied by changing its generation; only while counting.
+	struct CtpPipeline {
+		uint64_t handle     = 0;
+		uint32_t generation = 0;
+	};
+	static constexpr uint32_t                 kCtpPipelineSlots = 4096; // A power of two.
+	static constexpr uint32_t                 kCtpPipelineLimit = 3072; // Then the count stops growing.
+	bool                                      m_ctp_begun = false;
+	std::array<uint64_t, 3>                   m_ctp_events {};
+	std::vector<CtpPipeline>                  m_ctp_pipelines;
+	uint32_t                                  m_ctp_generation = 1;
+	uint32_t                                  m_ctp_distinct   = 0;
+	// GameFlex (0094): a GPU timestamp and CLOCK_MONOTONIC at one instant (VK_KHR_calibrated_timestamps), taken again
+	// every kCalibrationNs while counting.
+	static constexpr uint64_t                 kCalibrationNs  = 50'000'000;
+	bool                                      m_calibrated    = false;
+	uint64_t                                  m_calibration_gpu = 0;
+	uint64_t                                  m_calibration_ns  = 0;
 };
 
 } // namespace Libs::Graphics

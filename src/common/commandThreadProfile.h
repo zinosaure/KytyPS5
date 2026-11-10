@@ -144,6 +144,59 @@ constexpr size_t WRITER_COUNT = static_cast<size_t>(Writer::Count);
 constexpr size_t WORD_WAIT_CAUSES = 3;
 constexpr size_t WORD_WAIT_COUNT  = WORD_WAIT_CAUSES * WRITER_COUNT;
 
+// GameFlex (0094): a submission's kind, as RADV sees its command buffer. Binding a pipeline with a task stage (an
+// indirect mesh draw) gives the buffer an ACE stream that a reset keeps: from then on, every submission of that
+// VkCommandBuffer goes to the kernel as a gang, and rebuilds the ACE queue's preambles (chantier 48, P4.5).
+enum class SubmitKind : uint8_t {
+	Task,     // It bound a mesh_task pipeline in this recording.
+	Marked,   // Its VkCommandBuffer bound one in an earlier recording, not in this one.
+	Ordinary, // Neither.
+	Count
+};
+
+constexpr size_t SUBMIT_KIND_COUNT = static_cast<size_t>(SubmitKind::Count);
+
+// The size of a submitted buffer, in draws and dispatches: for a cost of the form a + b x size.
+enum class SubmitSize : uint8_t {
+	Small,  // Under 64.
+	Medium, // 64 to 512.
+	Large,  // Over 512.
+	Count
+};
+
+constexpr size_t SUBMIT_SIZE_COUNT = static_cast<size_t>(SubmitSize::Count);
+constexpr size_t SUBMIT_CELLS      = SUBMIT_KIND_COUNT * SUBMIT_SIZE_COUNT;
+
+[[nodiscard]] constexpr SubmitSize SizeOf(uint64_t commands) noexcept {
+	return commands < 64 ? SubmitSize::Small : commands <= 512 ? SubmitSize::Medium : SubmitSize::Large;
+}
+
+[[nodiscard]] constexpr size_t SubmitCell(SubmitKind kind, SubmitSize size) noexcept {
+	return static_cast<size_t>(kind) * SUBMIT_SIZE_COUNT + static_cast<size_t>(size);
+}
+
+// GameFlex (0094): where the GPU stood around a buffer's vkQueueSubmit, for the gap before the GPU starts it.
+enum class GpuGap : uint8_t {
+	DryBefore, // Every earlier buffer was done before the call.
+	DryDuring, // Not before the call, but by its return (the progress word read again).
+	Queued,    // An earlier buffer still ran when the call returned.
+	Count
+};
+
+constexpr size_t GPU_GAP_COUNT = static_cast<size_t>(GpuGap::Count);
+// By where the GPU stood, then by the kind of the buffer after the gap.
+constexpr size_t GPU_GAP_CELLS = GPU_GAP_COUNT * SUBMIT_KIND_COUNT;
+
+[[nodiscard]] constexpr size_t GapCell(GpuGap gap, SubmitKind kind) noexcept {
+	return static_cast<size_t>(gap) * SUBMIT_KIND_COUNT + static_cast<size_t>(kind);
+}
+
+// GameFlex (0094): the buffers on the GPU, submitted and not executed, when one closes: 0, 1, 2 or more.
+constexpr size_t   QUEUED_DEPTHS = 3;
+constexpr uint64_t DEPTH_UNKNOWN = ~uint64_t {0}; // No progress word: asking the driver would cost a system call.
+// A game thread's take of GuestGpu's queue lock that lasted this long waited for it (about 1 us of the TSC).
+constexpr uint64_t GUEST_LOCK_WAIT_TICKS = 4096;
+
 namespace Detail {
 inline std::atomic<uint64_t> g_ticks[CAUSE_COUNT] {};
 inline std::atomic<uint64_t> g_events[EVENT_COUNT] {};
@@ -181,6 +234,44 @@ inline std::atomic<uint64_t> g_suspend_taken_buffers {0}; // Buffers submitted a
 inline std::atomic<uint64_t> g_suspend_released {0};
 inline std::atomic<uint64_t> g_suspend_released_ns {0}; // From being taken.
 inline std::atomic<uint64_t> g_suspend_released_buffers {0};
+// GameFlex (0094): the submissions of P4.5, by kind and size (SubmitCell): vkQueueSubmit alone, this thread's CPU
+// time and context switches during it, and what the buffer held.
+inline std::atomic<uint64_t> g_submits[SUBMIT_CELLS] {};
+inline std::atomic<uint64_t> g_submit_call_ticks[SUBMIT_CELLS] {};
+inline std::atomic<uint64_t> g_submit_cpu_ns[SUBMIT_CELLS] {};
+inline std::atomic<uint64_t> g_submit_voluntary[SUBMIT_CELLS] {};
+inline std::atomic<uint64_t> g_submit_involuntary[SUBMIT_CELLS] {};
+inline std::atomic<uint64_t> g_submit_draws[SUBMIT_CELLS] {};
+inline std::atomic<uint64_t> g_submit_dispatches[SUBMIT_CELLS] {};
+inline std::atomic<uint64_t> g_submit_packets[SUBMIT_CELLS] {};
+inline std::atomic<uint64_t> g_submit_pipelines[SUBMIT_CELLS] {}; // Distinct pipelines its draws and dispatches bound.
+// By close reason: the buffers on the GPU when it closed (QUEUED_DEPTHS each), and vkQueueSubmit alone.
+inline std::atomic<uint64_t> g_close_depths[CLOSE_COUNT * QUEUED_DEPTHS] {};
+inline std::atomic<uint64_t> g_close_samples[CLOSE_COUNT] {};
+inline std::atomic<uint64_t> g_close_call_ticks[CLOSE_COUNT] {};
+// From the GPU timestamps: busy time by kind; the gaps by GapCell (every buffer measured after the one before it
+// counts, gap or not); the delay from the call's return to the buffer's start on the GPU (calibrated timestamps),
+// signed, summed modulo 2^64.
+inline std::atomic<uint64_t> g_gpu_kind_busy_ns[SUBMIT_KIND_COUNT] {};
+inline std::atomic<uint64_t> g_gpu_kind_buffers[SUBMIT_KIND_COUNT] {};
+inline std::atomic<uint64_t> g_gpu_gap_cell_ns[GPU_GAP_CELLS] {};
+inline std::atomic<uint64_t> g_gpu_gap_cell_buffers[GPU_GAP_CELLS] {};
+inline std::atomic<uint64_t> g_start_delay_ns[GPU_GAP_CELLS] {};
+inline std::atomic<uint64_t> g_start_delays[GPU_GAP_CELLS] {};
+inline std::atomic<bool>     g_calibrated {false};
+inline std::atomic<uint64_t> g_calibration_deviation_ns {0}; // The last calibration's.
+// mesh_task pipelines bound; the first one, in ns after the command thread began, plus 1 (0: none yet); the command
+// pool's buffers and those a task stage marked.
+inline std::atomic<uint64_t> g_task_binds {0};
+inline std::atomic<uint64_t> g_thread_start_ns {0};
+inline std::atomic<uint64_t> g_first_task_ns {0};
+inline std::atomic<uint64_t> g_pool_buffers {0};
+inline std::atomic<uint64_t> g_pool_marked {0};
+// The game's threads on GuestGpu's queue lock (SendCommand, Enqueue): every take, and those that waited.
+inline std::atomic<uint64_t> g_guest_locks {0};
+inline std::atomic<uint64_t> g_guest_lock_ticks {0};
+inline std::atomic<uint64_t> g_guest_lock_waits {0};
+inline std::atomic<uint64_t> g_guest_lock_wait_ticks {0};
 
 constexpr uint32_t CLOCK_PAIRS             = 1024; // When the thread starts.
 constexpr uint32_t CLOCK_PAIRS_RECALIBRATE = 64;   // At each suspend point.
@@ -278,6 +369,7 @@ inline void CalibrateClock(uint32_t pairs) noexcept {
 inline void SetCommandThread() noexcept {
 	Detail::t_state.command_thread = true;
 	Detail::t_state.current        = Cause::Other;
+	Detail::g_thread_start_ns.store(SteadyNs(), std::memory_order_relaxed);
 	// GameFlex: the clock reads' cost for a report whose window holds no suspend point (RecalibrateClock).
 	Detail::CalibrateClock(Detail::CLOCK_PAIRS);
 }
@@ -519,6 +611,118 @@ inline void NoteSuspendPointReleased(uint64_t taken_ns, uint64_t queued) noexcep
 	Detail::g_suspend_released_buffers.fetch_add(queued, std::memory_order_relaxed);
 }
 
+// GameFlex (0094): an event counter's total so far, for the share of one command buffer.
+[[nodiscard]] inline uint64_t EventTotal(Event event) noexcept {
+	return Detail::g_events[static_cast<size_t>(event)].load(std::memory_order_relaxed);
+}
+
+// GameFlex (0094): one submission of the command thread, only while Counting().
+struct SubmitSample {
+	SubmitKind kind        = SubmitKind::Ordinary;
+	Close      reason      = Close::Other;
+	uint64_t   depth       = DEPTH_UNKNOWN; // Buffers on the GPU when it closed.
+	uint64_t   call_ticks  = 0;             // vkQueueSubmit alone.
+	uint64_t   cpu_ns      = 0;             // This thread's CPU time during the call.
+	uint64_t   voluntary   = 0;             // Its context switches during the call.
+	uint64_t   involuntary = 0;
+	uint64_t   draws       = 0;
+	uint64_t   dispatches  = 0;
+	uint64_t   packets     = 0;
+	uint64_t   pipelines   = 0;
+};
+
+inline void NoteSubmit(const SubmitSample& sample) noexcept {
+	using namespace Detail;
+	const auto cell = SubmitCell(sample.kind, SizeOf(sample.draws + sample.dispatches));
+	AddOwned(g_submits[cell], 1);
+	AddOwned(g_submit_call_ticks[cell], sample.call_ticks);
+	AddOwned(g_submit_cpu_ns[cell], sample.cpu_ns);
+	AddOwned(g_submit_voluntary[cell], sample.voluntary);
+	AddOwned(g_submit_involuntary[cell], sample.involuntary);
+	AddOwned(g_submit_draws[cell], sample.draws);
+	AddOwned(g_submit_dispatches[cell], sample.dispatches);
+	AddOwned(g_submit_packets[cell], sample.packets);
+	AddOwned(g_submit_pipelines[cell], sample.pipelines);
+	const auto reason = static_cast<size_t>(sample.reason);
+	AddOwned(g_close_samples[reason], 1);
+	AddOwned(g_close_call_ticks[reason], sample.call_ticks);
+	if (sample.depth != DEPTH_UNKNOWN) {
+		AddOwned(g_close_depths[reason * QUEUED_DEPTHS + std::min<uint64_t>(sample.depth, QUEUED_DEPTHS - 1)], 1);
+	}
+}
+
+// GameFlex (0094): what HarvestTimestamps found by kind and by gap (GapCell), in ns; `delay_ns` signed, modulo 2^64.
+struct GpuCells {
+	std::array<uint64_t, SUBMIT_KIND_COUNT> busy_ns {};
+	std::array<uint64_t, SUBMIT_KIND_COUNT> buffers {};
+	std::array<uint64_t, GPU_GAP_CELLS>     gap_ns {};
+	std::array<uint64_t, GPU_GAP_CELLS>     gap_buffers {};
+	std::array<uint64_t, GPU_GAP_CELLS>     delay_ns {};
+	std::array<uint64_t, GPU_GAP_CELLS>     delays {};
+};
+
+inline void AddGpuCells(const GpuCells& cells) noexcept {
+	using namespace Detail;
+	for (size_t i = 0; i < SUBMIT_KIND_COUNT; i++) {
+		g_gpu_kind_busy_ns[i].fetch_add(cells.busy_ns[i], std::memory_order_relaxed);
+		g_gpu_kind_buffers[i].fetch_add(cells.buffers[i], std::memory_order_relaxed);
+	}
+	for (size_t i = 0; i < GPU_GAP_CELLS; i++) {
+		g_gpu_gap_cell_ns[i].fetch_add(cells.gap_ns[i], std::memory_order_relaxed);
+		g_gpu_gap_cell_buffers[i].fetch_add(cells.gap_buffers[i], std::memory_order_relaxed);
+		g_start_delay_ns[i].fetch_add(cells.delay_ns[i], std::memory_order_relaxed);
+		g_start_delays[i].fetch_add(cells.delays[i], std::memory_order_relaxed);
+	}
+}
+
+// GameFlex (0094): the GPU's timestamps can be related to the CPU's clock (VK_KHR_calibrated_timestamps); the last
+// calibration's maximum deviation.
+inline void NoteCalibration(uint64_t deviation_ns) noexcept {
+	Detail::g_calibrated.store(true, std::memory_order_relaxed);
+	Detail::g_calibration_deviation_ns.store(deviation_ns, std::memory_order_relaxed);
+}
+
+// GameFlex (0094): the command thread bound a mesh_task pipeline; `marked` buffers of the pool's `buffers` have.
+// Counted whether the overlay counts or not: the first one's time and the marks are the game's, not the window's.
+inline void NoteTaskBind(uint64_t marked, uint64_t buffers) noexcept {
+	using namespace Detail;
+	if (g_first_task_ns.load(std::memory_order_relaxed) == 0) {
+		g_first_task_ns.store(SteadyNs() - g_thread_start_ns.load(std::memory_order_relaxed) + 1,
+		                      std::memory_order_relaxed);
+	}
+	g_pool_marked.store(marked, std::memory_order_relaxed);
+	g_pool_buffers.store(buffers, std::memory_order_relaxed);
+	if (DebugCounters::Enabled()) {
+		g_task_binds.fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
+// GameFlex (0094): the command pool's size, as it grows.
+inline void NotePoolBuffers(uint64_t buffers) noexcept {
+	Detail::g_pool_buffers.store(buffers, std::memory_order_relaxed);
+}
+
+// GameFlex (0094): a game thread takes GuestGpu's queue lock (SendCommand, Enqueue), which the command thread holds
+// while it submits before sleeping (FlushBeforeIdle). The clock before the lock; 0 while nothing counts, and on the
+// command thread itself.
+[[nodiscard]] inline uint64_t GuestLockStart() noexcept {
+	return DebugCounters::Enabled() && !Detail::t_state.command_thread ? Detail::Ticks() : 0;
+}
+
+inline void GuestLockTaken(uint64_t start) noexcept {
+	if (start == 0) {
+		return;
+	}
+	using namespace Detail;
+	const auto ticks = Ticks() - start;
+	g_guest_locks.fetch_add(1, std::memory_order_relaxed);
+	g_guest_lock_ticks.fetch_add(ticks, std::memory_order_relaxed);
+	if (ticks >= GUEST_LOCK_WAIT_TICKS) {
+		g_guest_lock_waits.fetch_add(1, std::memory_order_relaxed);
+		g_guest_lock_wait_ticks.fetch_add(ticks, std::memory_order_relaxed);
+	}
+}
+
 inline void CountPacket(uint32_t opcode) noexcept {
 	if (DebugCounters::Enabled()) {
 		Detail::g_packets[opcode & (PACKET_KINDS - 1)].fetch_add(1, std::memory_order_relaxed);
@@ -561,6 +765,36 @@ struct Totals {
 	uint64_t                              suspend_released         = 0;
 	uint64_t                              suspend_released_ns      = 0;
 	uint64_t                              suspend_released_buffers = 0;
+	// GameFlex (0094).
+	std::array<uint64_t, SUBMIT_CELLS>                  submits {};
+	std::array<uint64_t, SUBMIT_CELLS>                  submit_call_ticks {};
+	std::array<uint64_t, SUBMIT_CELLS>                  submit_cpu_ns {};
+	std::array<uint64_t, SUBMIT_CELLS>                  submit_voluntary {};
+	std::array<uint64_t, SUBMIT_CELLS>                  submit_involuntary {};
+	std::array<uint64_t, SUBMIT_CELLS>                  submit_draws {};
+	std::array<uint64_t, SUBMIT_CELLS>                  submit_dispatches {};
+	std::array<uint64_t, SUBMIT_CELLS>                  submit_packets {};
+	std::array<uint64_t, SUBMIT_CELLS>                  submit_pipelines {};
+	std::array<uint64_t, CLOSE_COUNT * QUEUED_DEPTHS>   close_depths {};
+	std::array<uint64_t, CLOSE_COUNT>                   close_samples {};
+	std::array<uint64_t, CLOSE_COUNT>                   close_call_ticks {};
+	std::array<uint64_t, SUBMIT_KIND_COUNT>             gpu_kind_busy_ns {};
+	std::array<uint64_t, SUBMIT_KIND_COUNT>             gpu_kind_buffers {};
+	std::array<uint64_t, GPU_GAP_CELLS>                 gpu_gap_cell_ns {};
+	std::array<uint64_t, GPU_GAP_CELLS>                 gpu_gap_cell_buffers {};
+	std::array<uint64_t, GPU_GAP_CELLS>                 start_delay_ns {};
+	std::array<uint64_t, GPU_GAP_CELLS>                 start_delays {};
+	bool                                                calibrated               = false;
+	uint64_t                                            calibration_deviation_ns = 0;
+	uint64_t                                            task_binds               = 0;
+	uint64_t                                            thread_start_ns          = 0;
+	uint64_t                                            first_task_ns            = 0;
+	uint64_t                                            pool_buffers             = 0;
+	uint64_t                                            pool_marked              = 0;
+	uint64_t                                            guest_locks              = 0;
+	uint64_t                                            guest_lock_ticks         = 0;
+	uint64_t                                            guest_lock_waits         = 0;
+	uint64_t                                            guest_lock_wait_ticks    = 0;
 };
 
 namespace Detail {
@@ -613,6 +847,36 @@ void LoadAll(const std::atomic<uint64_t> (&counters)[N], std::array<uint64_t, N>
 	totals.suspend_released         = Detail::g_suspend_released.load(std::memory_order_relaxed);
 	totals.suspend_released_ns      = Detail::g_suspend_released_ns.load(std::memory_order_relaxed);
 	totals.suspend_released_buffers = Detail::g_suspend_released_buffers.load(std::memory_order_relaxed);
+	// GameFlex (0094).
+	Detail::LoadAll(Detail::g_submits, totals.submits);
+	Detail::LoadAll(Detail::g_submit_call_ticks, totals.submit_call_ticks);
+	Detail::LoadAll(Detail::g_submit_cpu_ns, totals.submit_cpu_ns);
+	Detail::LoadAll(Detail::g_submit_voluntary, totals.submit_voluntary);
+	Detail::LoadAll(Detail::g_submit_involuntary, totals.submit_involuntary);
+	Detail::LoadAll(Detail::g_submit_draws, totals.submit_draws);
+	Detail::LoadAll(Detail::g_submit_dispatches, totals.submit_dispatches);
+	Detail::LoadAll(Detail::g_submit_packets, totals.submit_packets);
+	Detail::LoadAll(Detail::g_submit_pipelines, totals.submit_pipelines);
+	Detail::LoadAll(Detail::g_close_depths, totals.close_depths);
+	Detail::LoadAll(Detail::g_close_samples, totals.close_samples);
+	Detail::LoadAll(Detail::g_close_call_ticks, totals.close_call_ticks);
+	Detail::LoadAll(Detail::g_gpu_kind_busy_ns, totals.gpu_kind_busy_ns);
+	Detail::LoadAll(Detail::g_gpu_kind_buffers, totals.gpu_kind_buffers);
+	Detail::LoadAll(Detail::g_gpu_gap_cell_ns, totals.gpu_gap_cell_ns);
+	Detail::LoadAll(Detail::g_gpu_gap_cell_buffers, totals.gpu_gap_cell_buffers);
+	Detail::LoadAll(Detail::g_start_delay_ns, totals.start_delay_ns);
+	Detail::LoadAll(Detail::g_start_delays, totals.start_delays);
+	totals.calibrated               = Detail::g_calibrated.load(std::memory_order_relaxed);
+	totals.calibration_deviation_ns = Detail::g_calibration_deviation_ns.load(std::memory_order_relaxed);
+	totals.task_binds               = Detail::g_task_binds.load(std::memory_order_relaxed);
+	totals.thread_start_ns          = Detail::g_thread_start_ns.load(std::memory_order_relaxed);
+	totals.first_task_ns            = Detail::g_first_task_ns.load(std::memory_order_relaxed);
+	totals.pool_buffers             = Detail::g_pool_buffers.load(std::memory_order_relaxed);
+	totals.pool_marked              = Detail::g_pool_marked.load(std::memory_order_relaxed);
+	totals.guest_locks              = Detail::g_guest_locks.load(std::memory_order_relaxed);
+	totals.guest_lock_ticks         = Detail::g_guest_lock_ticks.load(std::memory_order_relaxed);
+	totals.guest_lock_waits         = Detail::g_guest_lock_waits.load(std::memory_order_relaxed);
+	totals.guest_lock_wait_ticks    = Detail::g_guest_lock_wait_ticks.load(std::memory_order_relaxed);
 	totals.clock_ticks = Detail::Ticks();
 	totals.clock_ns    = SteadyNs();
 	return totals;
@@ -656,6 +920,49 @@ struct Report {
 	double suspend_released_per_frame = 0.0;
 	double suspend_released_ms        = 0.0; // Per point, from being taken.
 	double suspend_released_buffers   = 0.0; // Per point.
+	// GameFlex (0094). By SubmitCell: per frame, then per call or per buffer.
+	std::array<double, SUBMIT_CELLS> submits_per_frame {};
+	std::array<double, SUBMIT_CELLS> submit_call_us {};
+	std::array<double, SUBMIT_CELLS> submit_draws {};
+	std::array<double, SUBMIT_CELLS> submit_dispatches {};
+	std::array<double, SUBMIT_CELLS> submit_packets {};
+	std::array<double, SUBMIT_CELLS> submit_pipelines {};
+	// By kind, the sizes together: per frame, then per call.
+	std::array<double, SUBMIT_KIND_COUNT> kind_per_frame {};
+	std::array<double, SUBMIT_KIND_COUNT> kind_call_us {};
+	std::array<double, SUBMIT_KIND_COUNT> kind_cpu_us {};
+	std::array<double, SUBMIT_KIND_COUNT> kind_voluntary {};
+	std::array<double, SUBMIT_KIND_COUNT> kind_involuntary {};
+	double                                call_us = 0.0; // Every call sampled.
+	// By close reason: closes per frame by the buffers on the GPU (QUEUED_DEPTHS), vkQueueSubmit per call.
+	std::array<double, CLOSE_COUNT * QUEUED_DEPTHS> close_depths_per_frame {};
+	std::array<double, CLOSE_COUNT>                 close_call_us {};
+	// The GPU: busy per buffer by kind; the gaps per frame and per buffer by GapCell, then by gap.
+	std::array<double, SUBMIT_KIND_COUNT> gpu_kind_buffers_per_frame {};
+	std::array<double, SUBMIT_KIND_COUNT> gpu_kind_busy_us {};
+	std::array<double, GPU_GAP_CELLS>     gap_ms_per_frame {};
+	std::array<double, GPU_GAP_CELLS>     gap_buffers_per_frame {};
+	std::array<double, GPU_GAP_COUNT>     gap_class_ms_per_frame {};
+	std::array<double, GPU_GAP_COUNT>     gap_class_buffers_per_frame {};
+	std::array<double, GPU_GAP_COUNT>     gap_us_per_buffer {};       // Over the buffers of its class.
+	std::array<double, GPU_GAP_COUNT>     gap_us_per_undry_buffer {}; // Over the buffers not dry before the call.
+	// The delay from the call's return to the buffer's start on the GPU, per buffer; per frame, the buffers measured.
+	bool                              calibrated   = false;
+	double                            deviation_us = 0.0;
+	std::array<double, GPU_GAP_CELLS> start_delay_us {};
+	std::array<double, GPU_GAP_CELLS> start_delays_per_frame {};
+	// mesh_task pipelines.
+	double task_binds_per_frame = 0.0;
+	double first_task_s         = -1.0; // After the command thread began; -1: none yet.
+	double window_end_s         = 0.0;  // The same clock.
+	double pool_buffers         = 0.0;
+	double pool_marked          = 0.0;
+	// The game's threads on GuestGpu's queue lock.
+	double guest_locks_per_frame        = 0.0;
+	double guest_lock_ms_per_frame      = 0.0;
+	double guest_lock_waits_per_frame   = 0.0;
+	double guest_lock_wait_ms_per_frame = 0.0;
+	double guest_lock_wait_us           = 0.0; // GUEST_LOCK_WAIT_TICKS.
 };
 
 [[nodiscard]] inline Report MakeReport(const Totals& before, const Totals& after,
@@ -754,6 +1061,87 @@ struct Report {
 	report.suspend_released_ms = mean(delta(before.suspend_released_ns, after.suspend_released_ns), released) / 1e6;
 	report.suspend_released_buffers =
 	    mean(delta(before.suspend_released_buffers, after.suspend_released_buffers), released);
+	// GameFlex (0094).
+	const double us_per_tick = ms_per_tick * 1000.0;
+	double       calls_all   = 0.0;
+	double       ticks_all   = 0.0;
+	for (size_t kind = 0; kind < SUBMIT_KIND_COUNT; kind++) {
+		double calls = 0.0, ticks = 0.0, cpu = 0.0, voluntary = 0.0, involuntary = 0.0;
+		for (size_t size = 0; size < SUBMIT_SIZE_COUNT; size++) {
+			const auto i                  = kind * SUBMIT_SIZE_COUNT + size;
+			const auto n                  = delta(before.submits[i], after.submits[i]);
+			const auto t                  = delta(before.submit_call_ticks[i], after.submit_call_ticks[i]);
+			report.submits_per_frame[i]   = n * per_frame;
+			report.submit_call_us[i]      = mean(t, n) * us_per_tick;
+			report.submit_draws[i]        = mean(delta(before.submit_draws[i], after.submit_draws[i]), n);
+			report.submit_dispatches[i]   = mean(delta(before.submit_dispatches[i], after.submit_dispatches[i]), n);
+			report.submit_packets[i]      = mean(delta(before.submit_packets[i], after.submit_packets[i]), n);
+			report.submit_pipelines[i]    = mean(delta(before.submit_pipelines[i], after.submit_pipelines[i]), n);
+			calls += n;
+			ticks += t;
+			cpu += delta(before.submit_cpu_ns[i], after.submit_cpu_ns[i]);
+			voluntary += delta(before.submit_voluntary[i], after.submit_voluntary[i]);
+			involuntary += delta(before.submit_involuntary[i], after.submit_involuntary[i]);
+		}
+		report.kind_per_frame[kind]   = calls * per_frame;
+		report.kind_call_us[kind]     = mean(ticks, calls) * us_per_tick;
+		report.kind_cpu_us[kind]      = mean(cpu, calls) / 1000.0;
+		report.kind_voluntary[kind]   = mean(voluntary, calls);
+		report.kind_involuntary[kind] = mean(involuntary, calls);
+		calls_all += calls;
+		ticks_all += ticks;
+	}
+	report.call_us = mean(ticks_all, calls_all) * us_per_tick;
+	for (size_t i = 0; i < CLOSE_COUNT * QUEUED_DEPTHS; i++) {
+		report.close_depths_per_frame[i] = delta(before.close_depths[i], after.close_depths[i]) * per_frame;
+	}
+	for (size_t i = 0; i < CLOSE_COUNT; i++) {
+		report.close_call_us[i] = mean(delta(before.close_call_ticks[i], after.close_call_ticks[i]),
+		                               delta(before.close_samples[i], after.close_samples[i])) *
+		                          us_per_tick;
+	}
+	for (size_t i = 0; i < SUBMIT_KIND_COUNT; i++) {
+		const auto buffers                   = delta(before.gpu_kind_buffers[i], after.gpu_kind_buffers[i]);
+		report.gpu_kind_buffers_per_frame[i] = buffers * per_frame;
+		report.gpu_kind_busy_us[i] =
+		    mean(delta(before.gpu_kind_busy_ns[i], after.gpu_kind_busy_ns[i]), buffers) / 1000.0;
+	}
+	std::array<double, GPU_GAP_COUNT> gap_ns {};
+	std::array<double, GPU_GAP_COUNT> gap_buffers {};
+	for (size_t i = 0; i < GPU_GAP_CELLS; i++) {
+		const auto gap     = i / SUBMIT_KIND_COUNT;
+		const auto ns      = delta(before.gpu_gap_cell_ns[i], after.gpu_gap_cell_ns[i]);
+		const auto buffers = delta(before.gpu_gap_cell_buffers[i], after.gpu_gap_cell_buffers[i]);
+		report.gap_ms_per_frame[i]      = ns / 1e6 * per_frame;
+		report.gap_buffers_per_frame[i] = buffers * per_frame;
+		gap_ns[gap] += ns;
+		gap_buffers[gap] += buffers;
+		const auto delays                = delta(before.start_delays[i], after.start_delays[i]);
+		const auto delay_ns              = static_cast<double>(static_cast<int64_t>(after.start_delay_ns[i] - before.start_delay_ns[i]));
+		report.start_delays_per_frame[i] = delays * per_frame;
+		report.start_delay_us[i]         = mean(delay_ns, delays) / 1000.0;
+	}
+	const auto undry = gap_buffers[static_cast<size_t>(GpuGap::DryDuring)] + gap_buffers[static_cast<size_t>(GpuGap::Queued)];
+	for (size_t gap = 0; gap < GPU_GAP_COUNT; gap++) {
+		report.gap_class_ms_per_frame[gap]      = gap_ns[gap] / 1e6 * per_frame;
+		report.gap_class_buffers_per_frame[gap] = gap_buffers[gap] * per_frame;
+		report.gap_us_per_buffer[gap]           = mean(gap_ns[gap], gap_buffers[gap]) / 1000.0;
+		report.gap_us_per_undry_buffer[gap]     = mean(gap_ns[gap], undry) / 1000.0;
+	}
+	report.calibrated   = after.calibrated;
+	report.deviation_us = static_cast<double>(after.calibration_deviation_ns) / 1000.0;
+	report.task_binds_per_frame = delta(before.task_binds, after.task_binds) * per_frame;
+	report.first_task_s = after.first_task_ns != 0 ? static_cast<double>(after.first_task_ns - 1) / 1e9 : -1.0;
+	report.window_end_s =
+	    after.thread_start_ns != 0 ? static_cast<double>(after.clock_ns - after.thread_start_ns) / 1e9 : 0.0;
+	report.pool_buffers                 = static_cast<double>(after.pool_buffers);
+	report.pool_marked                  = static_cast<double>(after.pool_marked);
+	report.guest_locks_per_frame        = delta(before.guest_locks, after.guest_locks) * per_frame;
+	report.guest_lock_ms_per_frame      = delta(before.guest_lock_ticks, after.guest_lock_ticks) * ms_per_tick * per_frame;
+	report.guest_lock_waits_per_frame   = delta(before.guest_lock_waits, after.guest_lock_waits) * per_frame;
+	report.guest_lock_wait_ms_per_frame =
+	    delta(before.guest_lock_wait_ticks, after.guest_lock_wait_ticks) * ms_per_tick * per_frame;
+	report.guest_lock_wait_us = static_cast<double>(GUEST_LOCK_WAIT_TICKS) * us_per_tick;
 	return report;
 }
 
@@ -795,6 +1183,21 @@ struct Report {
 [[nodiscard]] constexpr const char* Name(Writer writer) noexcept {
 	constexpr const char* NAMES[WRITER_COUNT] = {"open", "submitted", "executed"};
 	return NAMES[static_cast<size_t>(writer)];
+}
+
+[[nodiscard]] constexpr const char* Name(SubmitKind kind) noexcept {
+	constexpr const char* NAMES[SUBMIT_KIND_COUNT] = {"task", "marked", "ordinary"};
+	return NAMES[static_cast<size_t>(kind)];
+}
+
+[[nodiscard]] constexpr const char* Name(SubmitSize size) noexcept {
+	constexpr const char* NAMES[SUBMIT_SIZE_COUNT] = {"under 64", "64 to 512", "over 512"};
+	return NAMES[static_cast<size_t>(size)];
+}
+
+[[nodiscard]] constexpr const char* Name(GpuGap gap) noexcept {
+	constexpr const char* NAMES[GPU_GAP_COUNT] = {"dry before the call", "dry by its return", "queued"};
+	return NAMES[static_cast<size_t>(gap)];
 }
 
 // The cause a group of word waits is booked under (WORD_WAIT_CAUSES).

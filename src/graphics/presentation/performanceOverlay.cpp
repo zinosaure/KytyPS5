@@ -590,6 +590,11 @@ void DrawCommandThread(const Snapshot& shown) {
 		    Fmt("%.0f / %.0f / %.0f us", ms[static_cast<size_t>(Cause::SubmitBegin)] * 1000.0 / submits,
 		        ms[static_cast<size_t>(Cause::SubmitEnd)] * 1000.0 / submits,
 		        ms[static_cast<size_t>(Cause::SubmitQueue)] * 1000.0 / submits));
+		// GameFlex (0094): vkQueueSubmit alone, by kind (SubmitKind).
+		Row("Submit task / marked / other",
+		    Fmt("%.0f / %.0f / %.0f us", report.kind_call_us[static_cast<size_t>(SubmitKind::Task)],
+		        report.kind_call_us[static_cast<size_t>(SubmitKind::Marked)],
+		        report.kind_call_us[static_cast<size_t>(SubmitKind::Ordinary)]));
 	}
 	const auto full        = static_cast<size_t>(Timed::TransitFull);
 	const auto subresource = static_cast<size_t>(Timed::TransitSubresources);
@@ -603,11 +608,114 @@ void DrawCommandThread(const Snapshot& shown) {
 	ImGui::EndTable();
 }
 
+// GameFlex (0094): what P4.5 is decided on (chantier 48): the submissions by kind and size, the GPU's gaps by where
+// it stood around the call, its start after the call returned, the buffers on the GPU at each close, the mesh_task
+// pipelines, and the game's threads on the GPU queue lock.
+std::string SubmitLines(const Common::CommandThreadProfile::Report& report) {
+	using namespace Common::CommandThreadProfile;
+	std::string text;
+	char        line[512];
+	text += "[perf] submits per frame by kind (task: bound a mesh_task pipeline in its recording; marked: its command "
+	        "buffer did in an earlier one; ordinary), vkQueueSubmit alone per call:";
+	for (size_t i = 0; i < SUBMIT_KIND_COUNT; i++) {
+		std::snprintf(line, sizeof(line), " %s %.1f, %.1f us, %.1f us of CPU, %.2f voluntary and %.2f involuntary switches;",
+		              Name(static_cast<SubmitKind>(i)), report.kind_per_frame[i], report.kind_call_us[i],
+		              report.kind_cpu_us[i], report.kind_voluntary[i], report.kind_involuntary[i]);
+		text += line;
+	}
+	std::snprintf(line, sizeof(line), " every call %.1f us\n", report.call_us);
+	text += line;
+	text += "[perf] submits per frame by kind and size (draws and dispatches), then per buffer:";
+	for (size_t kind = 0; kind < SUBMIT_KIND_COUNT; kind++) {
+		for (size_t size = 0; size < SUBMIT_SIZE_COUNT; size++) {
+			const auto i = SubmitCell(static_cast<SubmitKind>(kind), static_cast<SubmitSize>(size));
+			std::snprintf(line, sizeof(line), " %s %s %.2f, %.1f us, %.1f draws, %.1f dispatches, %.0f packets, %.1f pipelines;",
+			              Name(static_cast<SubmitKind>(kind)), Name(static_cast<SubmitSize>(size)),
+			              report.submits_per_frame[i], report.submit_call_us[i], report.submit_draws[i],
+			              report.submit_dispatches[i], report.submit_packets[i], report.submit_pipelines[i]);
+			text += line;
+		}
+	}
+	text += "\n[perf] GPU idle per frame by where it stood around the call, then by the kind of the buffer after it:";
+	for (size_t gap = 0; gap < GPU_GAP_COUNT; gap++) {
+		std::snprintf(line, sizeof(line), " %s %.2f ms over %.1f buffers, %.1f us each", Name(static_cast<GpuGap>(gap)),
+		              report.gap_class_ms_per_frame[gap], report.gap_class_buffers_per_frame[gap],
+		              report.gap_us_per_buffer[gap]);
+		text += line;
+		// The two classes of a buffer the GPU still had work before, over all such buffers.
+		if (static_cast<GpuGap>(gap) != GpuGap::DryBefore) {
+			std::snprintf(line, sizeof(line), ", %.1f us per buffer not dry before the call",
+			              report.gap_us_per_undry_buffer[gap]);
+			text += line;
+		}
+		text += " (";
+		for (size_t kind = 0; kind < SUBMIT_KIND_COUNT; kind++) {
+			const auto i = GapCell(static_cast<GpuGap>(gap), static_cast<SubmitKind>(kind));
+			std::snprintf(line, sizeof(line), "%s %.2f ms over %.1f%s", Name(static_cast<SubmitKind>(kind)),
+			              report.gap_ms_per_frame[i], report.gap_buffers_per_frame[i],
+			              kind + 1 < SUBMIT_KIND_COUNT ? ", " : ");");
+			text += line;
+		}
+	}
+	text += " GPU busy per buffer:";
+	for (size_t kind = 0; kind < SUBMIT_KIND_COUNT; kind++) {
+		std::snprintf(line, sizeof(line), " %s %.1f us over %.1f per frame%s", Name(static_cast<SubmitKind>(kind)),
+		              report.gpu_kind_busy_us[kind], report.gpu_kind_buffers_per_frame[kind],
+		              kind + 1 < SUBMIT_KIND_COUNT ? "," : "\n");
+		text += line;
+	}
+	// Without the extension the GPU's clock cannot be set against the CPU's: no line.
+	if (report.calibrated) {
+		std::snprintf(line, sizeof(line),
+		              "[perf] GPU start after vkQueueSubmit returned, per buffer (calibrated timestamps, deviation %.1f "
+		              "us):",
+		              report.deviation_us);
+		text += line;
+		for (size_t gap = 0; gap < GPU_GAP_COUNT; gap++) {
+			std::snprintf(line, sizeof(line), " %s:", Name(static_cast<GpuGap>(gap)));
+			text += line;
+			for (size_t kind = 0; kind < SUBMIT_KIND_COUNT; kind++) {
+				const auto i = GapCell(static_cast<GpuGap>(gap), static_cast<SubmitKind>(kind));
+				std::snprintf(line, sizeof(line), " %s %.1f us over %.1f per frame%s", Name(static_cast<SubmitKind>(kind)),
+				              report.start_delay_us[i], report.start_delays_per_frame[i],
+				              kind + 1 < SUBMIT_KIND_COUNT ? "," : ";");
+				text += line;
+			}
+		}
+		text += "\n";
+	}
+	text += "[perf] closes per frame by the buffers on the GPU (0 / 1 / 2 or more), and vkQueueSubmit alone per call:";
+	for (size_t i = 0; i < CLOSE_COUNT; i++) {
+		std::snprintf(line, sizeof(line), " %s %.1f / %.1f / %.1f, %.1f us;", Name(static_cast<Close>(i)),
+		              report.close_depths_per_frame[i * QUEUED_DEPTHS], report.close_depths_per_frame[i * QUEUED_DEPTHS + 1],
+		              report.close_depths_per_frame[i * QUEUED_DEPTHS + 2], report.close_call_us[i]);
+		text += line;
+	}
+	char first[64];
+	if (report.first_task_s >= 0.0) {
+		std::snprintf(first, sizeof(first), "%.1f s", report.first_task_s);
+	} else {
+		std::snprintf(first, sizeof(first), "none yet");
+	}
+	std::snprintf(line, sizeof(line),
+	              "\n[perf] mesh_task pipelines: %.1f binds per frame; the first bound at %s, this window ending at %.1f s "
+	              "(after the command thread began); command buffers marked %.0f of %.0f\n",
+	              report.task_binds_per_frame, first, report.window_end_s, report.pool_marked, report.pool_buffers);
+	text += line;
+	std::snprintf(line, sizeof(line),
+	              "[perf] game threads on the GPU queue lock per frame (SendCommand, Enqueue): %.1f takes, %.3f ms; %.2f "
+	              "lasting %.1f us or more, %.3f ms\n",
+	              report.guest_locks_per_frame, report.guest_lock_ms_per_frame, report.guest_lock_waits_per_frame,
+	              report.guest_lock_wait_us, report.guest_lock_wait_ms_per_frame);
+	text += line;
+	return text;
+}
+
 // GameFlex: the same report in the log, every --perf-log seconds, for benches.
 std::string ProfileLines(const Common::CommandThreadProfile::Report& report) {
 	using namespace Common::CommandThreadProfile;
 	std::string text;
-	char        line[256];
+	char        line[512];
 	std::snprintf(line, sizeof(line), "[perf] %.2f frames/s over %.0f s; command thread, ms per frame:",
 	              report.seconds > 0.0 ? report.frames / report.seconds : 0.0, report.seconds);
 	text += line;
@@ -619,9 +727,13 @@ std::string ProfileLines(const Common::CommandThreadProfile::Report& report) {
 			text += line;
 		}
 	}
-	std::snprintf(line, sizeof(line), " total %.2f\n[perf] GPU per frame: busy %.2f ms, idle %.2f ms waiting for the CPU and %.2f ms with work queued, %.1f buffers measured\n[perf] per frame:",
+	// GameFlex (0094): the buffers measured after the one before them, dry before their call or not (GpuGap).
+	std::snprintf(line, sizeof(line), " total %.2f\n[perf] GPU per frame: busy %.2f ms, idle %.2f ms waiting for the CPU and %.2f ms with work queued, %.1f buffers measured (after the one before: %.1f dry before the call, %.1f not)\n[perf] per frame:",
 	              total, report.gpu_busy_ms_per_frame, report.gpu_gap_ms_per_frame, report.gpu_queued_gap_ms_per_frame,
-	              report.gpu_buffers_per_frame);
+	              report.gpu_buffers_per_frame,
+	              report.gap_class_buffers_per_frame[static_cast<size_t>(GpuGap::DryBefore)],
+	              report.gap_class_buffers_per_frame[static_cast<size_t>(GpuGap::DryDuring)] +
+	                  report.gap_class_buffers_per_frame[static_cast<size_t>(GpuGap::Queued)]);
 	text += line;
 	for (size_t i = 0; i < EVENT_COUNT; i++) {
 		std::snprintf(line, sizeof(line), " %s %.1f;", Name(static_cast<Event>(i)), report.per_frame[i]);
@@ -709,6 +821,7 @@ std::string ProfileLines(const Common::CommandThreadProfile::Report& report) {
 	              report.suspend_taken_per_frame, report.suspend_taken_ms, report.suspend_taken_buffers,
 	              report.suspend_released_per_frame, report.suspend_released_ms, report.suspend_released_buffers);
 	text += line;
+	text += SubmitLines(report);
 	return text;
 }
 

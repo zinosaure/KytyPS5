@@ -85,7 +85,9 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 		command();
 		return;
 	}
+	const auto        ctp_lock = Common::CommandThreadProfile::GuestLockStart();
 	Common::LockGuard lock(m_queue_mutex);
+	Common::CommandThreadProfile::GuestLockTaken(ctp_lock);
 	EXIT_IF(!m_accepting);
 	m_commands.push_back(std::move(command));
 	m_pending_commands.fetch_add(1, std::memory_order_release);
@@ -424,7 +426,11 @@ void CommandProcessor::DmaData(uint8_t dst_sel, uint64_t dst_address_or_offset, 
 }
 
 void GuestGpu::Enqueue(Submission submission) {
+	// GameFlex (0094): the game's threads wait here while the command thread submits under the lock
+	// (FlushBeforeIdle).
+	const auto        ctp_lock = Common::CommandThreadProfile::GuestLockStart();
 	Common::LockGuard lock(m_queue_mutex);
+	Common::CommandThreadProfile::GuestLockTaken(ctp_lock);
 	EXIT_IF(!m_accepting);
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;

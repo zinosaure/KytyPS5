@@ -48,6 +48,8 @@ struct GraphicContext {
 	bool                               buffer_marker_enabled                 = false;
 	bool                               occlusion_queries_enabled             = false;
 	bool                               host_query_reset_enabled              = false;
+	// GameFlex (0094): GPU timestamps related to the CPU's clock, for the command thread's instrument only.
+	bool                               calibrated_timestamps_enabled         = false;
 	bool                               occlusion_query_precise_enabled       = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;

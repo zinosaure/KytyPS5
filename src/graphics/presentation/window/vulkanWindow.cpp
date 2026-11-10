@@ -413,6 +413,8 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	       image_atomic_int64, conditional_rendering, barycentric, shading_rate] = supported;
 	graphics.memory_budget_ext_enabled = add(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 	graphics.buffer_marker_enabled     = add(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
+	// GameFlex (0094): queries only, for the command thread's instrument (CommandThreadProfile).
+	graphics.calibrated_timestamps_enabled = add(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
 	add(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
 	const bool extended_dynamic_state = add(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);
 	if (!add(VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME)) {
