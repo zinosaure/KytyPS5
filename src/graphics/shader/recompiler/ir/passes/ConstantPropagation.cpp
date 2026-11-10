@@ -838,9 +838,15 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 
 // Full and empty masks have a constant predicate in either wave size. In wave32,
 // ballot projection also survives scalar EXEC operations and loop-carried mask Phis.
+// In a wave64 vertex shader, the mask of the lanes below the entry lane count is true too.
 class LaneMaskProjection {
 public:
-	explicit LaneMaskProjection(FoldWorklist& worklist): m_worklist(worklist) {}
+	LaneMaskProjection(FoldWorklist& worklist, const BlockList& blocks, ShaderType stage)
+	    : m_worklist(worklist),
+	      m_entry(stage == ShaderType::Vertex && !blocks.empty() &&
+	                      blocks.front()->ImmPredecessors().empty()
+	                  ? blocks.front()
+	                  : nullptr) {}
 
 	void Fold(Inst& inst, uint32_t wave_size) {
 		if (inst.GetOpcode() != ValueOpcode::INotEqual32 || !Immediate(Arg(inst, 1), 0u)) return;
@@ -859,6 +865,10 @@ public:
 			Replace(inst, Value(mask.U32() != 0u));
 			return;
 		}
+		if (wave_size == 64u && m_entry != nullptr && IsEntryPrefixWords(mask)) {
+			Replace(inst, Value(true));
+			return;
+		}
 		if (wave_size != 32u) return;
 		m_visited.clear();
 		m_grounded = false;
@@ -868,6 +878,82 @@ public:
 private:
 	static bool Immediate(Value value, uint32_t expected) {
 		return IsImmediate(value, Type::U32) && value.U32() == expected;
+	}
+
+	const Inst* EntryInst(Value value, ValueOpcode opcode) const {
+		const auto* inst = value.TryInstruction();
+		return m_entry != nullptr && inst != nullptr && inst->GetOpcode() == opcode &&
+		               inst->Parent() == m_entry
+		           ? inst
+		           : nullptr;
+	}
+
+	// The s3 Kyty gives a wave64 vertex shader (Translate.cpp), computed in the entry block:
+	// the lane count n of the entry Ballot(true), | 1 << 28. A count the guest computes is
+	// not one, even from the same words.
+	bool IsEntryLaneCount(Value value) const {
+		const auto* tagged = EntryInst(value, ValueOpcode::BitwiseOr32);
+		if (tagged == nullptr || !Immediate(Arg(*tagged, 1), 1u << 28u)) return false;
+		const auto* sum = EntryInst(Arg(*tagged, 0), ValueOpcode::IAdd32);
+		if (sum == nullptr) return false;
+		const Inst* ballot = nullptr;
+		for (uint32_t half = 0; half < 2u; ++half) {
+			const auto* count = EntryInst(Arg(*sum, half), ValueOpcode::BitCount32);
+			const auto* word = count == nullptr
+			                       ? nullptr
+			                       : EntryInst(Arg(*count, 0), ValueOpcode::CompositeExtractU32x4);
+			if (word == nullptr || !Immediate(Arg(*word, 1), half)) return false;
+			const auto* source = EntryInst(Arg(*word, 0), ValueOpcode::Ballot);
+			const auto  all    = source == nullptr ? Value {} : Arg(*source, 0);
+			if (!IsImmediate(all, Type::U1) || !all.U1() || (ballot != nullptr && source != ballot))
+				return false;
+			ballot = source;
+		}
+		return true;
+	}
+
+	// The NGG prologue's EXEC, -1 >> ((K - c) & 63) as a 64-bit shift (which takes its amount
+	// & 63), where K is a multiple of 64 and c the entry s3, or s3 & m with the low six bits of
+	// m set. Then (K - c) & 63 = (64 - n) & 63: the lanes below n. The host lanes of a vertex
+	// wave are packed from lane 0 (otherwise this EXEC would drop the vertices of the lanes at
+	// and above n), so every running lane is below n.
+	bool IsEntryPrefix(Value value) const {
+		const auto* shift = value.TryInstruction();
+		if (shift == nullptr || shift->GetOpcode() != ValueOpcode::ShiftRightLogical64) return false;
+		const auto ones = Arg(*shift, 0);
+		if (!IsImmediate(ones, Type::U64) || ones.U64() != UINT64_MAX) return false;
+		const auto* amount = Arg(*shift, 1).TryInstruction();
+		if (amount == nullptr || amount->GetOpcode() != ValueOpcode::ISub32) return false;
+		const auto base = Arg(*amount, 0);
+		if (!IsImmediate(base, Type::U32) || (base.U32() & 63u) != 0u) return false;
+		const auto  count  = Arg(*amount, 1);
+		const auto* masked = count.TryInstruction();
+		if (masked == nullptr || masked->GetOpcode() != ValueOpcode::BitwiseAnd32)
+			return IsEntryLaneCount(count);
+		for (uint32_t arm = 0; arm < 2u; ++arm) {
+			const auto bits = Arg(*masked, arm);
+			if (IsImmediate(bits, Type::U32) && (bits.U32() & 63u) == 63u)
+				return IsEntryLaneCount(Arg(*masked, arm ^ 1u));
+		}
+		return false;
+	}
+
+	bool IsEntryPrefixWord(Value value, uint32_t half) const {
+		const auto* word = value.TryInstruction();
+		return word != nullptr && word->GetOpcode() == ValueOpcode::CompositeExtractU64 &&
+		       Immediate(Arg(*word, 1), half) && IsEntryPrefix(Arg(*word, 0));
+	}
+
+	// ThreadBit's wave64 word: the low word below lane 32, the high word from it.
+	bool IsEntryPrefixWords(Value mask) const {
+		const auto* select = mask.TryInstruction();
+		if (select == nullptr || select->GetOpcode() != ValueOpcode::SelectU32) return false;
+		const auto* below = Arg(*select, 0).TryInstruction();
+		if (below == nullptr || below->GetOpcode() != ValueOpcode::ULessThan32 ||
+		    !Immediate(Arg(*below, 1), 32u)) return false;
+		const auto* lane = Arg(*below, 0).TryInstruction();
+		return lane != nullptr && lane->GetOpcode() == ValueOpcode::LaneId &&
+		       IsEntryPrefixWord(Arg(*select, 1), 0u) && IsEntryPrefixWord(Arg(*select, 2), 1u);
 	}
 
 	static Value BallotPredicate(const Inst& inst) {
@@ -933,6 +1019,7 @@ private:
 	}
 
 	FoldWorklist& m_worklist;
+	const Block*  m_entry;
 	std::unordered_set<const Inst*> m_visited;
 	std::unordered_map<const Inst*, Value> m_values;
 	bool m_grounded = false;
@@ -940,9 +1027,9 @@ private:
 
 } // namespace
 
-void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size) {
+void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size, ShaderType stage) {
 	FoldWorklist worklist;
-	LaneMaskProjection mask_projection(worklist);
+	LaneMaskProjection mask_projection(worklist, blocks, stage);
 	for (auto* block: blocks)
 		for (auto inst = block->begin(); inst != block->end(); ++inst) worklist.Register(inst);
 	std::vector<Use> users;
