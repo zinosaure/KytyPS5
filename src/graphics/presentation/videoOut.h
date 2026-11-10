@@ -2,6 +2,7 @@
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_VIDEOOUT_H_
 
 #include "common/common.h"
+#include "common/uniqueFunction.h"
 // #include "common/subsystems.h"
 
 #include "common/abi.h"
@@ -37,9 +38,9 @@ public:
 	void PrepareFlip(uint64_t request_id, Graphics::CommandBuffer& buffer);
 	void CompleteFlip(uint64_t request_id);
 	void WaitForSubmitSlot(int handle);
-	void WaitFlipDone(int handle, int index);
-	// GameFlex: whether a flip of the buffer is pending, which WaitFlipDone would wait for (CommandThreadProfile).
-	[[nodiscard]] bool HasPendingFlip(int handle, int index);
+	// GameFlex: before_wait runs, outside the queue's lock, only when a flip of the buffer is pending: the flip
+	// may need the work still in the caller's open command buffer.
+	void WaitFlipDone(int handle, int index, Common::UniqueFunction<void>&& before_wait);
 
 	[[nodiscard]] Impl& State() noexcept;
 

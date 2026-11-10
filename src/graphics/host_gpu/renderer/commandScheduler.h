@@ -55,6 +55,9 @@ public:
 	// Guest-memory completions use the priority queue; normal callbacks maintain GPU resources.
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
+	// GameFlex: the operation after the work already submitted, when the open buffer has none and no operation
+	// waits for it: the buffer then need not reach the GPU empty. False, the operation left as it was, otherwise.
+	[[nodiscard]] bool        DeferPriorityOperationOnSubmitted(Common::UniqueFunction<void>& operation);
 	[[nodiscard]] bool        HasPendingPriorityOperations();
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 	// GameFlex: an empty buffer can stay open only when no deferred operation waits for its tick either, and its

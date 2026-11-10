@@ -348,6 +348,24 @@ void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& ope
 	QueueOperation(std::move(operation), true);
 }
 
+bool CommandScheduler::DeferPriorityOperationOnSubmitted(Common::UniqueFunction<void>& operation) {
+	CheckActive();
+	EXIT_IF(!operation);
+	if (m_buffer_used || m_command.IsInvalid()) {
+		return false;
+	}
+	std::unique_lock lock(m_operation_mutex);
+	const auto       tick = CurrentTick();
+	if (m_operation_state != OperationState::Open || m_operation_tick == tick) {
+		return false;
+	}
+	// The queue stays in tick order: no operation waits for the open buffer, so none is past tick - 1.
+	m_priority_operations.push({std::move(operation), tick - 1});
+	lock.unlock();
+	m_operation_available.notify_one();
+	return true;
+}
+
 void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, bool priority) {
 	CheckActive();
 	EXIT_IF(!operation);

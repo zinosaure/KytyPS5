@@ -588,13 +588,21 @@ bool GuestGpu::Process(Submission& submission) {
 				Common::CommandThreadProfile::RecalibrateClock();
 				scheduler.NoteCloseOperations();
 			}
-			scheduler.DeferPriorityOperation([ready = m_suspend_point_ready, &master, taken] {
+			Common::UniqueFunction<void> release = [ready = m_suspend_point_ready, &master, taken] {
 				if (taken != 0) {
 					Common::CommandThreadProfile::NoteSuspendPointReleased(taken, QueuedBuffers(master));
 				}
 				ready->release();
-			});
-			cp.BufferFlush(Common::CommandThreadProfile::Close::SuspendPoint);
+			};
+			// GameFlex: an empty buffer gives the GPU nothing to do: the game is released once the work already
+			// submitted is done, and the buffer stays open for the next frame (5 empty submissions an image in
+			// Clair Obscur, ~200 us of vkQueueSubmit each).
+			if (scheduler.DeferPriorityOperationOnSubmitted(release)) {
+				m_renderer.GetOcclusionQueries().Publish();
+			} else {
+				scheduler.DeferPriorityOperation(std::move(release));
+				cp.BufferFlush(Common::CommandThreadProfile::Close::SuspendPoint);
+			}
 			cp.Reset();
 			break;
 		}
@@ -1032,17 +1040,19 @@ void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_
 	auto&      video_out = m_renderer.GetVideoOut();
 	const auto handle    = static_cast<int>(video_out_handle);
 	const auto index     = static_cast<int>(display_buffer_index);
-	// GameFlex: whether a flip of this buffer was pending before the flush: without one, the flush gave the GPU
-	// nothing the wait needs. The wait's own share of WaitGpuFrame, by that (CommandThreadProfile).
+	// GameFlex: the open buffer goes to the GPU only when a flip of this buffer is pending, which may wait for its
+	// work; without one there is nothing to wait for, and the buffer stays open (twice an image in Clair Obscur,
+	// once in Astro Bot). The wait's own share of WaitGpuFrame, by whether it flushed (CommandThreadProfile).
 	const bool ctp_counting = Common::CommandThreadProfile::Counting();
-	const bool ctp_pending  = ctp_counting && video_out.HasPendingFlip(handle, index);
-	BufferFlush(Common::CommandThreadProfile::Close::WaitFlipDone);
-
+	bool       flushed      = false;
 	const auto ctp_frame = Common::CommandThreadProfile::CauseTicks(Common::CommandThreadProfile::Cause::WaitGpuFrame);
-	video_out.WaitFlipDone(handle, index);
+	video_out.WaitFlipDone(handle, index, [this, &flushed] {
+		BufferFlush(Common::CommandThreadProfile::Close::WaitFlipDone);
+		flushed = true;
+	});
 	if (ctp_counting) {
 		Common::CommandThreadProfile::NoteFlipWait(
-		    ctp_pending,
+		    flushed,
 		    Common::CommandThreadProfile::CauseTicks(Common::CommandThreadProfile::Cause::WaitGpuFrame) - ctp_frame);
 	}
 }
