@@ -64,13 +64,16 @@ uint64_t BuildStamp() {
 }
 
 // GameFlex: the sources the records depend on (generate_version.cmake), so a build that changes
-// neither the recompiler nor the pipelines keeps the store. Without them, the executable's date.
+// neither the recompiler nor the pipelines keeps the store. Without them, the executable's date
+// and the Kyty revision: under Box64, /proc/self/exe is Box64 itself, whose date stays the same
+// when Kyty changes - a store written by another Kyty would pass for this one's.
 uint64_t StoreStamp() {
 	constexpr std::string_view sources = KYTY_SHADER_STORE_STAMP;
 	if (sources != "unknown") {
 		return XXH3_64bits(sources.data(), sources.size());
 	}
-	return BuildStamp();
+	const uint64_t date = BuildStamp();
+	return date == 0 ? 0 : date ^ XXH3_64bits(KYTY_GIT_REVISION, sizeof(KYTY_GIT_REVISION) - 1);
 }
 
 // What every record depends on besides its own fields; empty when the build is unknown.
@@ -79,11 +82,8 @@ std::vector<uint8_t> StoreHeader(const GraphicContext& graphics) {
 	if (stamp == 0) {
 		return {};
 	}
-	// The Kyty revision as well: under Box64, /proc/self/exe is Box64 itself, whose date stays the
-	// same when Kyty changes - a store written by another Kyty would pass for this one's.
-	const uint64_t revision = XXH3_64bits(KYTY_GIT_REVISION, sizeof(KYTY_GIT_REVISION) - 1);
 	Writer header;
-	IoAll(header, stamp, revision, SpirvProfile(graphics),
+	IoAll(header, stamp, SpirvProfile(graphics),
 	      graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize);
 	return std::move(header.bytes);
 }

@@ -583,6 +583,23 @@ void DrawCommandThread(const Snapshot& shown) {
 	Row("Buffers / waits", Fmt("%.0f / %.0f", e[static_cast<size_t>(Event::Submits)],
 	                           e[static_cast<size_t>(Event::GpuWaits)]));
 	Row("Label polls", Fmt("%.0f", e[static_cast<size_t>(Event::LabelPolls)]));
+	// GameFlex (0088): a submit in three, the transits that record nothing, the suspend point's release.
+	if (const auto submits = e[static_cast<size_t>(Event::Submits)]; submits > 0.0) {
+		const auto& ms = report.ms_per_frame;
+		Row("Submit begin / end / queue",
+		    Fmt("%.0f / %.0f / %.0f us", ms[static_cast<size_t>(Cause::SubmitBegin)] * 1000.0 / submits,
+		        ms[static_cast<size_t>(Cause::SubmitEnd)] * 1000.0 / submits,
+		        ms[static_cast<size_t>(Cause::SubmitQueue)] * 1000.0 / submits));
+	}
+	const auto full        = static_cast<size_t>(Timed::TransitFull);
+	const auto subresource = static_cast<size_t>(Timed::TransitSubresources);
+	Row("Transits, no barrier",
+	    Fmt("%.0f, %.2f ms", report.timed_per_frame[full] + report.timed_per_frame[subresource],
+	        report.timed_ms_per_frame[full] + report.timed_ms_per_frame[subresource]));
+	if (report.suspend_released_per_frame > 0.0) {
+		Row("Suspend point release",
+		    Fmt("%.1f ms, %.1f buffers", report.suspend_released_ms, report.suspend_released_buffers));
+	}
 	ImGui::EndTable();
 }
 
@@ -622,7 +639,76 @@ std::string ProfileLines(const Common::CommandThreadProfile::Report& report) {
 			text += line;
 		}
 	}
-	text += "\n";
+	// GameFlex (0088): what the P4 pieces are decided on.
+	const auto& ms         = report.ms_per_frame;
+	const auto  submits    = report.per_frame[static_cast<size_t>(Event::Submits)];
+	const auto  per_submit = [submits](double ms_per_frame) {
+		return submits > 0.0 ? ms_per_frame * 1000.0 / submits : 0.0;
+	};
+	std::snprintf(line, sizeof(line),
+	              "\n[perf] submit per buffer: begin %.1f us, end %.1f us, vkQueueSubmit %.1f us, the GPU timestamps "
+	              "%.1f us of begin and end; %.1f buffers per frame",
+	              per_submit(ms[static_cast<size_t>(Cause::SubmitBegin)]),
+	              per_submit(ms[static_cast<size_t>(Cause::SubmitEnd)]),
+	              per_submit(ms[static_cast<size_t>(Cause::SubmitQueue)]), per_submit(report.timestamp_ms_per_frame),
+	              submits);
+	text += line;
+	text += "\n[perf] empty buffers closed per frame, and those a deferred operation waits for:";
+	for (size_t i = 0; i < CLOSE_COUNT; i++) {
+		std::snprintf(line, sizeof(line), " %s %.1f, %.1f with operations;", Name(static_cast<Close>(i)),
+		              report.empty_closes_per_frame[i], report.empty_operation_closes_per_frame[i]);
+		text += line;
+	}
+	std::snprintf(line, sizeof(line),
+	              "\n[perf] flip waits per frame (WaitFlipDone): %.1f with a flip of the buffer pending before the "
+	              "flush, %.2f ms waiting; %.1f without, %.2f ms",
+	              report.flip_waits_per_frame[1], report.flip_wait_ms_per_frame[1], report.flip_waits_per_frame[0],
+	              report.flip_wait_ms_per_frame[0]);
+	text += line;
+	text += "\n[perf] transits per frame:";
+	for (const bool barrier: {false, true}) {
+		for (const bool per_subresource: {false, true}) {
+			std::snprintf(line, sizeof(line), " %s, %s:", barrier ? "barrier" : "no barrier",
+			              per_subresource ? "per subresource" : "whole image");
+			text += line;
+			for (size_t i = 0; i < TRANSIT_CALLER_COUNT; i++) {
+				const auto caller = static_cast<TransitCaller>(i);
+				std::snprintf(line, sizeof(line), " %s %.0f%s", Name(caller),
+				              report.transits_per_frame[TransitIndex(barrier, per_subresource, caller)],
+				              i + 1 < TRANSIT_CALLER_COUNT ? "," : ";");
+				text += line;
+			}
+		}
+	}
+	// The raw ticks next to the pair taken out of them: a step shorter than its clock reads shows as 0 ns.
+	std::snprintf(line, sizeof(line), "\n[perf] sampled steps per frame, two clock reads %.1f ticks:",
+	              report.clock_pair_ticks);
+	text += line;
+	for (size_t i = 0; i < TIMED_COUNT; i++) {
+		std::snprintf(line, sizeof(line), " %s %.0f calls, %.1f ns each (%.1f ticks raw), %.2f ms (%.0f timed);",
+		              Name(static_cast<Timed>(i)), report.timed_per_frame[i], report.timed_ns_per_call[i],
+		              report.timed_ticks_per_call[i], report.timed_ms_per_frame[i], report.timed_samples_per_frame[i]);
+		text += line;
+	}
+	// By the cause the wait is booked under, then by where the last writer stood. The wait is the cause's share; the
+	// Finish around it adds the open buffer's submit, the next one's begin and the deferred operations.
+	text += "\n[perf] waits for GPU-written words per frame, by their last writer:";
+	for (size_t i = 0; i < WORD_WAIT_COUNT; i++) {
+		std::snprintf(line, sizeof(line),
+		              " %s %s %.1f, %.2f ms waiting, %.2f ms in Finish, %.1f buffers to it, %.1f after it with the "
+		              "open one, %.1f with work in the open one;",
+		              WordWaitCauseName(i / WRITER_COUNT), Name(static_cast<Writer>(i % WRITER_COUNT)),
+		              report.word_waits_per_frame[i], report.word_wait_ms_per_frame[i],
+		              report.word_finish_ms_per_frame[i], report.word_wait_ahead[i], report.word_wait_behind[i],
+		              report.word_wait_open_used_per_frame[i]);
+		text += line;
+	}
+	std::snprintf(line, sizeof(line),
+	              "\n[perf] suspend points per frame: taken %.1f, %.2f ms after the game's call, %.1f buffers on the "
+	              "GPU; released %.1f, %.2f ms after being taken, %.1f buffers on the GPU\n",
+	              report.suspend_taken_per_frame, report.suspend_taken_ms, report.suspend_taken_buffers,
+	              report.suspend_released_per_frame, report.suspend_released_ms, report.suspend_released_buffers);
+	text += line;
 	return text;
 }
 

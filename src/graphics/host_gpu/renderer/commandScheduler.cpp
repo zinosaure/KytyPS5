@@ -354,13 +354,33 @@ void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& ope
 	QueueOperation(std::move(operation), true);
 }
 
+bool CommandScheduler::DeferPriorityOperationOnSubmitted(Common::UniqueFunction<void>& operation) {
+	CheckActive();
+	EXIT_IF(!operation);
+	if (m_buffer_used || m_command.IsInvalid()) {
+		return false;
+	}
+	std::unique_lock lock(m_operation_mutex);
+	const auto       tick = CurrentTick();
+	if (m_operation_state != OperationState::Open || m_operation_tick == tick) {
+		return false;
+	}
+	// The queue stays in tick order: no operation waits for the open buffer, so none is past tick - 1.
+	m_priority_operations.push({std::move(operation), tick - 1});
+	lock.unlock();
+	m_operation_available.notify_one();
+	return true;
+}
+
 void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, bool priority) {
 	CheckActive();
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
 	if (m_operation_state == OperationState::Open) {
-		auto& queue = priority ? m_priority_operations : m_pending_operations;
-		queue.push({std::move(operation), CurrentTick()});
+		auto&      queue = priority ? m_priority_operations : m_pending_operations;
+		const auto tick  = CurrentTick();
+		queue.push({std::move(operation), tick});
+		m_operation_tick = tick;
 		lock.unlock();
 		if (priority) {
 			m_operation_available.notify_one();
@@ -373,6 +393,11 @@ void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, 
 	}
 	lock.unlock();
 	operation();
+}
+
+void CommandScheduler::NoteCloseOperations() {
+	std::lock_guard lock(m_operation_mutex);
+	m_close_operations = m_operation_tick == CurrentTick();
 }
 
 bool CommandScheduler::HasPendingPriorityOperations() {
@@ -477,7 +502,7 @@ CommandBuffer& CommandScheduler::Current() {
 }
 
 CommandBuffer& CommandScheduler::BeginCommand() {
-	Common::CommandThreadProfile::Scope ctp_submit(Common::CommandThreadProfile::Cause::Submit);
+	Common::CommandThreadProfile::Scope ctp_submit(Common::CommandThreadProfile::Cause::SubmitBegin);
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
@@ -485,6 +510,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	if (m_profiled && Common::DebugCounters::Enabled()) {
 		Common::CommandThreadProfile::Count(Common::CommandThreadProfile::Event::CommandBuffers);
 		if (m_timestamps != nullptr) {
+			const auto ctp_timestamps = Common::CommandThreadProfile::Clock();
 			HarvestTimestamps();
 			// This buffer's tick is the next one handed out; its slot was last used 256 buffers ago.
 			const auto tick = CurrentTick();
@@ -494,13 +520,14 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 				m_command.Handle().writeTimestamp2(vk::PipelineStageFlagBits2::eNone, m_timestamps, 2 * slot);
 				m_timestamp_ticks[slot] = tick;
 			}
+			Common::CommandThreadProfile::AddTimestampTicks(ctp_timestamps);
 		}
 	}
 	return m_command;
 }
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
-	Common::CommandThreadProfile::Scope ctp_submit_scope(Common::CommandThreadProfile::Cause::Submit);
+	Common::CommandThreadProfile::Scope ctp_submit_scope(Common::CommandThreadProfile::Cause::SubmitEnd);
 	EXIT_IF(m_command.IsInvalid());
 
 	// This thread alone hands out ticks and submits: the order of the two is the same.
@@ -513,10 +540,12 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	}
 	if (const auto slot = static_cast<uint32_t>(tick % kTimestampSlots);
 	    m_timestamps != nullptr && m_timestamp_ticks[slot] == tick) {
+		const auto ctp_timestamps = Common::CommandThreadProfile::Clock();
 		m_command.EndRendering();
 		m_command.Handle().writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, m_timestamps, 2 * slot + 1);
 		m_timestamp_pending.push_back(tick);
 		m_timestamp_starved[slot] = tick == m_master.Progress() + 1;
+		Common::CommandThreadProfile::AddTimestampTicks(ctp_timestamps);
 	}
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;
@@ -527,7 +556,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	{
 		Common::CommandThreadProfile::Phase(Common::CommandThreadProfile::Cause::WaitQueueLock);
 		Common::LockGuard lock(graphics.queue_mutex);
-		Common::CommandThreadProfile::Phase(Common::CommandThreadProfile::Cause::Submit);
+		Common::CommandThreadProfile::Phase(Common::CommandThreadProfile::Cause::SubmitQueue);
 		submit.AddSignal(m_master.Handle(), tick);
 
 		vk::TimelineSemaphoreSubmitInfo timeline_info {};
@@ -548,6 +577,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 		result = graphics.queue.submit(1, &submit_info, nullptr);
 	}
+	Common::CommandThreadProfile::Phase(Common::CommandThreadProfile::Cause::SubmitEnd);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
 
 	if (result != vk::Result::eSuccess) {
@@ -555,10 +585,21 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	}
 
 	if (m_profiled) {
-		Common::CommandThreadProfile::CountClose(m_close_reason);
+		// GameFlex: an empty buffer, and whether a deferred operation waits for its tick all the same.
+		bool operations = false;
+		if (!m_buffer_used && Common::DebugCounters::Enabled()) {
+			if (m_close_operations.has_value()) {
+				operations = *m_close_operations;
+			} else {
+				std::lock_guard lock(m_operation_mutex);
+				operations = m_operation_tick == tick;
+			}
+		}
+		Common::CommandThreadProfile::CountClose(m_close_reason, !m_buffer_used, operations);
 		Common::CommandThreadProfile::Count(Common::CommandThreadProfile::Event::Submits);
 	}
 	m_close_reason      = Common::CommandThreadProfile::Close::Other;
+	m_close_operations.reset();
 	m_command.m_buffer  = nullptr;
 	m_commands_recorded = 0;
 	m_buffer_used       = false;

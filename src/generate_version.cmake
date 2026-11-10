@@ -38,14 +38,17 @@ if(GIT_EXECUTABLE)
 		endif()
 	endif()
 endif()
-# GameFlex: what the shader store's records depend on - the recompiler, and the renderer that
-# describes and creates pipelines (not its memory caches). A build that leaves these sources alone
-# keeps the store, whatever else it changes.
+# GameFlex: what the shader store's records depend on - the recompiler, which builds the programs
+# and their keys, and the code that describes and creates pipelines, with the render target headers
+# it includes. A build that leaves these sources alone keeps the store, whatever else it changes:
+# barriers, the scheduler, the draws, the caches of memory (they used to count, with all of
+# host_gpu/renderer, and the Kyty revision on top: every build threw the accounts' stores away).
 set(KYTY_SHADER_STORE_STAMP "unknown")
 if(GRAPHICS_SOURCE_DIR)
 	file(GLOB_RECURSE store_sources LIST_DIRECTORIES false RELATIVE "${GRAPHICS_SOURCE_DIR}"
-		"${GRAPHICS_SOURCE_DIR}/shader/*" "${GRAPHICS_SOURCE_DIR}/host_gpu/renderer/*")
-	list(FILTER store_sources EXCLUDE REGEX "^host_gpu/renderer/cache/")
+		"${GRAPHICS_SOURCE_DIR}/shader/*" "${GRAPHICS_SOURCE_DIR}/host_gpu/renderer/pipeline/*")
+	list(APPEND store_sources "host_gpu/renderer/colorRenderTarget.h"
+		"host_gpu/renderer/depthRenderTarget.h" "host_gpu/renderer/renderTarget.h")
 	list(SORT store_sources)
 	set(store_digests "")
 	foreach(source IN LISTS store_sources)
@@ -56,10 +59,5 @@ if(GRAPHICS_SOURCE_DIR)
 		string(SHA256 KYTY_SHADER_STORE_STAMP "${store_digests}")
 	endif()
 endif()
-# GameFlex: 0034 only translates what used to stop Kyty, and 0038 only moves when the store is read,
-# so the records stored before them stay valid.
-# Any other change to these sources gives another stamp, and a new store.
-if(KYTY_SHADER_STORE_STAMP STREQUAL "58af55fba97c6709ae1c05a25943a503c1fe2bec899d2f11ba69c593a259f71c")
-	set(KYTY_SHADER_STORE_STAMP "1a2216d3d966cf7b1b6e8ec85cd3a0a1a0f2115d9453cbf36d9a6c909aa85b7d")
-endif()
+# Any change to these sources gives another stamp, and a new store.
 configure_file("${INPUT_FILE}" "${OUTPUT_FILE}")

@@ -38,6 +38,15 @@ namespace Libs::Graphics {
 static thread_local Pm4Execution* g_current_execution = nullptr;
 static thread_local GuestGpu*     g_gpu_state         = nullptr;
 
+namespace {
+// GameFlex: the command buffers submitted and not executed yet (CommandThreadProfile), from any thread.
+uint64_t QueuedBuffers(MasterSemaphore& master) {
+	const auto done    = master.Progress();
+	const auto current = master.CurrentTick();
+	return done + 1 < current ? current - 1 - done : 0;
+}
+} // namespace
+
 GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	m_gfx_cp = std::make_unique<CommandProcessor>(renderer, 0);
@@ -156,7 +165,8 @@ void GuestGpu::SuspendPoint() {
 	m_suspend_point_ready->acquire();
 	m_guest_at_suspend_point.store(false, std::memory_order_relaxed);
 	Submission submission;
-	submission.type = SubmissionType::SuspendPoint;
+	submission.type      = SubmissionType::SuspendPoint;
+	submission.called_ns = Common::CommandThreadProfile::SuspendClock();
 	Enqueue(std::move(submission));
 	m_done_num++;
 }
@@ -567,9 +577,32 @@ bool GuestGpu::Process(Submission& submission) {
 			Common::CommandThreadProfile::Scope ctp_upkeep(Common::CommandThreadProfile::Cause::Upkeep);
 			// Age caches at the frame boundary, not once per command list.
 			m_renderer.RunGarbageCollector();
-			m_renderer.GetCommandScheduler().DeferPriorityOperation(
-			    [ready = m_suspend_point_ready] { ready->release(); });
-			cp.BufferFlush(Common::CommandThreadProfile::Close::Frame);
+			// GameFlex: how deep the frame runs: the buffers still on the GPU when the point is taken and when it is
+			// released, and the time from the game's call to each (CommandThreadProfile). Whether an operation other
+			// than the release waits for the buffer this point closes, and the clock reads' cost measured again.
+			auto&      scheduler = m_renderer.GetCommandScheduler();
+			auto&      master    = scheduler.GetMasterSemaphore();
+			const auto taken     = Common::CommandThreadProfile::SuspendClock();
+			if (taken != 0) {
+				Common::CommandThreadProfile::NoteSuspendPointTaken(submission.called_ns, taken, QueuedBuffers(master));
+				Common::CommandThreadProfile::RecalibrateClock();
+				scheduler.NoteCloseOperations();
+			}
+			Common::UniqueFunction<void> release = [ready = m_suspend_point_ready, &master, taken] {
+				if (taken != 0) {
+					Common::CommandThreadProfile::NoteSuspendPointReleased(taken, QueuedBuffers(master));
+				}
+				ready->release();
+			};
+			// GameFlex: an empty buffer gives the GPU nothing to do: the game is released once the work already
+			// submitted is done, and the buffer stays open for the next frame (5 empty submissions an image in
+			// Clair Obscur, ~200 us of vkQueueSubmit each).
+			if (scheduler.DeferPriorityOperationOnSubmitted(release)) {
+				m_renderer.GetOcclusionQueries().Publish();
+			} else {
+				scheduler.DeferPriorityOperation(std::move(release));
+				cp.BufferFlush(Common::CommandThreadProfile::Close::SuspendPoint);
+			}
 			cp.Reset();
 			break;
 		}
@@ -1004,10 +1037,24 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
 	Common::CommandThreadProfile::Scope ctp_upkeep(Common::CommandThreadProfile::Cause::Upkeep);
-	BufferFlush(Common::CommandThreadProfile::Close::Frame);
-
-	m_renderer.GetVideoOut().WaitFlipDone(static_cast<int>(video_out_handle),
-	                                      static_cast<int>(display_buffer_index));
+	auto&      video_out = m_renderer.GetVideoOut();
+	const auto handle    = static_cast<int>(video_out_handle);
+	const auto index     = static_cast<int>(display_buffer_index);
+	// GameFlex: the open buffer goes to the GPU only when a flip of this buffer is pending, which may wait for its
+	// work; without one there is nothing to wait for, and the buffer stays open (twice an image in Clair Obscur,
+	// once in Astro Bot). The wait's own share of WaitGpuFrame, by whether it flushed (CommandThreadProfile).
+	const bool ctp_counting = Common::CommandThreadProfile::Counting();
+	bool       flushed      = false;
+	const auto ctp_frame = Common::CommandThreadProfile::CauseTicks(Common::CommandThreadProfile::Cause::WaitGpuFrame);
+	video_out.WaitFlipDone(handle, index, [this, &flushed] {
+		BufferFlush(Common::CommandThreadProfile::Close::WaitFlipDone);
+		flushed = true;
+	});
+	if (ctp_counting) {
+		Common::CommandThreadProfile::NoteFlipWait(
+		    flushed,
+		    Common::CommandThreadProfile::CauseTicks(Common::CommandThreadProfile::Cause::WaitGpuFrame) - ctp_frame);
+	}
 }
 
 void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector, void* address,
@@ -1200,7 +1247,7 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 	auto  request = Sync::PrepareVideoOutFlip(command, handle, index, flip_mode, flip_arg);
 	GetScheduler().DeferPriorityOperation(
 	    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); });
-	GetScheduler().Flush(Common::CommandThreadProfile::Close::Frame);
+	GetScheduler().Flush(Common::CommandThreadProfile::Close::Flip);
 }
 
 void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
@@ -1209,7 +1256,7 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	m_renderer.GetVideoOut().PrepareFlip(request_id, command);
 	GetScheduler().DeferPriorityOperation(
 	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });
-	GetScheduler().Flush(Common::CommandThreadProfile::Close::Frame);
+	GetScheduler().Flush(Common::CommandThreadProfile::Close::CpuFlip);
 }
 
 bool GuestGpu::IsGpuThread() noexcept {

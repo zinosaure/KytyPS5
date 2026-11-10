@@ -13,6 +13,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <thread>
 #include <vector>
@@ -54,8 +55,17 @@ public:
 	// Guest-memory completions use the priority queue; normal callbacks maintain GPU resources.
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
+	// GameFlex: the operation after the work already submitted, when the open buffer has none and no operation
+	// waits for it: the buffer then need not reach the GPU empty. False, the operation left as it was, otherwise.
+	[[nodiscard]] bool        DeferPriorityOperationOnSubmitted(Common::UniqueFunction<void>& operation);
 	[[nodiscard]] bool        HasPendingPriorityOperations();
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
+	// GameFlex: an empty buffer can stay open only when no deferred operation waits for its tick either, and its
+	// close counts whether one does (CommandThreadProfile). The suspend point queues its own release on the buffer
+	// it closes: it asks before, and the close counts that answer.
+	void                      NoteCloseOperations();
+	// GameFlex: whether anything was recorded in the open buffer (CommandThreadProfile).
+	[[nodiscard]] bool        BufferUsed() const noexcept { return m_buffer_used; }
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
 	void                           CheckActive() const;
@@ -117,6 +127,10 @@ private:
 	// the buffer to whoever records: a label, a transfer, a draw).
 	uint32_t m_commands_recorded = 0;
 	bool     m_buffer_used       = false;
+	// GameFlex: the tick of the last operation queued, under m_operation_mutex, and what NoteCloseOperations found
+	// for the next close (CommandThreadProfile).
+	uint64_t            m_operation_tick = 0;
+	std::optional<bool> m_close_operations;
 	// The word the GPU writes at the end of each command buffer with the buffer's tick (VK_AMD_buffer_marker):
 	// where the GPU is, read from memory (MasterSemaphore::Progress).
 	std::unique_ptr<Buffer> m_progress;

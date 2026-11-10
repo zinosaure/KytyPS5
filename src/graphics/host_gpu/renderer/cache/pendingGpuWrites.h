@@ -31,6 +31,8 @@ public:
 	[[nodiscard]] bool         Intersects(uint64_t address, uint64_t size) const noexcept;
 	// How many bytes of [address, address + size) the ranges cover.
 	[[nodiscard]] uint64_t     Bytes(uint64_t address, uint64_t size) const noexcept;
+	// The tick of the last writer of [address, address + size): the latest of the ranges it meets, 0 for none.
+	[[nodiscard]] uint64_t     LatestTick(uint64_t address, uint64_t size) const noexcept;
 
 private:
 	// The first range that ends after `address`.
