@@ -45853,6 +45853,88 @@ TestCase ImageStoreYzwxUsesInverseSwizzle() {
   return test;
 }
 
+// 0093: a wave64 vertex shader's NGG prologue writes EXEC = -1 >> ((K - c) & 63)
+// from the lane count Kyty puts in s3. With c = s3 (K = 0) or s3 & 0xff (K = 64),
+// that is the lanes below the count: the per-lane EXEC test folds to true, and the
+// VGPR write under it needs no select. Another K or mask, a count the guest computes
+// (even from the entry EXEC words) or a count the guest wrote keeps its lane test.
+TestCase VertexNggPrologueExecFoldsToTrue() {
+  using O = ShaderOpcode;
+  using ShaderRecompiler::IR::ValueOpcode;
+  constexpr u32 kMinusOne = 193; // inline constant -1
+  const auto sub = [](u32 dst, u32 lhs, u32 rhs) {
+    return EncodeSop2(0x01, dst, lhs, rhs); // s_sub_u32
+  };
+  const u32 exec_prefix = EncodeSop2(0x21, 126, kMinusOne, 4); // s_lshr_b64 exec, -1, s4
+  struct Variant {
+    const char *name;
+    std::vector<u32> prologue;
+    bool folds;
+  };
+  const std::vector<Variant> variants{
+      {"K=0", {sub(4, InlineU32(0), 3), exec_prefix}, true},
+      {"K=64, s3 & 0xff",
+       {EncodeSop2(0x0e, 4, 3, 255), 0xffu, sub(4, InlineU32(64), 4), exec_prefix},
+       true},
+      {"K=64, 0xff & s3",
+       {EncodeSop2(0x0e, 4, 255, 3), 0xffu, sub(4, InlineU32(64), 4), exec_prefix},
+       true},
+      {"K=0 through s[6:7]",
+       {sub(4, InlineU32(0), 3), EncodeSop2(0x21, 6, kMinusOne, 4),
+        EncodeSop1(0x04, 126, 6)},
+       true},
+      {"K=32", {sub(4, InlineU32(32), 3), exec_prefix}, false},
+      {"K=64, s3 & 31",
+       {EncodeSop2(0x0e, 4, 3, InlineU32(31)), sub(4, InlineU32(64), 4), exec_prefix},
+       false},
+      {"guest count of EXEC | 1 << 28",
+       {EncodeSop1(0x10, 4, 126), EncodeSop2(0x10, 4, 4, 255), 1u << 28u,
+        sub(4, InlineU32(0), 4), exec_prefix},
+       false},
+      {"s3 written by the guest",
+       {EncodeSMovB32(3, InlineU32(40)), sub(4, InlineU32(0), 3), exec_prefix},
+       false},
+  };
+  for (const auto &variant : variants) {
+    std::vector<u32> vertex_code = variant.prologue;
+    vertex_code.push_back(EncodeVop1(0x01, 1, 242)); // v_mov_b32 v1, 1.0
+    vertex_code.push_back(EncodeExp0(0x0c, 0xf));    // exp pos0 v1, v1, v1, v1 done
+    vertex_code.push_back(EncodeExp1(1, 1, 1, 1));
+    AppendEnd(&vertex_code);
+    ShaderVertexInputInfo vertex{};
+    ShaderRecompiler::CompileOptions options;
+    options.stage = ShaderType::Vertex;
+    options.input_info.vertex = &vertex;
+    auto result = ShaderRecompiler::CompileProgram(
+        ShaderRecompiler::TranslateProgram(vertex_code, options), options, {});
+    ValidateSpirv("VertexNggPrologueExecFoldsToTrue", result.spirv);
+    size_t lane_ids = 0;
+    size_t selects = 0;
+    for (const auto *block : result.program.blocks) {
+      for (const auto &inst : *block) {
+        lane_ids += inst.GetOpcode() == ValueOpcode::LaneId ? 1u : 0u;
+        selects += inst.GetOpcode() == ValueOpcode::SelectU32 ? 1u : 0u;
+      }
+    }
+    Require("VertexNggPrologueExecFoldsToTrue", variant.name,
+            variant.folds ? lane_ids == 0 && selects == 0 : lane_ids != 0 && selects != 0,
+            variant.folds ? "the prologue's EXEC kept a per-lane test"
+                          : "a lane test that is not the entry lane count folded");
+  }
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 7);
+  AppendStoreVgpr(&code, 1, 0);
+  AppendEnd(&code);
+  TestCase test;
+  test.name = "VertexNggPrologueExecFoldsToTrue";
+  test.code = code;
+  test.initial = {0u};
+  test.expected = {7u};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase ImageStoreR32FloatUsesFormatlessStorageImage() {
   using O = ShaderOpcode;
 
@@ -54393,6 +54475,7 @@ int main(int argc, char **argv) {
         [] { return VectorReadlaneSelectsTwoKeysWithinWave(); },
         [] { return ImageStoreBgraUsesInverseSwizzle(); },
         [] { return ImageStoreYzwxUsesInverseSwizzle(); },
+        [] { return VertexNggPrologueExecFoldsToTrue(); },
     };
     for (size_t index = argc == 3 ? std::strtoul(argv[2], nullptr, 10) : 0; index < cases.size(); index++) {
       auto test = cases[index]();

@@ -290,7 +290,7 @@ void LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 			    2, ActiveAddress(*block, it, it->Arg(2), it->Arg(it->NumArgs() - 1u), resolved));
 		}
 	}
-	ConstantPropagationPass(program.blocks, program.wave_size);
+	ConstantPropagationPass(program.blocks, program.wave_size, program.stage);
 	uint32_t reads = 0, writes = 0, factors = 0, patches = 0;
 	for (auto* block: program.blocks) {
 		for (auto it = block->begin(); it != block->end(); ++it) {
@@ -397,7 +397,7 @@ void LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 			inst.Invalidate();
 		}
 	}
-	ConstantPropagationPass(program.blocks, program.wave_size);
+	ConstantPropagationPass(program.blocks, program.wave_size, program.stage);
 	RemoveIdentities(program);
 	EliminateDeadCode(program.blocks);
 	// Patch constant stores whose EXEC selects were not stripped would land in control points.
