@@ -124,7 +124,7 @@ constexpr size_t TRANSIT_KINDS = 2 * 2 * TRANSIT_CALLER_COUNT;
 enum class Timed : uint8_t {
 	TransitFull,         // An Image::Transit of the whole image that records no barrier.
 	TransitSubresources, // An Image::Transit subresource by subresource that records no barrier.
-	DrawState,           // A draw's DrawRenderState built (value-initialized).
+	DrawState,           // The executor's DrawRenderState taken back by a draw (ResetDrawRenderState).
 	Count
 };
 
