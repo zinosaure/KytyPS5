@@ -705,9 +705,11 @@ std::string ProfileLines(const Common::CommandThreadProfile::Report& report) {
 	}
 	std::snprintf(line, sizeof(line),
 	              "\n[perf] suspend points per frame: taken %.1f, %.2f ms after the game's call, %.1f buffers on the "
-	              "GPU; released %.1f, %.2f ms after being taken, %.1f buffers on the GPU\n",
+	              "GPU; released %.1f, %.2f ms after being taken, %.1f buffers on the GPU; called %.1f, %.1f waited, "
+	              "%.2f ms waiting\n",
 	              report.suspend_taken_per_frame, report.suspend_taken_ms, report.suspend_taken_buffers,
-	              report.suspend_released_per_frame, report.suspend_released_ms, report.suspend_released_buffers);
+	              report.suspend_released_per_frame, report.suspend_released_ms, report.suspend_released_buffers,
+	              report.suspend_called_per_frame, report.suspend_waited_per_frame, report.suspend_wait_ms_per_frame);
 	text += line;
 	return text;
 }

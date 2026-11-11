@@ -26,6 +26,7 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -47,7 +48,23 @@ uint64_t QueuedBuffers(MasterSemaphore& master) {
 }
 } // namespace
 
-GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
+namespace {
+// GameFlex (0097): KYTY_SUSPEND_POINTS_AHEAD, the suspend points a game may run ahead of the GPU, a per-game setting:
+// 1 by default, as before. Clair Obscur closes its frame with the 7th of its 7 points an image, 6 of them called in
+// the first millisecond: at one point ahead, its next frame waits for the GPU to finish the whole of this one, and
+// the command thread idles meanwhile (13 ms an image). Astro Bot, one point an image, does not start at two.
+std::ptrdiff_t SuspendPointsAheadSetting(std::ptrdiff_t max) {
+	const char* setting = std::getenv("KYTY_SUSPEND_POINTS_AHEAD");
+	const long  value   = setting != nullptr && *setting != '\0' ? std::strtol(setting, nullptr, 10) : 1;
+	const auto  ahead   = static_cast<std::ptrdiff_t>(std::clamp<long>(value, 1, static_cast<long>(max)));
+	std::printf("Suspend points ahead: %td\n", ahead);
+	return ahead;
+}
+} // namespace
+
+GuestGpu::GuestGpu(RenderContext& renderer)
+    : m_renderer(renderer), m_suspend_points_ahead(SuspendPointsAheadSetting(MaxSuspendPointsAhead)),
+      m_suspend_point_ready(std::make_shared<SuspendPointCredits>(m_suspend_points_ahead)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	m_gfx_cp = std::make_unique<CommandProcessor>(renderer, 0);
 	m_thread = std::jthread(ThreadRun, this);
@@ -160,9 +177,17 @@ void GuestGpu::SubmitFlipPreparation(uint64_t request_id) {
 void GuestGpu::SuspendPoint() {
 	EXIT_IF(IsGpuThread() || CommandScheduler::InDeferredOperation());
 	// Do not hold a queue lock while waiting: asynchronous work may be needed to
-	// finish the preceding graphics frame. The first point returns immediately.
+	// finish the preceding graphics frames. The first SuspendPointsAhead() points return immediately.
+	// GameFlex (0097): how long the game waits here, and how often, for the command thread's report.
 	m_guest_at_suspend_point.store(true, std::memory_order_relaxed);
-	m_suspend_point_ready->acquire();
+	const auto wait_start = Common::CommandThreadProfile::SuspendClock();
+	const bool waited     = !m_suspend_point_ready->try_acquire();
+	if (waited) {
+		m_suspend_point_ready->acquire();
+	}
+	if (wait_start != 0) {
+		Common::CommandThreadProfile::NoteSuspendPointCalled(wait_start, waited);
+	}
 	m_guest_at_suspend_point.store(false, std::memory_order_relaxed);
 	Submission submission;
 	submission.type      = SubmissionType::SuspendPoint;
@@ -426,6 +451,12 @@ void CommandProcessor::DmaData(uint8_t dst_sel, uint64_t dst_address_or_offset, 
 void GuestGpu::Enqueue(Submission submission) {
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
+	// GameFlex (0097): the admission order, under the lock every queue shares: a submission admitted after a suspend
+	// point, from any game thread, belongs to the next epoch; the point itself closes its own.
+	submission.epoch = m_epoch;
+	if (submission.type == SubmissionType::SuspendPoint) {
+		m_epoch++;
+	}
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
 	m_work_available.Signal();
@@ -473,12 +504,27 @@ void GuestGpu::ThreadRun(void* data) {
 				EXIT_IF(gpu->m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 				gpu->m_processing = true;
 			} else {
-				int selected_queue = -1;
+				// GameFlex (0097): a game that runs more than one suspend point ahead keeps its frames in order across
+				// queues. Of the fronts that can run, the oldest epoch goes first, round-robin among its queues:
+				// work admitted after a suspend point does not overtake work admitted before it. At one point ahead,
+				// the next frame enters only once the GPU has executed what precedes the last point, and the first
+				// front that can run goes, as before. Several frames ahead, a frame's compute lists would otherwise be
+				// recorded, on the one Vulkan queue, before the graphics lists of the frame before, which may read
+				// what they rewrite (U59 1fbc0396: Astro Bot's water, once its game ran ahead). A front that waits
+				// (blocked) lets a later epoch run: an older stream may wait for a newer one (async compute releasing
+				// graphics), and the thread never idles with work it can run.
+				const bool in_order       = gpu->m_suspend_points_ahead > 1;
+				int        selected_queue = -1;
+				uint64_t   selected_epoch = 0;
 				for (uint32_t offset = 0; offset < QueueCount; offset++) {
 					const auto id = (gpu->m_next_queue + offset) % QueueCount;
-					if (!gpu->m_queues[id].empty() && !gpu->m_queues[id].front().blocked) {
+					if (!gpu->m_queues[id].empty() && !gpu->m_queues[id].front().blocked &&
+					    (selected_queue < 0 || gpu->m_queues[id].front().epoch < selected_epoch)) {
 						selected_queue = static_cast<int>(id);
-						break;
+						selected_epoch = gpu->m_queues[id].front().epoch;
+						if (!in_order) {
+							break;
+						}
 					}
 				}
 				if (selected_queue < 0) {
@@ -592,6 +638,7 @@ bool GuestGpu::Process(Submission& submission) {
 				if (taken != 0) {
 					Common::CommandThreadProfile::NoteSuspendPointReleased(taken, QueuedBuffers(master));
 				}
+				// This point's credit back: the call SuspendPointsAhead() points later may return.
 				ready->release();
 			};
 			// GameFlex: an empty buffer gives the GPU nothing to do: the game is released once the work already

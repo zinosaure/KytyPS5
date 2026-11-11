@@ -9,6 +9,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -36,11 +37,15 @@ public:
 	void Submit(std::span<const uint32_t> commands);
 	void SubmitCompute(uint32_t queue, std::span<const uint32_t> commands);
 	void SubmitFlipPreparation(uint64_t request_id);
-	// Insert an ordered graphics drain; only a previous suspend point can block the caller.
+	// Insert an ordered graphics drain; only the suspend point SuspendPointsAhead() calls back can block the caller.
 	void SuspendPoint();
 	// Wait for guest command processing, including all compute queues (not native GPU completion).
 	void              WaitForIdle();
 	[[nodiscard]] int GetFrameNum() const;
+	// GameFlex (0097): the suspend points the game may run ahead of the GPU, KYTY_SUSPEND_POINTS_AHEAD (1 by default,
+	// at most MaxSuspendPointsAhead). A call returns once the GPU has executed everything submitted before the point
+	// this many calls back; the first ones return at once.
+	[[nodiscard]] std::ptrdiff_t SuspendPointsAhead() const noexcept { return m_suspend_points_ahead; }
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
 
@@ -50,6 +55,7 @@ private:
 	static constexpr uint32_t ComputeQueueCount    = ComputePipeCount * QueuesPerComputePipe;
 	static constexpr uint32_t ComputeQueueBase     = 0x20;
 	static constexpr uint32_t QueueCount           = 1 + ComputeQueueCount;
+	static constexpr std::ptrdiff_t MaxSuspendPointsAhead = 16;
 
 	enum class SubmissionType { Commands, FlipPreparation, SuspendPoint };
 
@@ -62,6 +68,8 @@ private:
 		uint64_t                  flip_request_id = 0;
 		// GameFlex: when the game called its suspend point (CommandThreadProfile::SuspendClock).
 		uint64_t                  called_ns = 0;
+		// GameFlex (0097): the suspend points admitted before this submission, on any queue (m_epoch).
+		uint64_t                  epoch = 0;
 	};
 
 	void              Enqueue(Submission submission);
@@ -80,14 +88,18 @@ private:
 	std::atomic_uint32_t                           m_pending_commands {0};
 	uint32_t                                       m_next_queue        = 0;
 	uint32_t                                       m_submission_count  = 0;
+	// GameFlex (0097): the suspend points admitted so far, under m_queue_mutex: the epoch of the next submission.
+	uint64_t                                       m_epoch = 0;
 	bool                                           m_processing        = false;
 	bool                                           m_accepting         = true;
 	bool                                           m_stopping          = false;
 	bool                                           m_shutdown_complete = false;
-	// Completion callbacks can outlive GuestGpu during renderer shutdown.
-	std::shared_ptr<std::binary_semaphore> m_suspend_point_ready =
-	    std::make_shared<std::binary_semaphore>(1);
-	// GameFlex: a game thread waits at its suspend point for the previous frame (CommandThreadProfile).
+	const std::ptrdiff_t                           m_suspend_points_ahead;
+	// Completion callbacks can outlive GuestGpu during renderer shutdown. One credit per suspend point the game may
+	// still call before it waits; each point gives its credit back once the GPU has executed everything before it.
+	using SuspendPointCredits = std::counting_semaphore<MaxSuspendPointsAhead>;
+	std::shared_ptr<SuspendPointCredits> m_suspend_point_ready;
+	// GameFlex: a game thread waits at its suspend point for an earlier one (CommandThreadProfile).
 	std::atomic<bool> m_guest_at_suspend_point {false};
 
 	std::unique_ptr<CommandProcessor>                                m_gfx_cp;

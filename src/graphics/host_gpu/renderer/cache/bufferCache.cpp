@@ -1097,10 +1097,19 @@ bool BufferCache::HasPendingGpuWrites(uint64_t vaddr, uint64_t size) {
 // (Astro Bot's light counter: 4 then 6 for good) earned it back nowhere and cost two full drains an image,
 // 33 ms, once the thread stopped waiting for labels (0072): the trust comes back after twice as many unchanged
 // waits as the time before, and only the fifth difference revokes the word for good.
+//
+// GameFlex (0098): words of large ranges too. Clair Obscur waits four times an image for words of its tables, two of
+// them always 0 in ranges of 1.9 and 2.4 MB a pass rewrites every frame: 3.6 ms of the command thread and two drains
+// of the GPU an image. 0078 let any range speculate and was wrong five times, each a draw recorded with a wrong
+// resource: a word Clair Obscur alternates with another, a frame in four, held 0xffffffff in memory when the game came
+// back to it, which the GPU then cleared to 0. The value in memory was not the one the GPU had left there: the
+// region served something else meanwhile. A trusted word is now read ahead only while memory holds the value it
+// settled at, after its last wait or check; otherwise it waits, and keeps its trust. A word of a range larger than a
+// counter that is still wrong is a table entry that moves: its first difference revokes it for good.
 namespace {
 constexpr uint32_t kSpeculationConfirmations = 8;
-constexpr uint32_t kSpeculationMisses        = 5; // differences before the word is revoked for good
-constexpr uint64_t kSpeculationRangeBytes    = 256; // a counter, not a table the GPU fills
+constexpr uint32_t kSpeculationMisses        = 5;   // differences before the word is revoked for good
+constexpr uint64_t kCounterRangeBytes        = 256; // a counter, not a table the GPU fills
 } // namespace
 
 void BufferCache::VerifySrtSpeculations() {
@@ -1115,18 +1124,22 @@ void BufferCache::VerifySrtSpeculations() {
 		}
 		speculation.verify_tick = 0;
 		uint32_t landed = 0;
-		if (!LibKernel::Memory::TryReadBacking(address, &landed, sizeof(landed)) ||
-		    landed == speculation.used) {
+		if (!LibKernel::Memory::TryReadBacking(address, &landed, sizeof(landed))) {
 			return true;
 		}
+		speculation.settled = landed;
+		if (landed == speculation.used) {
+			return true;
+		}
+		Common::CommandThreadProfile::Count(Common::CommandThreadProfile::Event::SrtMissed);
 		speculation.trusted       = false;
 		speculation.confirmations = 0;
-		speculation.revoked       = ++speculation.misses >= kSpeculationMisses;
+		speculation.revoked       = ++speculation.misses >= (speculation.large ? 1u : kSpeculationMisses);
 		static uint32_t misses = 0;
 		if (misses++ < 50) {
-			std::printf("SRT speculation: the GPU wrote 0x%08x at 0x%016" PRIx64 " after 0x%08x was used; "
+			std::printf("SRT speculation: the GPU wrote 0x%08x at 0x%016" PRIx64 " after 0x%08x was used%s; "
 			            "this word waits again%s\n",
-			            landed, address, speculation.used,
+			            landed, address, speculation.used, speculation.large ? " (large range)" : "",
 			            speculation.revoked ? " from now on" : " until it holds still for longer");
 		}
 		return true;
@@ -1154,12 +1167,17 @@ bool BufferCache::FinishPendingGpuWritesUnder(std::span<const uint64_t> addresse
 		if (speculation.trusted) {
 			uint32_t used = 0;
 			if (LibKernel::Memory::TryReadBacking(address, &used, sizeof(used))) {
-				if (speculation.verify_tick == 0) {
-					speculation.used = used;
-					m_srt_verifications.push_back(address);
+				// Memory holds what the GPU left there last (or what an unchecked read ahead took): read ahead.
+				if (used == (speculation.verify_tick != 0 ? speculation.used : speculation.settled)) {
+					if (speculation.verify_tick == 0) {
+						speculation.used = used;
+						m_srt_verifications.push_back(address);
+					}
+					speculation.verify_tick = std::max(speculation.verify_tick, range->tick);
+					Common::CommandThreadProfile::Count(Common::CommandThreadProfile::Event::SrtReadAhead);
+					continue;
 				}
-				speculation.verify_tick = std::max(speculation.verify_tick, range->tick);
-				continue;
+				Common::CommandThreadProfile::Count(Common::CommandThreadProfile::Event::SrtHeld);
 			}
 		}
 		uint32_t before = 0;
@@ -1181,9 +1199,11 @@ bool BufferCache::FinishPendingGpuWritesUnder(std::span<const uint64_t> addresse
 		m_scheduler.Finish();
 		Common::CommandThreadProfile::EndWordWait(ctp_wait);
 		m_pending_gpu_writes.Clear();
-		if (!speculation.revoked && range_size <= kSpeculationRangeBytes) {
-			uint32_t after = 0;
-			LibKernel::Memory::TryReadBacking(address, &after, sizeof(after));
+		uint32_t after = 0;
+		LibKernel::Memory::TryReadBacking(address, &after, sizeof(after));
+		speculation.settled = after;
+		speculation.large   = range_size > kCounterRangeBytes;
+		if (!speculation.revoked) {
 			if (after != before) {
 				speculation.confirmations = 0;
 			} else if (++speculation.confirmations >= kSpeculationConfirmations << speculation.misses) {
