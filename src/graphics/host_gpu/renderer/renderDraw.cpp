@@ -852,6 +852,38 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 	return false;
 }
 
+// GameFlex: the executor's draw state, returned to its value-initialized state in every field a draw reads
+// before it writes it. Value-initialized whole at every draw, its 17 KB (eight color targets, three vertex
+// stages) cost ~320 ns a draw, 1.6 ms per frame in Astro Bot's garden. Left as they were:
+// - vertex_info[0]: every draw prepares it whole (PrepareProgram, PrepareTessellationPrograms);
+// - the color targets: a draw resolves each of its own whole (ResolveRenderColorTarget) and reads none past
+//   color_count, but for the debug dumps, which print color_info[0] of a draw without color targets;
+// - vertex_info[1] and [2]: only a tessellated draw writes them, once it has named their stages
+//   (PrepareTessellationPrograms); a named stage clears them.
+// The depth target, which a draw without one leaves as it was (ResolveRenderDepthTarget), and the pixel
+// stage, prepared only when its shader runs, are read in any case: they start over.
+static void ResetDrawRenderState(DrawRenderState& state, const DrawIndirectArgs& indirect) {
+	state.depth_info = {};
+	if (graphics_debug_dump_enabled()) {
+		state.color_info[0] = {};
+	}
+	state.color_count              = 0;
+	state.mrt_mask                 = 0;
+	state.topology                 = vk::PrimitiveTopology::ePointList;
+	state.primitive_restart_enable = false;
+	state.ps_active                = false;
+	if (state.vertex_info[1].logical_stage != ShaderType::Vertex) {
+		state.vertex_info[1] = {};
+		state.vertex_info[2] = {};
+	}
+	state.ps_input_info          = {};
+	state.indirect_offsets       = indirect.offsets;
+	state.indirect_draw          = indirect.address != 0;
+	state.deferrable             = false;
+	state.layered_quad_instances = 0;
+	state.layered_quad           = false;
+}
+
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             DrawRenderState& state) {
 	m_context.GetImageHeap().BeginDraw();
@@ -1356,10 +1388,10 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 
 	hw_check(buffer);
 
-	// GameFlex: what building the draw's state costs, sampled (CommandThreadProfile).
-	const auto      ctp_state = Common::CommandThreadProfile::TimedStart();
-	DrawRenderState state {.indirect_offsets = args.indirect.offsets,
-	                       .indirect_draw    = args.indirect.address != 0};
+	// GameFlex: what taking the draw's state back costs, sampled (CommandThreadProfile).
+	const auto ctp_state = Common::CommandThreadProfile::TimedStart();
+	auto&      state     = m_draw_state;
+	ResetDrawRenderState(state, args.indirect);
 	Common::CommandThreadProfile::TimedEnd(Common::CommandThreadProfile::Timed::DrawState, ctp_state);
 	if (!GetDrawTopology(ucfg, state.topology)) {
 		return true;
@@ -1450,10 +1482,10 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 
 	const DrawCallInfo draw {false, args.vertex_count, args.instance_count};
 
-	// GameFlex: what building the draw's state costs, sampled (CommandThreadProfile).
-	const auto      ctp_state = Common::CommandThreadProfile::TimedStart();
-	DrawRenderState state {.indirect_offsets = args.indirect.offsets,
-	                       .indirect_draw    = args.indirect.address != 0};
+	// GameFlex: what taking the draw's state back costs, sampled (CommandThreadProfile).
+	const auto ctp_state = Common::CommandThreadProfile::TimedStart();
+	auto&      state     = m_draw_state;
+	ResetDrawRenderState(state, args.indirect);
 	Common::CommandThreadProfile::TimedEnd(Common::CommandThreadProfile::Timed::DrawState, ctp_state);
 	if (!GetDrawTopology(ucfg, state.topology)) {
 		ResetBindings();

@@ -258,6 +258,9 @@ private:
 	ContinuedDepth                                            m_continued_depth;
 	// Advances at every dispatch and at every draw spent on an image operation (metadata, copy, resolve).
 	uint64_t                                                  m_chain_breaks = 0;
+	// The state of the draw being prepared: every draw takes it back (ResetDrawRenderState, renderDraw.cpp)
+	// instead of value-initializing its 17 KB, of which a draw reads a few fields before it writes them.
+	DrawRenderState                      m_draw_state {};
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
