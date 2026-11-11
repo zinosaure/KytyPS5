@@ -76,6 +76,12 @@ enum class Event : uint8_t {
 	GpuWaits,       // Waits of this thread for the GPU.
 	MemoryAllocations, // Vulkan device memory allocated (driver buffer objects), any thread.
 	MemoryReleases,
+	// GameFlex (0098): the words of resource tables in ranges the GPU may still write. Read ahead: trusted and
+	// taken from memory without waiting; held: trusted, but memory did not hold the value the GPU left there last,
+	// so they waited; missed: read ahead, and the GPU wrote another value afterwards.
+	SrtReadAhead,
+	SrtHeld,
+	SrtMissed,
 	Count
 };
 
@@ -798,7 +804,8 @@ struct Report {
 [[nodiscard]] constexpr const char* Name(Event event) noexcept {
 	constexpr const char* NAMES[EVENT_COUNT] = {
 	    "packets", "draws",       "dispatches", "barriers",    "command buffers", "submits",
-	    "retries", "label polls", "label waits GPU", "label waits CPU", "trusted waits", "GPU waits", "allocations", "releases"};
+	    "retries", "label polls", "label waits GPU", "label waits CPU", "trusted waits", "GPU waits", "allocations", "releases",
+	    "SRT words read ahead", "SRT words held", "SRT words missed"};
 	return NAMES[static_cast<size_t>(event)];
 }
 
