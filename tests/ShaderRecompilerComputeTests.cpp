@@ -2962,49 +2962,59 @@ public:
       blocked.AddWait(gate, 1);
       scheduler.Flush(blocked);
     });
-    std::binary_semaphore first_returned{0};
-    std::jthread first([&] {
-      gpu.SuspendPoint();
-      first_returned.release();
-    });
-    const bool first_nonblocking =
-        first_returned.try_acquire_for(std::chrono::seconds(2));
-    if (!first_nonblocking) {
-      signal(1);
-    }
-    first.join();
-    Require(name, "first call", first_nonblocking,
-            "the first suspend point waited for native GPU completion");
+    // The game runs SuspendPointsAhead() points ahead (KYTY_SUSPEND_POINTS_AHEAD,
+    // 1 by default): the first ones return at once, their markers behind the
+    // gated work; the next one waits for the first one's native completion.
+    const auto ahead = static_cast<uint32_t>(gpu.SuspendPointsAhead());
+    std::printf("[host]    %-32s %u point(s) ahead\n", name, ahead);
+    const auto suspend_ahead = [&](uint32_t point) {
+      std::binary_semaphore returned{0};
+      std::jthread caller([&] {
+        gpu.SuspendPoint();
+        returned.release();
+      });
+      const bool nonblocking = returned.try_acquire_for(std::chrono::seconds(2));
+      if (!nonblocking) {
+        signal(1);
+      }
+      caller.join();
+      Require(name, point == 1 ? "first call" : "call ahead", nonblocking,
+              "a suspend point with a credit left waited for native GPU "
+              "completion");
 
-    // Let the marker reach Vulkan while its completion remains gated.
-    std::binary_semaphore marker_parsed{0};
-    std::jthread parser([&] {
-      gpu.WaitForIdle();
-      marker_parsed.release();
-    });
-    const bool parser_nonblocking =
-        marker_parsed.try_acquire_for(std::chrono::seconds(2));
-    if (!parser_nonblocking) {
-      signal(1);
+      // Let the marker reach Vulkan while its completion remains gated.
+      std::binary_semaphore marker_parsed{0};
+      std::jthread parser([&] {
+        gpu.WaitForIdle();
+        marker_parsed.release();
+      });
+      const bool parser_nonblocking =
+          marker_parsed.try_acquire_for(std::chrono::seconds(2));
+      if (!parser_nonblocking) {
+        signal(1);
+      }
+      parser.join();
+      Require(name, "marker insertion", parser_nonblocking,
+              "inserting a suspend point blocked the GPU command thread");
+      Require(name, "frame cache maintenance",
+              cache_ticks() == std::pair{initial_cache_ticks.first + point,
+                                        initial_cache_ticks.second + point},
+              "a suspend point did not age both caches exactly once");
+    };
+    for (uint32_t point = 1; point <= ahead; ++point) {
+      suspend_ahead(point);
     }
-    parser.join();
-    Require(name, "marker insertion", parser_nonblocking,
-            "inserting a suspend point blocked the GPU command thread");
-    Require(name, "frame cache maintenance",
-            cache_ticks() == std::pair{initial_cache_ticks.first + 1,
-                                      initial_cache_ticks.second + 1},
-            "a suspend point did not age both caches exactly once");
 
-    std::binary_semaphore second_entered{0};
-    std::binary_semaphore second_returned{0};
-    std::jthread second([&] {
-      second_entered.release();
+    std::binary_semaphore next_entered{0};
+    std::binary_semaphore next_returned{0};
+    std::jthread next([&] {
+      next_entered.release();
       gpu.SuspendPoint();
-      second_returned.release();
+      next_returned.release();
     });
-    second_entered.acquire();
-    const bool second_overtook_completion =
-        second_returned.try_acquire_for(std::chrono::milliseconds(100));
+    next_entered.acquire();
+    const bool next_overtook_completion =
+        next_returned.try_acquire_for(std::chrono::milliseconds(100));
 
     uint32_t compute_value = 0;
     std::array<uint32_t, 5> compute_commands{};
@@ -3020,21 +3030,54 @@ public:
     const bool compute_did_not_wait =
         compute_progress.try_acquire_for(std::chrono::seconds(2));
     signal(1);
-    second.join();
+    next.join();
     compute.join();
     finish();
-    Require(name, "one outstanding point", !second_overtook_completion,
-            "a second suspend point returned before the first native completion");
+    Require(name, "outstanding points", !next_overtook_completion,
+            "a suspend point returned before the native completion of the one "
+            "SuspendPointsAhead() calls back");
     Require(name, "independent queue progress",
             compute_did_not_wait && host_lane_responded && compute_value == 33,
-            "waiting for a previous suspend point blocked compute submissions "
+            "waiting for an earlier suspend point blocked compute submissions "
             "or the host command lane");
-    Require(name, "frame count", gpu.GetFrameNum() == 2,
+    Require(name, "frame count",
+            gpu.GetFrameNum() == static_cast<int>(ahead + 1),
             "suspend-point insertion did not advance the frame counter once");
     Require(name, "async cache lifetime",
-            cache_ticks() == std::pair{initial_cache_ticks.first + 2,
-                                      initial_cache_ticks.second + 2},
+            cache_ticks() == std::pair{initial_cache_ticks.first + ahead + 1,
+                                      initial_cache_ticks.second + ahead + 1},
             "asynchronous work aged the caches between frame boundaries");
+
+    // More than one point ahead, work admitted after a suspend point does not
+    // overtake work admitted before it on another queue, even where the
+    // round-robin would start at the compute queue (graphics ran last). At one
+    // point ahead the round-robin stays as it was: the game cannot run a frame
+    // ahead of the queues.
+    if (ahead > 1) {
+      uint32_t order_value = 0;
+      std::array<uint32_t, 5> order_graphics{}, order_compute{};
+      write(order_graphics.data(), &order_value, 51);
+      write(order_compute.data(), &order_value, 52);
+      gpu.Submit(graphics_list);
+      finish();
+      {
+        std::binary_semaphore lane_entered{0};
+        std::binary_semaphore release_lane{0};
+        gpu.SendCommand([&] {
+          lane_entered.release();
+          release_lane.acquire();
+        });
+        lane_entered.acquire();
+        gpu.Submit(order_graphics);
+        gpu.SuspendPoint();
+        gpu.SubmitCompute(0x20, order_compute);
+        release_lane.release();
+      }
+      finish();
+      Require(name, "frames in order", order_value == 52,
+              "work admitted after a suspend point ran before work admitted "
+              "before it on another queue");
+    }
 
     // A marker must stay behind a stalled graphics stream, then clear its
     // predicate before the next stream. Async compute releases that stream.

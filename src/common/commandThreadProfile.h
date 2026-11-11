@@ -181,6 +181,10 @@ inline std::atomic<uint64_t> g_suspend_taken_buffers {0}; // Buffers submitted a
 inline std::atomic<uint64_t> g_suspend_released {0};
 inline std::atomic<uint64_t> g_suspend_released_ns {0}; // From being taken.
 inline std::atomic<uint64_t> g_suspend_released_buffers {0};
+// GameFlex (0097): the game's calls, those that waited for a credit, and their wait.
+inline std::atomic<uint64_t> g_suspend_called {0};
+inline std::atomic<uint64_t> g_suspend_waited {0};
+inline std::atomic<uint64_t> g_suspend_wait_ns {0};
 
 constexpr uint32_t CLOCK_PAIRS             = 1024; // When the thread starts.
 constexpr uint32_t CLOCK_PAIRS_RECALIBRATE = 64;   // At each suspend point.
@@ -511,6 +515,16 @@ inline void NoteSuspendPointTaken(uint64_t called_ns, uint64_t taken_ns, uint64_
 	Detail::g_suspend_taken_buffers.fetch_add(queued, std::memory_order_relaxed);
 }
 
+// GameFlex (0097): the game's call that started at `start_ns` got its credit; `waited` when none was left.
+inline void NoteSuspendPointCalled(uint64_t start_ns, bool waited) noexcept {
+	const auto now = SteadyNs();
+	Detail::g_suspend_called.fetch_add(1, std::memory_order_relaxed);
+	if (waited) {
+		Detail::g_suspend_waited.fetch_add(1, std::memory_order_relaxed);
+		Detail::g_suspend_wait_ns.fetch_add(now > start_ns ? now - start_ns : 0, std::memory_order_relaxed);
+	}
+}
+
 // The point taken at `taken_ns` is released: the GPU executed everything before it, `queued` buffers still on it.
 inline void NoteSuspendPointReleased(uint64_t taken_ns, uint64_t queued) noexcept {
 	const auto now = SteadyNs();
@@ -561,6 +575,9 @@ struct Totals {
 	uint64_t                              suspend_released         = 0;
 	uint64_t                              suspend_released_ns      = 0;
 	uint64_t                              suspend_released_buffers = 0;
+	uint64_t                              suspend_called           = 0; // GameFlex (0097).
+	uint64_t                              suspend_waited           = 0;
+	uint64_t                              suspend_wait_ns          = 0;
 };
 
 namespace Detail {
@@ -613,6 +630,9 @@ void LoadAll(const std::atomic<uint64_t> (&counters)[N], std::array<uint64_t, N>
 	totals.suspend_released         = Detail::g_suspend_released.load(std::memory_order_relaxed);
 	totals.suspend_released_ns      = Detail::g_suspend_released_ns.load(std::memory_order_relaxed);
 	totals.suspend_released_buffers = Detail::g_suspend_released_buffers.load(std::memory_order_relaxed);
+	totals.suspend_called           = Detail::g_suspend_called.load(std::memory_order_relaxed);
+	totals.suspend_waited           = Detail::g_suspend_waited.load(std::memory_order_relaxed);
+	totals.suspend_wait_ns          = Detail::g_suspend_wait_ns.load(std::memory_order_relaxed);
 	totals.clock_ticks = Detail::Ticks();
 	totals.clock_ns    = SteadyNs();
 	return totals;
@@ -656,6 +676,9 @@ struct Report {
 	double suspend_released_per_frame = 0.0;
 	double suspend_released_ms        = 0.0; // Per point, from being taken.
 	double suspend_released_buffers   = 0.0; // Per point.
+	double suspend_called_per_frame   = 0.0; // GameFlex (0097): the game's calls,
+	double suspend_waited_per_frame   = 0.0; // those that waited,
+	double suspend_wait_ms_per_frame  = 0.0; // and their wait.
 };
 
 [[nodiscard]] inline Report MakeReport(const Totals& before, const Totals& after,
@@ -754,6 +777,9 @@ struct Report {
 	report.suspend_released_ms = mean(delta(before.suspend_released_ns, after.suspend_released_ns), released) / 1e6;
 	report.suspend_released_buffers =
 	    mean(delta(before.suspend_released_buffers, after.suspend_released_buffers), released);
+	report.suspend_called_per_frame  = delta(before.suspend_called, after.suspend_called) * per_frame;
+	report.suspend_waited_per_frame  = delta(before.suspend_waited, after.suspend_waited) * per_frame;
+	report.suspend_wait_ms_per_frame = delta(before.suspend_wait_ns, after.suspend_wait_ns) / 1e6 * per_frame;
 	return report;
 }
 
